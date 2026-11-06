@@ -111,13 +111,19 @@
 //! in the order listed (`DATA_QUALITY_MISSING_FIELD`), then match each schema
 //! rule in name order (absent and not `optional` ⇒ `DATA_QUALITY_MISSING_FIELD`,
 //! wrong type or a disallowed `null` ⇒ `DATA_QUALITY_SCHEMA`). The whole file is
-//! read: every breaching row is counted, and each breach code lists its first
-//! `max_reported` rows (default 10; `0` lists none) by line number and field.
+//! read: every breaching row is counted, and each breach code names its first
+//! `max_reported` rows by line number and field. The default is 10 and the
+//! ceiling 1000; the first breaching row is always named, so `0` acts as `1`.
 //!
 //! Line numbers are 1-based physical lines of the file, blank lines included,
 //! so they match an editor or `sed -n '<N>p'`. Blank lines (empty or whitespace
 //! only) are not rows: they are skipped by the row count and by the line checks
-//! alike, so the rows counted are exactly the rows checked.
+//! alike, so the rows counted are exactly the rows checked. An empty file has
+//! no rows to break a rule, so only `min_rows` can refuse it.
+//!
+//! Memory is bounded by the longest line, not by the file: the scan holds one
+//! line and its parsed value at a time, plus the rows named in the breach
+//! message. A file with no newlines is one line, and is read whole.
 //!
 //! The row-count bounds are checked first, then the line checks. Under `block`
 //! the first failing one is the node's failure: a line-check failure carries the
@@ -328,14 +334,18 @@ pub struct CheckJsonlArgs {
     )]
     pub required_fields: Vec<String>,
     /// How many breaching rows each line-breach code names in its message
-    /// (default 10). The first breaching row is always named, so `0` acts as
-    /// `1`; every breaching row is counted either way.
+    /// (default 10, at most 1000). The first breaching row is always named,
+    /// so `0` acts as `1`; every breaching row is counted either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_reported: Option<u32>,
 }
 
 /// Rows each line-breach code names when `max_reported` is not set.
 const DEFAULT_MAX_REPORTED: u32 = 10;
+
+/// The most rows a line-breach code names, whatever `max_reported` says. What
+/// the scan holds must not scale with a file that fails on every row.
+const MAX_REPORTED_CEILING: u32 = 1000;
 
 /// The JSON type a [`FieldSpec`] requires; the module docs say what each one
 /// matches. Spelled in args as its lowercase name.
@@ -434,10 +444,10 @@ pub struct FieldSpec {
     #[serde(rename = "type")]
     pub ty: FieldType,
     /// `null` is accepted in place of a value of `ty`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub nullable: bool,
     /// The field may be absent.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub optional: bool,
 }
 
@@ -808,8 +818,8 @@ impl JsonlScan {
 }
 
 /// Stream `path` once: count its non-blank rows and, with `rules`, check each
-/// of them. Memory is one line plus at most `cap` listed breaches per code,
-/// whatever the file's size.
+/// of them. Memory is one line and its parsed value plus at most `cap` listed
+/// breaches per code, whatever the file's size.
 ///
 /// A row is a line that is not empty or whitespace once its `\n` / `\r\n` is
 /// removed, which is what the row count has always counted. Without `rules`
@@ -950,7 +960,10 @@ impl Stage for CheckJsonl {
         // spikes RAM nor stalls the executor's reactor.
         let path = input.path.clone();
         let rules = LineRules::from_args(args);
-        let cap = args.max_reported.unwrap_or(DEFAULT_MAX_REPORTED) as usize;
+        let cap = args
+            .max_reported
+            .unwrap_or(DEFAULT_MAX_REPORTED)
+            .min(MAX_REPORTED_CEILING) as usize;
         let scan = tokio::task::spawn_blocking(move || scan_jsonl(&path, rules.as_ref(), cap))
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!("check_jsonl join: {e}")))?
@@ -1676,6 +1689,7 @@ mod line_check_tests {
     //! and unchanged behaviour when no line check is asked for.
     use super::*;
     use crate::framework::stage::StageDyn;
+    use std::sync::Arc;
 
     fn write(dir: &Path, body: &[u8]) -> JsonlArtifact {
         let path = dir.join("rows.jsonl");
@@ -2025,12 +2039,45 @@ mod line_check_tests {
         assert_eq!(f.message.matches("missing").count(), 3);
         assert!(f.message.ends_with("; 22 more not listed"));
 
+        let a = serde_json::json!({ "required_fields": ["id"], "max_reported": 1 });
+        assert_eq!(
+            block_failure(body.as_bytes(), a).await.message,
+            "25 of 25 rows: line 1 field \"id\": missing; 24 more not listed"
+        );
+
         let a = serde_json::json!({ "required_fields": ["id"], "max_reported": 0 });
         let f = block_failure(body.as_bytes(), a).await;
         assert!(
             f.message
                 .starts_with("25 of 25 rows: line 1 field \"id\": missing; 24 more")
         );
+    }
+
+    /// However large `max_reported` is, what a scan holds stays bounded, and
+    /// the count still covers every row.
+    #[tokio::test]
+    async fn max_reported_has_a_ceiling() {
+        let body = "{}\n".repeat(MAX_REPORTED_CEILING as usize + 5);
+        let a = serde_json::json!({ "required_fields": ["id"], "max_reported": u32::MAX });
+        let f = block_failure(body.as_bytes(), a).await;
+        assert_eq!(
+            f.message.matches("missing").count(),
+            MAX_REPORTED_CEILING as usize
+        );
+        assert!(f.message.ends_with("; 5 more not listed"), "{}", f.message);
+        assert_eq!(ctx_value(&f, "breached_rows"), Some("1005"));
+    }
+
+    /// An empty file has no rows to break a rule: the line checks pass it and
+    /// only `min_rows` can refuse it.
+    #[tokio::test]
+    async fn an_empty_file_is_refused_only_by_min_rows() {
+        let rules = serde_json::json!({ "required_fields": ["id"], "schema": { "id": "integer" } });
+        let (_, _, events) = passes(b"", rules.clone()).await;
+        assert!(events.is_empty());
+        passes(b"\n  \n", rules).await;
+        let a = serde_json::json!({ "min_rows": 1, "required_fields": ["id"] });
+        assert_eq!(block_failure(b"", a).await.code, "DATA_QUALITY_MIN_ROWS");
     }
 
     /// The report shows the new codes as DataQuality breaches with their line.
@@ -2118,6 +2165,23 @@ mod line_check_tests {
             serde_json::to_value(CheckJsonlArgs::default()).unwrap(),
             serde_json::json!({ "min_rows": null, "max_rows": null, "on_breach": "block" })
         );
+    }
+
+    /// `FieldSpec`'s own `Deserialize` takes both forms and refuses as the
+    /// args decode does.
+    #[test]
+    fn field_spec_decodes_both_forms() {
+        let spec = |v| serde_json::from_value::<FieldSpec>(v);
+        assert_eq!(
+            spec(serde_json::json!("boolean")).unwrap(),
+            FieldSpec::new(FieldType::Boolean)
+        );
+        assert_eq!(
+            spec(serde_json::json!({ "type": "array", "optional": true })).unwrap(),
+            FieldSpec::new(FieldType::Array).allow_missing()
+        );
+        let e = spec(serde_json::json!("bool")).unwrap_err().to_string();
+        assert!(e.contains("unknown type \"bool\""), "{e}");
     }
 
     #[test]
@@ -2299,14 +2363,14 @@ mod line_check_tests {
     }
 
     /// Peak memory stays flat as the file grows: the scan holds one line at a
-    /// time. Run it explicitly (it writes about 100 MB to the temp dir, which
-    /// the tempdir removes):
+    /// time. Run it explicitly (it writes about 140 MB to the temp dir, and
+    /// removes it):
     /// `cargo test --lib checks::line_check_tests::large_file_memory_stays_flat
     /// -- --ignored --exact --nocapture`. `BLUT_CHECKS_BIG_LINES` overrides the
     /// line count (default 2,000,000).
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[ignore = "writes ~100 MB of JSONL to the temp dir; run explicitly"]
+    #[ignore = "writes ~140 MB of JSONL to the temp dir; run explicitly"]
     async fn large_file_memory_stays_flat() {
         use std::io::Write as _;
         fn status_kib(key: &str) -> u64 {
@@ -2365,6 +2429,4 @@ mod line_check_tests {
             lines / 100
         );
     }
-
-    use std::sync::Arc;
 }
