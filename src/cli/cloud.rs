@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! `blut cloud` — the cloud compute queue (ADR 0082 / 0067 T3.1).
+//! `blut cloud` — the cloud compute queue (ADR 0082 / 0067 T3.1): the worker,
+//! a look at the queue, the smoke test, and what `--launcher cloud` installs on
+//! a run.
 //!
 //! Mounted as a child of the `cli` module and glob-imported back (the
 //! `cli/p2p.rs` pattern), so `super::*` resolves the shared imports.
@@ -98,10 +100,7 @@ fn queue_spec(flag: Option<String>) -> Result<String> {
 
 #[cfg(feature = "cloud")]
 fn default_worker_id() -> String {
-    let host = nix::unistd::gethostname()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "worker".into());
+    let host = crate::framework::stage_checkpoint::hostname().unwrap_or_else(|| "worker".into());
     format!("{host}-{}", std::process::id())
 }
 

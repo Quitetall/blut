@@ -5,10 +5,10 @@
 //! not strand it — `reclaim_expired` returns the job to the pending set once its
 //! lease elapses, so another worker picks it up.
 //!
-//! [`MemQueue`] is the in-process implementation used by the loopback proof and
-//! single-box runs. A real cross-process deployment (submitter local, worker on a
-//! cloud GPU box) swaps in an object-store / REST-backed `CloudQueue` with the same
-//! trait — the dispatch path above it is unchanged.
+//! [`MemQueue`] is the in-process implementation used by the loopback proof.
+//! A cross-process deployment (submitter local, worker on a cloud GPU box) uses
+//! [`ObjectQueue`](super::object_queue::ObjectQueue) behind the same trait: the
+//! dispatch path above it is unchanged.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

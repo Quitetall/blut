@@ -67,9 +67,11 @@ pub(super) enum RecipeCommand {
         /// (only with `--run`).
         #[arg(long, requires = "run")]
         experiment: Option<String>,
-        /// Where `--run` executes: `local` (default), or `k8s`, which ships the
+        /// Where `--run` executes: `local` (default); `k8s`, which ships the
         /// file to a Kubernetes cluster as a BlutPlan for blut-operator and
-        /// follows it (settings: `BLUT_K8S_*`, docs/OPERATOR.md).
+        /// follows it (settings: `BLUT_K8S_*`, docs/OPERATOR.md); or `cloud`,
+        /// which submits every stage to the queue in `BLUT_CLOUD_QUEUE` for
+        /// `blut cloud worker` processes (see `recipe run --help`).
         #[arg(long, default_value = "local")]
         launcher: String,
     },
@@ -125,8 +127,13 @@ pub(super) enum RecipeCommand {
         /// content-addressed cache + job dirs must be reachable from the
         /// compute node (NFS/Lustre); local admission still gates (conservative).
         /// `k8s` submits the whole recipe to blut-operator (docs/OPERATOR.md).
-        /// `p2p` and `cloud` are refused: no command places a run's stages on
-        /// peers or on the cloud queue.
+        /// `cloud` submits every stage to the durable queue in `BLUT_CLOUD_QUEUE`
+        /// (`s3://bucket[/prefix]`, credentials from `AWS_*` only, or a
+        /// directory; a build with the `cloud` feature, `s3` for a bucket) for
+        /// `blut cloud worker` processes, which need the same code; nothing
+        /// runs on this machine, and a stage nobody claims within
+        /// `BLUT_CLOUD_PICKUP_SECS` (default 300) fails the run. `p2p` is
+        /// refused: no command places a run's stages on peers.
         #[arg(long, default_value = "local")]
         launcher: String,
         /// Tenant (`project[/domain]`, ADR 0096) whose namespace this run's

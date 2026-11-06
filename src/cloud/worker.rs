@@ -4,7 +4,9 @@
 //! [`run_one`] claims one job, downloads + `unbundle`s its input (four fail-closed
 //! gates), runs the stage under the job's wall-clock deadline, bundles the output,
 //! uploads it, and `complete`s the job (success OR failure — a claimed job is never
-//! left stranded on its lease). Loop `run_one` to drain a queue.
+//! left stranded on its lease). [`serve`] is the long-running form `blut cloud
+//! worker` uses: it adds lease renewal, cancellation by re-reading the job,
+//! release on shutdown and backoff.
 //!
 //! Three gates run before any work, mirroring the P2P peer. Stated in the order
 //! they actually fire, because the first one shadows the others for PHI:

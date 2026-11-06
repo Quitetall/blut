@@ -895,10 +895,7 @@ fn unix_ms() -> u64 {
 }
 
 fn hostname() -> String {
-    nix::unistd::gethostname()
-        .ok()
-        .and_then(|name| name.into_string().ok())
-        .unwrap_or_else(|| "unknown-host".into())
+    crate::framework::stage_checkpoint::hostname().unwrap_or_else(|| "unknown-host".into())
 }
 
 /// A worker id as one key segment: `[A-Za-z0-9._-]`, anything else `_`.

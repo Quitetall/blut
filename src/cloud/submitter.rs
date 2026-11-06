@@ -12,6 +12,11 @@
 //! clear: the object store is operator-controlled and clinical data is hard-blocked
 //! from cloud (see [`crate::cloud`]). At-rest encryption (reusing `p2p::crypto`) and
 //! the verified-novel-work model are T3.2 (untrusted multi-tenant providers).
+//!
+//! As an [`ExecutionAdapter`], the submitter is what `--launcher cloud` installs:
+//! the executor hands it each stage attempt, and it adds a pickup window
+//! ([`CloudSubmitter::with_pickup_timeout`]) and a record of the jobs it enqueues
+//! ([`CloudSubmitter::with_job_record`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
