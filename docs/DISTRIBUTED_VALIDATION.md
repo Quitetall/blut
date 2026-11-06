@@ -209,7 +209,7 @@ line whenever its view changes.
 dispatch any stage with `blut::p2p::dispatch_stage`.
 
 The mesh is reached only through `blut p2p` and the library. `recipe run`
-and the other run commands refuse `--launcher p2p` (and `--launcher cloud`):
+and the other run commands refuse `--launcher p2p`:
 nothing hands a run's stages to peers, and those commands used to run them
 all on the submitting machine instead.
 
@@ -1029,16 +1029,17 @@ The whole test suite then ran on the same bucket:
   a SIGKILLed worker's stage is requeued when its lease runs out; two runs
   overlap on one submitting machine.
 
-The same tests pass on MinIO, and on a directory. Three planted regressions were
-caught: claims written without create-only (six workers won one job), leases
+On a directory all of them pass. On MinIO the queue semantics and nine of the
+process tests passed; the tenth was added after that pass. Three planted
+regressions were caught: claims written without create-only (six workers won one job), leases
 that never expire, and no code-identity check (both the queue test and the
 process test failed).
 
-A run over R2 found one defect MinIO and the directory had hidden: a one-second
-lease in a test expired during a single claim attempt. The test's lease was
-wrong, not the queue's; `--lease-secs` defaults to 60. Host memory pressure
-during the same pass found a real one: a cloud run took local RAM admission and
-the training lock, though nothing runs on the submitter. It no longer does.
+R2's latency showed a one-second lease in a test expiring during a single claim
+attempt; the test's lease was too short, and `--lease-secs` defaults to 60. Host
+memory pressure during the same pass found a real defect: a cloud run took local
+RAM admission and the training lock, though nothing runs on the submitter. It no
+longer does.
 
 **Secrets.** All 353 bucket objects, the job directories and the logs kept with
 this record were scanned for the access key, the secret, the Cloudflare API
