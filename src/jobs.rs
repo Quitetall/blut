@@ -1281,8 +1281,8 @@ pub(crate) fn cgroup_resume_blocker_at(job_id: &str, job_dir: &Path) -> Result<O
 }
 
 /// Stop every process in the leaves recorded for `job_id` that still hold
-/// any: SIGTERM to each, then, after [`CGROUP_STOP_GRACE`], `cgroup.kill`
-/// (SIGKILL to the whole leaf at once; each pid when the kernel predates it),
+/// any: SIGTERM to each, then, after a 10 s grace, `cgroup.kill` (SIGKILL to
+/// the whole leaf at once; each pid when the kernel predates it),
 /// as `systemctl stop` does for a unit. Emptied leaves are removed. Returns
 /// the leaves stopped; errors naming any still populated.
 pub fn cancel_cgroup_leaves(job_id: &str) -> Result<Vec<PathBuf>> {
