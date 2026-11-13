@@ -57,6 +57,10 @@ pub struct ContainedChild {
     /// Peak scraped from stderr by [`Self::pump_stderr`], for
     /// [`PeakSource::StderrLine`] backends.
     stderr_peak: Arc<Mutex<Option<u64>>>,
+    oom_kills: Option<u64>,
+    /// Whether stderr reported an OOM kill, scraped by [`Self::pump_stderr`]
+    /// for [`PeakSource::StderrLine`] backends.
+    stderr_oom: Arc<Mutex<Option<bool>>>,
     stderr_pump: Option<tokio::task::JoinHandle<()>>,
     finished: bool,
 }
@@ -124,6 +128,8 @@ impl ContainedChild {
             peak_source,
             peak: None,
             stderr_peak: Arc::new(Mutex::new(None)),
+            oom_kills: None,
+            stderr_oom: Arc::new(Mutex::new(None)),
             stderr_pump: None,
             finished: false,
         })
@@ -186,6 +192,7 @@ impl ContainedChild {
         let scrape = self.peak_source == PeakSource::StderrLine;
         let backend = Arc::clone(&self.backend);
         let slot = Arc::clone(&self.stderr_peak);
+        let oom_slot = Arc::clone(&self.stderr_oom);
         self.stderr_pump = Some(tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut buf = Vec::new();
@@ -201,6 +208,9 @@ impl ContainedChild {
                 if scrape && let Some(bytes) = backend.parse_peak(&line) {
                     *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(bytes);
                 }
+                if scrape && let Some(oom) = backend.parse_oom_kill(&line) {
+                    *oom_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(oom);
+                }
                 sink(line);
             }
         }));
@@ -213,6 +223,20 @@ impl ContainedChild {
     /// through [`Self::pump_stderr`].
     pub fn peak_bytes(&self) -> Option<u64> {
         self.peak
+    }
+
+    /// How many OOM kills the kernel reported in the contained tree, once the
+    /// child has exited. `Some(0)` means the backend looked and the kernel
+    /// reported none, so the exit was not an OOM whatever its status or peak.
+    /// `None` before exit and when the backend cannot tell: the rlimit, bare
+    /// and Windows backends, and a [`PeakSource::StderrLine`] backend whose
+    /// stderr was not pumped through [`Self::pump_stderr`] or was cut short.
+    ///
+    /// The cgroup-v2 backend reports the kernel's `oom_kill` counter. The
+    /// systemd backend reports `1` when the unit's result was `oom-kill` and
+    /// `0` for any other result; it does not count processes.
+    pub fn oom_kills(&self) -> Option<u64> {
+        self.oom_kills
     }
 
     /// Wait for the child to exit, then tear down what is left of the tree,
@@ -317,6 +341,22 @@ impl ContainedChild {
             PeakSource::StderrLine => *self.stderr_peak.lock().unwrap_or_else(|p| p.into_inner()),
             PeakSource::None => None,
         };
+        self.oom_kills = match self.peak_source {
+            PeakSource::CgroupFile => self.backend.read_oom_kills(&self.teardown),
+            PeakSource::StderrLine => self
+                .stderr_oom
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .map(u64::from),
+            PeakSource::None => None,
+        };
+        if let Some(kills @ 1..) = self.oom_kills {
+            tracing::warn!(
+                "containment: the kernel OOM-killed {} ({kills} reported, {})",
+                self.unit,
+                self.kind()
+            );
+        }
         match self.peak {
             Some(peak) => tracing::info!(
                 "containment: {} exited; peak memory {peak} bytes ({})",

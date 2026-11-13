@@ -50,11 +50,21 @@ fn writable_base() -> Option<PathBuf> {
     }
 }
 
+/// A probe directory name no other thread or process is using. Stages spawn
+/// concurrently and several `blut` processes can share one base; with a fixed
+/// name, two probes collide, the loser's mkdir fails, and a writable base
+/// reads as unwritable.
+fn probe_name(what: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("blut-probe-{what}-{}-{n}", std::process::id())
+}
+
 /// Probe writability by attempting a probe mkdir + rmdir. The cgroupfs is
 /// often mounted read-only in unprivileged containers, so a stat is not
 /// enough — only an actual mkdir tells the truth.
 fn dir_writable(base: &Path) -> bool {
-    let probe = base.join("blut-probe-wcheck");
+    let probe = base.join(probe_name("wcheck"));
     match std::fs::create_dir(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_dir(&probe);
@@ -94,7 +104,7 @@ fn probe() -> Availability {
 /// first cap write fails. Probed with a throwaway leaf.
 fn leaf_gets_memory_controller(base: &Path) -> bool {
     enable_memory_subtree(base);
-    let probe = base.join("blut-probe-memcheck");
+    let probe = base.join(probe_name("memcheck"));
     if std::fs::create_dir(&probe).is_err() {
         return false;
     }
@@ -205,6 +215,12 @@ impl Containment for CgroupV2Direct {
         // memory.peak (kernel ≥5.19) is the high-water RSS of the leaf.
         let s = std::fs::read_to_string(dir.join("memory.peak")).ok()?;
         s.trim().parse::<u64>().ok()
+    }
+
+    fn read_oom_kills(&self, teardown: &TeardownHandle) -> Option<u64> {
+        let dir = teardown.cgroup_path.as_ref()?;
+        let events = std::fs::read_to_string(dir.join("memory.events")).ok()?;
+        super::memsize::parse_memory_events_oom_kill(&events)
     }
 
     fn cancel(&self, _unit: &str, teardown: &TeardownHandle) -> Option<tokio::process::Command> {
@@ -344,10 +360,92 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(dir_writable(tmp.path()));
         assert!(!leaf_gets_memory_controller(tmp.path()));
-        assert!(
-            !tmp.path().join("blut-probe-memcheck").exists(),
-            "probe leaf left behind"
-        );
+        let left: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with("blut-probe"))
+            .collect();
+        assert!(left.is_empty(), "probe leaf left behind: {left:?}");
+    }
+
+    /// Stages spawn concurrently, and each spawn probes its base. A probe
+    /// must not collide with another thread's: a collision reads as "not
+    /// writable" and sends the run to the wrong base.
+    #[test]
+    fn concurrent_writability_probes_do_not_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let failures = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| (0..500).filter(|_| !dir_writable(tmp.path())).count()))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .sum::<usize>()
+        });
+        assert_eq!(failures, 0, "a writable directory probed as unwritable");
+    }
+
+    /// Live: the kernel's `oom_kill` counter is what says a run was an OOM.
+    /// A tree killed at its cap reports at least one; a run that fails on its
+    /// own reports zero. Same skip rule as the leaf test below.
+    #[tokio::test]
+    async fn live_oom_kills_come_from_the_kernel_counter() {
+        use crate::containment::ContainedChild;
+        let availability = CgroupV2Direct.available();
+        if availability != Availability::Present {
+            assert!(
+                std::env::var_os("BLUT_REQUIRE_CGROUP2_LIVE").is_none(),
+                "BLUT_REQUIRE_CGROUP2_LIVE is set but the cgroup2 backend is {availability:?}"
+            );
+            eprintln!("SKIP live cgroup2 oom test: backend is {availability:?}");
+            return;
+        }
+        let caps = CapSpec {
+            mem_max: Some(64 * 1024 * 1024),
+            mem_high: None,
+            // Zero would mean "default"; this is as close to no swap as a
+            // knob gets, so the hog dies instead of paging out.
+            swap_max: Some(1024 * 1024),
+        };
+        let run = |script: &str, unit: &str| {
+            CgroupV2Direct
+                .wrap_command(
+                    Path::new("sh"),
+                    &["-c".to_string(), script.to_string()],
+                    Path::new("/"),
+                    &[],
+                    unit,
+                    &caps,
+                )
+                .expect("wrap in a cgroup2 leaf")
+        };
+        let wait = std::time::Duration::from_secs(120);
+
+        let unit = format!("blut-live-oom-{}-1", std::process::id());
+        let hog = run("head -c 700000000 /dev/zero | tail", &unit);
+        let mut child = ContainedChild::spawn(Box::new(CgroupV2Direct), hog, &unit, |_| {})
+            .await
+            .expect("spawn hog");
+        let status = tokio::time::timeout(wait, child.wait())
+            .await
+            .expect("hog exited")
+            .expect("wait");
+        assert!(!status.success(), "the hog fit in 64M: {status:?}");
+        let kills = child.oom_kills().expect("memory.events was read");
+        assert!(kills >= 1, "oom_kill {kills}");
+
+        let unit = format!("blut-live-oom-{}-2", std::process::id());
+        let failing = run("exit 3", &unit);
+        let mut child = ContainedChild::spawn(Box::new(CgroupV2Direct), failing, &unit, |_| {})
+            .await
+            .expect("spawn failing");
+        let status = tokio::time::timeout(wait, child.wait())
+            .await
+            .expect("exited")
+            .expect("wait");
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(child.oom_kills(), Some(0), "a plain failure is not an OOM");
     }
 
     /// Live: a stage left running in a REAL cgroup-v2 leaf after its driver

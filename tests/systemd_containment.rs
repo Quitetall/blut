@@ -10,6 +10,7 @@
 //   - it sees the caller's environment, and an explicit value wins;
 //   - the systemd peak is read from stderr when it is pumped, and every line
 //     still reaches the sink;
+//   - an OOM kill at the cap is reported, and a plain failed exit is not;
 //   - cancelling kills the whole tree, the grandchild included, and stops the
 //     unit, although the direct child is only the systemd-run client;
 //   - dropping the value stops the unit too;
@@ -184,6 +185,45 @@ async fn the_systemd_backend_contains_reports_and_tears_down() {
     );
     let peak = child.peak_bytes().expect("Memory peak scraped from stderr");
     assert!(peak > 0, "peak {peak}");
+    assert_eq!(
+        child.oom_kills(),
+        Some(0),
+        "a failed exit the kernel did not OOM-kill is not an OOM"
+    );
+    wait_unit_gone(&unit).await;
+
+    // 1b. A tree the kernel OOM-kills at the cap says so. Almost no swap
+    // (zero is not expressible: it means "default"), or it would page out
+    // instead of dying.
+    let tight = LocalSystemd {
+        mem_max: "64M".into(),
+        mem_high: "64M".into(),
+        swap_max: "1M".into(),
+    };
+    let mut child = tight
+        .spawn_contained(
+            "blut-systemd-test",
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "head -c 700000000 /dev/zero | tail".to_string(),
+            ],
+            tmp.path(),
+            &[],
+            |c| {
+                c.stderr(std::process::Stdio::piped());
+            },
+        )
+        .await
+        .expect("spawn hog");
+    let unit = child.unit().to_string();
+    assert!(child.pump_stderr(|_| {}));
+    let status = tokio::time::timeout(Duration::from_secs(120), child.wait())
+        .await
+        .expect("hog exited")
+        .expect("wait");
+    assert!(!status.success(), "the hog fit in 64M: {status:?}");
+    assert_eq!(child.oom_kills(), Some(1), "unit result was not oom-kill");
     wait_unit_gone(&unit).await;
 
     // The cap reached the unit: while one runs, its MemoryMax is the

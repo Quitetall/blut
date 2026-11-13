@@ -189,6 +189,20 @@ pub trait Containment: Send + Sync {
         None
     }
 
+    /// Whether a stderr line reports how the kernel treated the tree
+    /// (StderrLine backends): `Some(true)` for an OOM kill, `Some(false)` for
+    /// any other reported result. Default `None`: the line says nothing.
+    fn parse_oom_kill(&self, _line: &str) -> Option<bool> {
+        None
+    }
+
+    /// The kernel's count of OOM kills in the tree, read post-wait for
+    /// CgroupFile backends (`oom_kill` in `memory.events`). Default `None`:
+    /// the backend cannot tell.
+    fn read_oom_kills(&self, _teardown: &TeardownHandle) -> Option<u64> {
+        None
+    }
+
     /// PRIMARY teardown: the command that kills the contained tree
     /// (`systemctl --user stop <unit>` / a `cgroup.kill` write). `None` when
     /// the backend has no out-of-band teardown (rlimit/bare) — the runner's

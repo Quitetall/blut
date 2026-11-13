@@ -17,7 +17,7 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-use super::memsize::{parse_memory_peak_line, resolve_mem_knob};
+use super::memsize::{parse_memory_peak_line, parse_unit_result_oom, resolve_mem_knob};
 use super::{Availability, CapSpec, Containment, PeakSource, TeardownHandle, WrappedRun};
 use crate::error::{Result, TrainError};
 
@@ -171,6 +171,10 @@ impl Containment for SystemdCgroup {
 
     fn parse_peak(&self, line: &str) -> Option<u64> {
         parse_memory_peak_line(line)
+    }
+
+    fn parse_oom_kill(&self, line: &str) -> Option<bool> {
+        parse_unit_result_oom(line)
     }
 
     fn cancel(&self, unit: &str, _teardown: &TeardownHandle) -> Option<tokio::process::Command> {

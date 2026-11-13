@@ -39,6 +39,7 @@ async fn exit_status_passes_through_and_bare_has_no_peak() {
         .expect("wait");
     assert_eq!(status.code(), Some(3));
     assert_eq!(child.peak_bytes(), None);
+    assert_eq!(child.oom_kills(), None, "bare cannot tell");
 }
 
 #[tokio::test]

@@ -113,6 +113,27 @@ pub fn parse_memory_peak_line(line: &str) -> Option<u64> {
     parse_memsize(token)
 }
 
+/// Whether a systemd-run client stderr line reports the unit's result, and if
+/// so whether that result is an OOM kill. `systemd-run --wait` prints
+/// `Finished with result: <result>` when the unit stops; the result is
+/// `oom-kill` when the kernel OOM-killed a process of the unit. `None` for any
+/// other line.
+pub fn parse_unit_result_oom(line: &str) -> Option<bool> {
+    let marker = "Finished with result:";
+    let idx = line.find(marker)?;
+    let result = line[idx + marker.len()..].split_whitespace().next()?;
+    Some(result == "oom-kill")
+}
+
+/// The `oom_kill` counter of a cgroup-v2 `memory.events` file: the number of
+/// processes in the cgroup the kernel OOM-killed.
+pub fn parse_memory_events_oom_kill(events: &str) -> Option<u64> {
+    events.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next() == Some("oom_kill")).then(|| fields.next()?.parse().ok())?
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +173,34 @@ mod tests {
             resolve_mem_knob(Some(8 * 1024 * 1024 * 1024), "X", "44G"),
             "8G"
         );
+    }
+
+    #[test]
+    fn unit_result_line_tells_an_oom_kill_from_other_results() {
+        assert_eq!(
+            parse_unit_result_oom("Finished with result: oom-kill"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_unit_result_oom("Finished with result: exit-code"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_unit_result_oom("Finished with result: success"),
+            Some(false)
+        );
+        assert_eq!(parse_unit_result_oom("MemoryError: out of memory"), None);
+        assert_eq!(parse_unit_result_oom("Finished with result:"), None);
+    }
+
+    #[test]
+    fn memory_events_oom_kill_is_read_by_exact_key() {
+        let events = "low 0\nhigh 12\nmax 40\noom 3\noom_kill 2\noom_group_kill 1\n";
+        assert_eq!(parse_memory_events_oom_kill(events), Some(2));
+        assert_eq!(
+            parse_memory_events_oom_kill("oom 3\noom_group_kill 1\n"),
+            None
+        );
+        assert_eq!(parse_memory_events_oom_kill("oom_kill x\n"), None);
     }
 }

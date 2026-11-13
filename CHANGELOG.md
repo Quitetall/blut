@@ -194,6 +194,22 @@ depend on this crate.
   live_systemd_units, systemd_resume_blocker, cancel_systemd_units,
   resume_blocker}`.
 
+### Fixed
+- **A run is an OOM only when the kernel says so.** `ContainedChild::oom_kills()`
+  reports the kernel's OOM kills in the contained tree after exit: the
+  `oom_kill` counter of `memory.events` on the cgroup-v2 backend, and the
+  unit's `oom-kill` result on the systemd backend (`Some(0)` when it looked and
+  found none; `None` on rlimit, bare and Windows). A cookbook that inferred an
+  OOM from the exit status or the memory peak recorded crashes, and runs that
+  mapped large files, as OOM bounds. `Containment` gains the defaulted methods
+  `parse_oom_kill` and `read_oom_kills`.
+
+- **Concurrent stages on the cgroup-v2 backend no longer lose their cap.**
+  Each spawn probed its cgroup base with a directory of one fixed name. Two
+  spawns at once collided, the loser read the base as unwritable and fell back
+  to the process's own cgroup, where `memory.max` cannot be written, so the
+  stage failed with "Permission denied". Probe names are now unique.
+
 ### Security
 - `rusqlite` moves from 0.32 to 0.41, whose bundled SQLite fixes
   RUSTSEC-2026-0459 (uninitialized memory read through a crafted write-ahead
