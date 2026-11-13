@@ -194,6 +194,11 @@ depend on this crate.
   live_systemd_units, systemd_resume_blocker, cancel_systemd_units,
   resume_blocker}`.
 
+### Security
+- `rusqlite` moves from 0.32 to 0.41, whose bundled SQLite fixes
+  RUSTSEC-2026-0459 (uninitialized memory read through a crafted write-ahead
+  log). A cookbook that depends on `rusqlite` directly must move with it.
+
 ### Changed
 - **MSRV.** Every crate now requires and is tested on Rust 1.99 (was 1.88).
   `blut-operator` moves to the current kube release, which the old floor held
