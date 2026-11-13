@@ -33,6 +33,7 @@ use blut::framework::{RecipeError, StageError};
 use blut::p2p::crypto::KeyPair;
 use blut::p2p::peer::PeerId;
 use blut::recipes::recipe::{Recipe, RecipeDef};
+use blut_types::envelope::ResourceEnvelope;
 use serde::{Deserialize, Serialize};
 
 const CHILD_ENV: &str = "BLUT_MESH_E2E_CHILD";
@@ -106,6 +107,15 @@ struct SeedArgs {
     trace: String,
 }
 
+/// These stages hold a few megabytes. Declaring that keeps admission from
+/// billing the 2G floor, which refuses the run on a busy host.
+fn tiny_envelope() -> ResourceEnvelope {
+    ResourceEnvelope {
+        ram_bytes: 64 << 20,
+        ..Default::default()
+    }
+}
+
 struct Seed;
 #[async_trait]
 impl Stage for Seed {
@@ -115,6 +125,9 @@ impl Stage for Seed {
     type Input = ();
     type Output = Blob;
     type Args = SeedArgs;
+    fn resource_envelope(&self, _: &SeedArgs) -> ResourceEnvelope {
+        tiny_envelope()
+    }
     async fn run(&self, ctx: &StageContext, _: (), a: &SeedArgs) -> Result<Blob, StageError> {
         let pid = std::process::id();
         trace(&a.trace, format!("seed 0 {pid} done"));
@@ -145,6 +158,9 @@ impl Stage for Transform {
     type Input = Blob;
     type Output = Blob;
     type Args = TransformArgs;
+    fn resource_envelope(&self, _: &TransformArgs) -> ResourceEnvelope {
+        tiny_envelope()
+    }
     async fn run(
         &self,
         ctx: &StageContext,
@@ -197,6 +213,9 @@ impl Stage for Collect {
     type Input = Blob;
     type Output = Blob;
     type Args = CollectArgs;
+    fn resource_envelope(&self, _: &CollectArgs) -> ResourceEnvelope {
+        tiny_envelope()
+    }
     async fn run(
         &self,
         ctx: &StageContext,

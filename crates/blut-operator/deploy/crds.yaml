@@ -7,7 +7,6 @@ metadata:
 spec:
   group: blut.lamquant.dev
   names:
-    categories: []
     kind: BlutPlan
     plural: blutplans
     shortNames:
@@ -304,7 +303,6 @@ metadata:
 spec:
   group: blut.lamquant.dev
   names:
-    categories: []
     kind: BlutWorkerPool
     plural: blutworkerpools
     shortNames:
