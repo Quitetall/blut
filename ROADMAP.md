@@ -66,9 +66,12 @@ gone. Still missing: workers on separate hosts, a GPU stage, a large artifact,
 **4. A benchmark baseline that exists.** The regression gate
 (`scripts/bench_regression_gate.py`) compares confidence bounds rather than
 raw medians, and `scripts/run_benchmarks.sh compare` names the `release-0.2`
-baseline. That baseline is not committed yet: it is recorded on a whole
-dedicated machine at the frozen release SHA, because a shared host drifted
-−12% to +8% on unchanged code.
+baseline. A shared host drifted −12% to +8% on unchanged code, so the baseline
+is recorded on a whole dedicated machine. Even there, one pass in two failed on
+unchanged code (one benchmark +17%), so the gate now waits for a quiet host
+and fails only on a slowdown that repeats in a second pass. Still missing: the
+two-pass gate run on a quiet host, and the baseline committed at the release
+commit.
 
 **5. Windows containment.** Local stages are contained on Windows.
 `LocalSystemd::spawn_contained` places a stage process in a Job Object: a

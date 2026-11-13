@@ -208,6 +208,14 @@ slower than the baseline by more than `BLUT_BENCH_MAX_REGRESSION` (default
 `0.10`), even at the lower bound of its confidence interval. A planted +40%
 regression fails it.
 
+Since 2026-11-13 a slowdown has to show twice. On a whole idle 16-core machine
+(load 0.01 to 0.05 before the runs), unchanged code compared against its own
+baseline failed one pass and passed the next: one benchmark sat 17.3% over in
+the first and level in the second, and others moved 5% to 9%. `compare` now
+waits for the host's load to fall to `BLUT_BENCH_MAX_LOAD` (default `1.0`),
+runs a pass, and when that pass flags a benchmark, waits again and runs a
+second pass. Only a benchmark over the limit in both fails the gate.
+
 **What "quiet host" has to mean.** A trial on a rented, shared 8-core
 instance compared unchanged code against its own baseline. The medians moved
 between −11.8% and +7.7%, with tight confidence intervals: other tenants'

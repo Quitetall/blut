@@ -204,6 +204,11 @@ depend on this crate.
   mapped large files, as OOM bounds. `Containment` gains the defaulted methods
   `parse_oom_kill` and `read_oom_kills`.
 
+- **The benchmark gate no longer fails on one noisy pass.**
+  `scripts/run_benchmarks.sh` builds first and waits for the host's load to
+  fall to `BLUT_BENCH_MAX_LOAD` before measuring, and `compare` fails only
+  when a benchmark is over the limit in two passes. On a whole idle machine,
+  unchanged code had failed one single pass in two.
 - **Concurrent stages on the cgroup-v2 backend no longer lose their cap.**
   Each spawn probed its cgroup base with a directory of one fixed name. Two
   spawns at once collided, the loser read the base as unwritable and fell back

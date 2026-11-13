@@ -700,9 +700,9 @@ jobs:
         # library, and the runner image ships no pytest -- so `python -m pytest`
         # failed with "No module named pytest" on every run since the job
         # arrived, and the suites it names never executed in CI at all.
-        # `-m unittest` runs the same 27 tests with nothing to install.
+        # `-m unittest` runs the same tests with nothing to install.
         working-directory: tools
-        run: python -m unittest -v test_check_blut_release_state test_check_blut_i4_evidence
+        run: python -m unittest -v test_check_blut_release_state test_check_blut_i4_evidence test_bench_regression_gate
       - name: The release-state checker still runs and still reports
         # NOT a pass/fail gate on the release itself -- see above. It asserts
         # that the command executes against the committed catalog and produces
