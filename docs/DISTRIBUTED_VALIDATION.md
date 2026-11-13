@@ -1171,7 +1171,7 @@ token revoked (lookup 404), and the old credentials then get `Unauthorized`.
 workers shared the dataset path with the submitter, because a stage reads paths
 on the worker. No GPU stage, no subprocess stage on a worker, nothing large:
 bundles here are kilobytes. Static key credentials only. AWS S3 itself has not
-been run against. Evidence: `/mnt/4tb/artifacts/BLUT/keep/2026-10-30-cloud-queue/`.
+been run against. Evidence: `artifacts/BLUT/keep/2026-10-30-cloud-queue/`.
 
 ## Recorded run: training through BLUT on Windows, in Job Objects (2026-10-24)
 
