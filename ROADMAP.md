@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 # Roadmap
 
-What stands between `0.2.0-alpha.1` and a 1.0, stated as evidence that does not
+What stands between `0.2.0-alpha.2` and a 1.0, stated as evidence that does not
 exist yet rather than as features.
 
 The rule this file follows: a capability is only listed as done when something
@@ -16,7 +16,8 @@ page, is the authority.
 The single-node path is exercised: typed DAG compilation, the content-addressed
 cache, memory admission, containment selection on Linux, durable resume, the
 PlanSpec IR, the Starlark front-end and the Python SDK. That is what
-`0.2.0-alpha.1` means and it is why the version says `alpha`.
+`0.2.0-alpha.1` meant. `0.2.0-alpha.2` adds the distributed work below, each
+item with what it still lacks, which is why the version still says `alpha`.
 
 ## Before 1.0
 

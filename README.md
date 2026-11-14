@@ -155,7 +155,7 @@ let result = ParallelExecutor::execute(plan.into_compiled(), ctx).await?;
 
 ## Key features
 
-### v0.2.0-alpha.1 — current development preview ([CHANGELOG](CHANGELOG.md))
+### v0.2.0-alpha.2 — current development preview ([CHANGELOG](CHANGELOG.md))
 
 | Feature | What |
 |---------|------|
@@ -182,7 +182,7 @@ former default.
 
 Landed in the development tree, but not yet cut as a release. Validation status
 per capability is tracked in the
-[distributed-validation ledger](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md):
+[distributed-validation ledger](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.2/docs/DISTRIBUTED_VALIDATION.md):
 
 | Feature | What |
 |---------|------|
@@ -291,7 +291,7 @@ as an optional fallback.
 
 ## Status
 
-**Source version: 0.2.0-alpha.1**, published on crates.io and tagged here. Each
+**Source version: 0.2.0-alpha.2**, published on crates.io and tagged here. Each
 published crate has a `<crate>-v<version>` tag and a GitHub release pointing at
 the exact commit it was built from, recovered from the published tarball's own
 `.cargo_vcs_info.json`.
@@ -302,7 +302,7 @@ records what they were.
 
 **Experimental:** P2P module, DDP launch wiring, and DAG optimizer remain under
 active validation; per-rung status lives in the
-[distributed-validation ledger](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md).
+[distributed-validation ledger](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.2/docs/DISTRIBUTED_VALIDATION.md).
 
 Engine integration and property tests run in CI; exact counts live in CI, not
 this README. The standalone fuzz workspace is not yet CI-gated. The deprecated
@@ -341,7 +341,7 @@ A **commercial license** is available from the maintainer on request.
 
 - [API reference](API.md)
 - [Roadmap](ROADMAP.md) — what 1.0 needs, stated as missing evidence
-- [Validation status](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md)
+- [Validation status](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.2/docs/DISTRIBUTED_VALIDATION.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Release procedure](RELEASING.md)

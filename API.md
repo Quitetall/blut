@@ -617,7 +617,7 @@ the CLI on an explicit argument list.
 
 ## Preview surface (targeted for the 1.0 contract)
 
-The current `0.2.0-alpha.1` line is a development preview, not a semver-stable
+The current `0.2.0-alpha.2` line is a development preview, not a semver-stable
 1.0 release. The following surface is the intended 1.0 contract, but it may
 still change before the M6 release gate. Cookbooks should pin the exact preview
 version while the campaign is in progress.

@@ -155,9 +155,9 @@ Then verify from an empty directory and clean Cargo home:
 ```bash
 cargo new --lib blut-consumer
 cd blut-consumer
-cargo add blut@=0.2.0-alpha.1
+cargo add blut@=0.2.0-alpha.2
 cargo check
-cargo install blut-dsl --version =0.2.0-alpha.1
+cargo install blut-dsl --version =0.2.0-alpha.2
 ```
 
 ## Tagging

@@ -10,6 +10,8 @@ depend on this crate.
 
 ## [Unreleased]
 
+## [0.2.0-alpha.2] — published 2026-11-14
+
 ### Added
 - **Recipe-level dispatch over the `p2p node` mesh** (feature `p2p`).
   `recipe run <name> --launcher p2p` and `recipe declare <file> --run
@@ -603,13 +605,13 @@ depend on this crate.
   list` says when a binary registers no recipes; the scheduler-lock sensor no
   longer names a nonexistent `--allow-evict` flag.
 
-## [0.2.0-alpha.2] — 2026-10-09
+### Earlier in 0.2.0-alpha.2 (recorded 2026-10-09)
 
 `blut-types`, `blut`, `blut-dsl`, `blut-notify` and `blut-tui`, all at
 0.2.0-alpha.2. `blut-types` carries no code change; it moves because the
 train shares one exact version.
 
-### Added
+#### Added
 - `BLUT_P2P_CONGESTION=bbr` selects BBR congestion control for P2P QUIC
   connections (default `cubic`; any other value is refused). On a real
   Australia-Korea-Germany path at 5% random loss, 1 MiB each way took 14.2 s
@@ -706,14 +708,14 @@ train shares one exact version.
   cannot express a Job Object as a command line and now says so, naming
   `spawn_contained`, instead of blaming a missing `systemd-run`.
 
-### Changed
+#### Changed
 - **Breaking (P2P API):** `p2p::transport::WireMessage` gains `Goodbye`, the
   orderly end of a session, and is now `#[non_exhaustive]` so later messages
   are not breaking. Code outside `blut` that matches on it needs a wildcard
   arm. This is the only finding `scripts/semver_checks.sh` accepts against
   0.2.0-alpha.1, recorded in `scripts/semver_exemptions.tsv`.
 
-### Fixed
+#### Fixed
 - A mesh node served only the connections it accepted, so a peer it dialed
   could not send it anything back over that connection. It now serves every
   connection in both directions. It also handled requests one at a time per
@@ -942,7 +944,7 @@ train shares one exact version.
     application handshake after QUIC connects is bounded to 10 s, so a silent
     client cannot hold the accept loop.
 
-### Security
+#### Security
 - rustls-webpki 0.103.16 and webpki-roots / webpki-root-certs 1.0.10 in
   every lockfile, closing RUSTSEC-2026-0381, -0382 and -0383 (distrusted
   emSign intermediates could be trusted). `blut` now requires rustls-webpki

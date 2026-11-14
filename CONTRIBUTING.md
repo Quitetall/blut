@@ -78,7 +78,7 @@ three-node cluster.
 
 ## API preview
 
-The current `0.2.0-alpha.1` surface is a preview of the intended 1.0 contract —
+The current `0.2.0-alpha.2` surface is a preview of the intended 1.0 contract —
 see the "Preview surface" section in [`API.md`](API.md). Until the M6 release
 gate, downstream cookbooks should pin the exact preview version.
 
