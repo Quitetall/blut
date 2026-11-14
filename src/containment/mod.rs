@@ -22,17 +22,25 @@
 //!     of the whole tree) but a REAL cap.
 //!   - [`bare::Bare`] — no cap; the admission gate is the only floor. Last
 //!     resort, loud warning.
-//!   - `windows::WindowsJobObject` — stub for a future Windows Job Object
-//!     cap (`#[cfg(windows)]`).
+//!   - `windows::WindowsJobObject` — one Windows Job Object per run: a
+//!     tree-wide committed-memory cap, tree kill, and peak
+//!     (`#[cfg(windows)]`; the only backend the Windows factory selects
+//!     before `Bare`). It needs [`Containment::after_spawn`] after the spawn.
 //!
 //! The `Launcher` trait (in `config::launcher`) is ORTHOGONAL: it answers
 //! "which MACHINE runs this" (local / Slurm / Ray); `Containment` answers "how
 //! is THIS-box memory capped". A local run is placed by `LocalSystemd` and
 //! capped by whichever `Containment` the factory selects.
+//!
+//! [`ContainedChild`] is the one-value way to run a wrapped command: it
+//! spawns through [`spawn_attached`] and keeps the backend and teardown handle
+//! until the child exits. `LocalSystemd::spawn_contained` (in
+//! `config::launcher`) builds one from the launcher's memory knobs.
 
 pub mod bare;
 #[cfg(target_os = "linux")]
 pub mod cgroup2;
+mod contained;
 pub mod memsize;
 #[cfg(unix)]
 pub mod rlimit;
@@ -42,6 +50,8 @@ pub mod systemd;
 pub mod windows;
 
 use std::path::{Path, PathBuf};
+
+pub use contained::ContainedChild;
 
 use crate::error::Result;
 
@@ -90,13 +100,19 @@ pub enum PeakSource {
     None,
 }
 
-/// Backend-owned teardown state, threaded back to `cancel`/`read_peak`/
-/// `cleanup`. systemd keys off the unit name (the runner already has it);
-/// cgroup2 needs the created leaf dir; rlimit/bare need nothing.
+/// Backend-owned teardown state, threaded back to `after_spawn`/`cancel`/
+/// `read_peak`/`cleanup`. systemd keys off the unit name (the runner already
+/// has it); cgroup2 needs the created leaf dir; the Windows backend holds the
+/// Job Object; rlimit/bare need nothing.
 #[derive(Clone, Debug, Default)]
 pub struct TeardownHandle {
     /// The cgroup-v2 leaf directory created for this run (cgroup2 backend).
     pub cgroup_path: Option<PathBuf>,
+    /// The run's Job Object (Windows backend). Shared by clones; the job is
+    /// closed, and by `KILL_ON_JOB_CLOSE` every process left in it killed,
+    /// when the last clone drops.
+    #[cfg(windows)]
+    pub(crate) job: Option<std::sync::Arc<windows::JobHandle>>,
 }
 
 /// The constructed child command + the metadata the runner needs to manage it.
@@ -138,6 +154,30 @@ pub trait Containment: Send + Sync {
         caps: &CapSpec,
     ) -> Result<WrappedRun>;
 
+    /// Finish containment on the child the caller just spawned from
+    /// [`WrappedRun::command`]. Call it immediately after a successful
+    /// `spawn()`, before waiting on the child, and treat an `Err` as a failed
+    /// spawn (the backend has already killed the child; wait on it, then call
+    /// [`Containment::cleanup`]). [`spawn_attached`] does all of this.
+    ///
+    /// Default `Ok(())`: the Unix backends contain the child before `exec`
+    /// (wrapper binary or `pre_exec` hook) and need nothing afterwards. The
+    /// Windows Job Object backend assigns the child (started suspended by
+    /// [`Containment::before_spawn`]) to the job here, then lets it run.
+    fn after_spawn(
+        &self,
+        _child: &tokio::process::Child,
+        _teardown: &TeardownHandle,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Adjust the wrapped command immediately before it is spawned. Default
+    /// no-op. The Windows Job Object backend starts the child suspended so
+    /// [`Containment::after_spawn`] can assign it before it runs.
+    /// [`spawn_attached`] calls both.
+    fn before_spawn(&self, _command: &mut tokio::process::Command) {}
+
     /// Parse a peak from a stderr line (StderrLine backends). Default `None`.
     fn parse_peak(&self, _line: &str) -> Option<u64> {
         None
@@ -146,6 +186,20 @@ pub trait Containment: Send + Sync {
     /// Read the peak post-wait for CgroupFile backends (reads `memory.peak`).
     /// Default `None`.
     fn read_peak(&self, _teardown: &TeardownHandle) -> Option<u64> {
+        None
+    }
+
+    /// Whether a stderr line reports how the kernel treated the tree
+    /// (StderrLine backends): `Some(true)` for an OOM kill, `Some(false)` for
+    /// any other reported result. Default `None`: the line says nothing.
+    fn parse_oom_kill(&self, _line: &str) -> Option<bool> {
+        None
+    }
+
+    /// The kernel's count of OOM kills in the tree, read post-wait for
+    /// CgroupFile backends (`oom_kill` in `memory.events`). Default `None`:
+    /// the backend cannot tell.
+    fn read_oom_kills(&self, _teardown: &TeardownHandle) -> Option<u64> {
         None
     }
 
@@ -162,19 +216,65 @@ pub trait Containment: Send + Sync {
     fn cleanup(&self, _teardown: &TeardownHandle) {}
 }
 
+/// Spawn `command` (normally a [`WrappedRun::command`] after the caller has
+/// set pipes etc.) and run [`Containment::after_spawn`] on the child. On an
+/// attach failure the child has already been killed by the backend; it is
+/// reaped here and the error returned, so the caller never holds a child that
+/// is outside its containment. `cleanup` remains the caller's job, exactly as
+/// after any other failed spawn.
+///
+/// A failed `spawn()` is returned as [`TrainError::Io`](crate::error::TrainError::Io)
+/// with the program as `path` and the OS error as `source`, so a caller can
+/// still tell a missing program (`ErrorKind::NotFound`) from other failures.
+pub async fn spawn_attached(
+    backend: &dyn Containment,
+    command: &mut tokio::process::Command,
+    teardown: &TeardownHandle,
+) -> Result<tokio::process::Child> {
+    backend.before_spawn(command);
+    let mut child = command
+        .spawn()
+        .map_err(|source| crate::error::TrainError::Io {
+            path: PathBuf::from(command.as_std().get_program()),
+            source,
+        })?;
+    if let Err(e) = backend.after_spawn(&child, teardown) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(e);
+    }
+    Ok(child)
+}
+
 /// Select a containment backend. Probing order (the `auto` default):
 ///   `BLUT_NO_CONTAIN=1`            → [`bare::Bare`]
 ///   `BLUT_CONTAINMENT=<kind>`      → that backend, NO fallback (an explicit
 ///                                    name that's unusable surfaces as the
 ///                                    runner's fail-closed refusal — loud).
-///   else AUTO: systemd-bus-Present → cgroup2-writable → rlimit → bare.
+///   else AUTO: systemd-bus-Present → cgroup2-writable → rlimit → bare
+///   (Linux/Unix), or windows-job-object → bare (Windows).
 ///
 /// On a developer systemd box this is `SystemdCgroup`; on a cloud box with a
 /// delegated cgroup it's `CgroupV2Direct`; on a locked-down container (this is
 /// the common rented-GPU case) it's `RlimitAddressSpace` — a REAL cap, not
 /// Bare; only a box with none of the above falls to `Bare` with a warning.
 pub fn containment_for() -> Box<dyn Containment> {
-    if std::env::var_os("BLUT_NO_CONTAIN").is_some() {
+    select_backend(false)
+}
+
+/// [`containment_for`], but the AUTO order never picks the systemd backend:
+/// for a caller that needs something systemd on this host cannot give (see
+/// `LocalSystemd::spawn_contained`). An explicit `BLUT_CONTAINMENT=systemd`
+/// still selects it; the caller decides what to do with that.
+#[cfg(target_os = "linux")]
+pub(crate) fn containment_for_without_systemd() -> Box<dyn Containment> {
+    select_backend(true)
+}
+
+fn select_backend(skip_systemd: bool) -> Box<dyn Containment> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = skip_systemd;
+    if crate::config::env_flag("BLUT_NO_CONTAIN") {
         return Box::new(bare::Bare);
     }
 
@@ -186,6 +286,8 @@ pub fn containment_for() -> Box<dyn Containment> {
         Ok("cgroup2") => return Box::new(cgroup2::CgroupV2Direct),
         #[cfg(unix)]
         Ok("rlimit") => return Box::new(rlimit::RlimitAddressSpace),
+        #[cfg(windows)]
+        Ok("windows-job-object") => return Box::new(windows::WindowsJobObject),
         Ok("auto") | Err(_) => {}
         Ok(other) => {
             tracing::warn!("unknown BLUT_CONTAINMENT='{other}', using auto");
@@ -196,7 +298,7 @@ pub fn containment_for() -> Box<dyn Containment> {
     #[cfg(target_os = "linux")]
     {
         let sd = systemd::SystemdCgroup;
-        if sd.available() == Availability::Present {
+        if !skip_systemd && sd.available() == Availability::Present {
             return Box::new(sd);
         }
         let cg = cgroup2::CgroupV2Direct;
@@ -217,9 +319,17 @@ pub fn containment_for() -> Box<dyn Containment> {
         }
     }
 
+    #[cfg(windows)]
+    {
+        let job = windows::WindowsJobObject;
+        if job.available() == Availability::Present {
+            return Box::new(job);
+        }
+    }
+
     tracing::warn!(
         "containment: no systemd --user bus, no writable cgroup-v2 subtree, and \
-         no RLIMIT_AS — running BARE (admission-gated but NOT memory-capped; an \
+         no RLIMIT_AS or Job Object — running BARE (admission-gated but NOT memory-capped; an \
          oversized run can OOM the box). Set BLUT_CONTAINMENT or fix delegation."
     );
     Box::new(bare::Bare)

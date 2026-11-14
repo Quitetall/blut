@@ -364,7 +364,13 @@ impl Stage for RecordOrder {
         record_fusion_task(&args.label);
         if args.label == "fuse-admission-root" {
             FUSION_ROOT_STARTED.notify_one();
-            FUSION_RELEASE_ROOT.notified().await;
+            // Bounded: a lost release must fail the test, not hang the binary.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                FUSION_RELEASE_ROOT.notified(),
+            )
+            .await
+            .expect("the test releases the fusion root");
         }
         EXECUTION_ORDER
             .lock()
@@ -2607,7 +2613,12 @@ async fn dag_opt_advanced_gate_fused_chain_holds_one_admission() {
         FUSION_WAITER_STARTED.notify_one();
         let permit = cpu.acquire_owned().await.expect("CPU semaphore stays open");
         FUSION_WAITER_ACQUIRED.store(true, Ordering::SeqCst);
-        FUSION_RELEASE_WAITER.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            FUSION_RELEASE_WAITER.notified(),
+        )
+        .await
+        .expect("the test releases the CPU waiter");
         drop(permit);
     });
     tokio::time::timeout(

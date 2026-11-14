@@ -43,23 +43,42 @@ pub(super) enum RecipeCommand {
         #[arg(long, default_value_t = false)]
         run: bool,
         /// Promote this run's outputs to the global cache (only with `--run`).
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, requires = "run")]
         shared_cache: bool,
         /// Force-recompute on launch: bypass the stage cache READ so every stage
         /// runs even with a warm entry (only with `--run`). Alias: `--force`.
-        #[arg(long = "no-cache", alias = "force", default_value_t = false)]
+        #[arg(
+            long = "no-cache",
+            alias = "force",
+            default_value_t = false,
+            requires = "run"
+        )]
         no_cache: bool,
         /// Force all declared async-I/O lanes onto their synchronous Inline
-        /// fallback (execution-only; cache identity is unchanged).
-        #[arg(long, default_value_t = false)]
+        /// fallback (execution-only; cache identity is unchanged; only with
+        /// `--run`).
+        #[arg(long, default_value_t = false, requires = "run")]
         sync_io: bool,
         /// Tenant to resolve a `registry://plan@<name>` deploy URI against and,
         /// with `--run`, to own the launched job (ADR 0085/0096).
         #[arg(long, default_value = "default")]
         tenant: String,
-        /// Experiment/campaign name for lineage grouping. Defaults to the recipe.
-        #[arg(long)]
+        /// Experiment/campaign name for lineage grouping. Defaults to the recipe
+        /// (only with `--run`).
+        #[arg(long, requires = "run")]
         experiment: Option<String>,
+        /// Where `--run` executes: `local` (default); `k8s`, which ships the
+        /// file to a Kubernetes cluster as a BlutPlan for blut-operator and
+        /// follows it (settings: `BLUT_K8S_*`, docs/OPERATOR.md); `cloud`, which
+        /// submits every stage to the queue in `BLUT_CLOUD_QUEUE` for `blut cloud
+        /// worker` processes (see `recipe run --help`); or `p2p`, which joins the
+        /// `p2p node` mesh (`--p2p-seed`) and runs each stage that declares it may
+        /// leave this machine on a peer with the same code identity (a build with
+        /// the `p2p` feature).
+        #[arg(long, default_value = "local")]
+        launcher: String,
+        #[command(flatten)]
+        mesh: super::mesh_launch::MeshArgs,
     },
     /// Execute a recipe, or a config-driven sweep over it.
     Run {
@@ -112,6 +131,17 @@ pub(super) enum RecipeCommand {
         /// (`BLUT_SLURM_*` / `RAY_ADDRESS` env). SHARED-FS CONTRACT: the
         /// content-addressed cache + job dirs must be reachable from the
         /// compute node (NFS/Lustre); local admission still gates (conservative).
+        /// `k8s` submits the whole recipe to blut-operator (docs/OPERATOR.md).
+        /// `p2p` joins the `p2p node` mesh (`--p2p-seed`, a build with the `p2p`
+        /// feature): each stage that declares it may leave this machine runs on
+        /// a peer with the same code identity, the others run here, and the run
+        /// fails if no peer can take an eligible stage.
+        /// `cloud` submits every stage to the durable queue in `BLUT_CLOUD_QUEUE`
+        /// (`s3://bucket[/prefix]`, credentials from `AWS_*` only, or a
+        /// directory; a build with the `cloud` feature, `s3` for a bucket) for
+        /// `blut cloud worker` processes, which need the same code; nothing
+        /// runs on this machine, and a stage nobody claims within
+        /// `BLUT_CLOUD_PICKUP_SECS` (default 300) fails the run.
         #[arg(long, default_value = "local")]
         launcher: String,
         /// Tenant (`project[/domain]`, ADR 0096) whose namespace this run's
@@ -122,6 +152,8 @@ pub(super) enum RecipeCommand {
         /// Experiment/campaign name for lineage grouping. Defaults to the recipe.
         #[arg(long)]
         experiment: Option<String>,
+        #[command(flatten)]
+        mesh: super::mesh_launch::MeshArgs,
     },
 }
 
@@ -157,8 +189,12 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 emit_json(&arr)?;
                 return Ok(());
             }
+            if sorted.is_empty() {
+                println!("(no recipes registered in this binary)");
+                return Ok(());
+            }
             println!(
-                "{:<32} {:<14} {:<12} {:<24} → output",
+                "{:<32} {:<16} {:<12} {:<24} → output",
                 "name", "category", "backend", "inputs"
             );
             for r in sorted {
@@ -168,7 +204,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     r.input_kinds.join(",")
                 };
                 println!(
-                    "{:<32} {:<14} {:<12} {:<24} → {}",
+                    "{:<32} {:<16} {:<12} {:<24} → {}",
                     r.name,
                     r.category.label(),
                     r.backend_id,
@@ -178,7 +214,9 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             }
         }
         RecipeCommand::Show { name } => {
-            let r = find_recipe(&name).ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            let r = find_recipe(&name).ok_or_else(|| {
+                anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)")
+            })?;
             println!("name        : {}", r.name);
             println!("category    : {}", r.category.label());
             println!("backend     : {}", r.backend_id);
@@ -208,7 +246,80 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             sync_io,
             tenant,
             experiment,
+            launcher,
+            mesh: mesh_args,
         } => {
+            let declare_target: crate::config::launcher::LaunchTarget = launcher
+                .parse()
+                .map_err(|e| anyhow!("invalid --launcher {launcher:?}: {e}"))?;
+            // Before the arm below, which sends other launchers to `recipe
+            // run`. p2p and cloud are placed here.
+            super::mesh_launch::refuse_stray(&mesh_args, declare_target)?;
+            if declare_target == crate::config::launcher::LaunchTarget::P2P {
+                super::mesh_launch::check(&mesh_args, "`recipe declare --run`")?;
+            } else if declare_target == crate::config::launcher::LaunchTarget::Cloud {
+                if !run {
+                    return Err(anyhow!(
+                        "--launcher cloud submits the recipe's stages, so it needs --run; \
+                         without --run, `recipe declare` only renders the plan"
+                    ));
+                }
+                crate::config::launcher::check_cloud_launch("`recipe declare --run`")
+                    .map_err(|e| anyhow!("{e}"))?;
+            } else {
+                crate::config::launcher::check_launcher_placeable(
+                    declare_target,
+                    "`recipe declare --run`",
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+            match declare_target {
+                crate::config::launcher::LaunchTarget::Local
+                | crate::config::launcher::LaunchTarget::Cloud => {}
+                crate::config::launcher::LaunchTarget::P2P => {
+                    if file.is_none() || !run {
+                        return Err(anyhow!(
+                            "--launcher p2p runs the recipe on the mesh, so it needs a <file> \
+                             and --run; without --run, `recipe declare` only renders the plan"
+                        ));
+                    }
+                }
+                crate::config::launcher::LaunchTarget::K8s => {
+                    let Some(path) = file.as_ref() else {
+                        return Err(anyhow!("--launcher k8s needs a <file> and --run"));
+                    };
+                    if !run {
+                        return Err(anyhow!(
+                            "--launcher k8s submits the recipe, so it needs --run; without \
+                             --run, `recipe declare` only renders the plan, locally"
+                        ));
+                    }
+                    let tenant_is_default = crate::tenant::Tenant::parse(&tenant)
+                        .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?
+                        .is_default();
+                    return run_file_on_k8s(
+                        reg,
+                        path,
+                        &args,
+                        K8sUnsupported {
+                            config_mode: false,
+                            shared_cache,
+                            no_cache,
+                            sync_io,
+                            tenant_is_default,
+                            experiment: experiment.is_some(),
+                        },
+                    )
+                    .await;
+                }
+                other => {
+                    return Err(anyhow!(
+                        "recipe declare --run takes --launcher local, p2p, cloud or k8s, not {}; \
+                         use `recipe run` for the other launchers",
+                        other.as_str()
+                    ));
+                }
+            }
             use crate::recipes::declarative::{scan_user_recipes, user_recipes_dir};
             match file {
                 None => {
@@ -232,7 +343,13 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 Some(path) => {
                     let tenant = crate::tenant::Tenant::parse(&tenant)
                         .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
-                    let launch_target = crate::config::launcher::LaunchTarget::Local;
+                    // Local, p2p or cloud: the arms above sent every other
+                    // launcher elsewhere.
+                    let launch_target = if run {
+                        declare_target
+                    } else {
+                        crate::config::launcher::LaunchTarget::Local
+                    };
                     // A `registry://plan@<name>` deploy URI (ADR 0085) resolves
                     // to a FROZEN PlanSpec from the local registry and dispatches
                     // that exact graph; otherwise `path` is a recipe file
@@ -261,20 +378,38 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                         println!(
                             "✓ '{name}' compiles + kind-checks ({n} ingredient(s)); launching…"
                         );
-                        launch_compiled_plan(
+                        let mesh = if launch_target == crate::config::launcher::LaunchTarget::P2P {
+                            Some(
+                                super::mesh_launch::join(&mesh_args, "`recipe declare --run`")
+                                    .await?,
+                            )
+                        } else {
+                            None
+                        };
+                        let launched = launch_compiled_plan(
+                            reg,
                             &name,
                             plan,
                             None,
                             None,
                             shared_cache,
-                            crate::config::launcher::LaunchTarget::Local,
+                            launch_target,
                             None,
                             no_cache,
                             sync_io,
                             tenant,
-                            experiment,
+                            // Runs of one deploy pointer group as one
+                            // experiment, `plan.<pointer>`, unless named.
+                            experiment.or_else(|| {
+                                crate::registry_db::parse_pointer_uri(&name)
+                                    .map(|ptr| format!("plan.{ptr}"))
+                            }),
                         )
-                        .await?;
+                        .await;
+                        if let Some(mesh) = mesh {
+                            mesh.close().await;
+                        }
+                        launched?;
                     } else {
                         // Render-only (default): print the runnable DAG, no exec.
                         print!("{}", plan.render_ascii().map_err(|e| anyhow!("{e}"))?);
@@ -298,15 +433,56 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             launcher,
             tenant,
             experiment,
+            mesh: mesh_args,
         } => {
             // #3 distributed: parse placement up front so a typo fails the run
             // BEFORE any job dir / state is written (vs deep in the executor).
             let launch_target: crate::config::launcher::LaunchTarget = launcher
                 .parse()
                 .map_err(|e| anyhow!("invalid --launcher {launcher:?}: {e}"))?;
+            crate::config::launcher::check_launcher_env(launch_target)
+                .map_err(|e| anyhow!("--launcher {launcher}: {e}"))?;
+            crate::config::launcher::check_launcher_tools(launch_target)
+                .map_err(|e| anyhow!("{e}"))?;
+            // Before `--dry-run` and config mode too: a dry run that reports
+            // OK for a placement the real run refuses would be a lie. p2p and
+            // cloud are placed by this command; what they need is checked here.
+            super::mesh_launch::refuse_stray(&mesh_args, launch_target)?;
+            if launch_target == crate::config::launcher::LaunchTarget::P2P {
+                super::mesh_launch::check(&mesh_args, "`recipe run`")?;
+            } else if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+                crate::config::launcher::check_cloud_launch("`recipe run`")
+                    .map_err(|e| anyhow!("{e}"))?;
+            } else {
+                crate::config::launcher::check_launcher_placeable(launch_target, "`recipe run`")
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
             // ADR 0096: parse the tenant up front (same fail-fast discipline).
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+            // k8s is not a stage placement: the whole recipe is submitted to the
+            // cluster as a BlutPlan and followed there. Nothing below runs.
+            if launch_target == crate::config::launcher::LaunchTarget::K8s {
+                return run_recipe_on_k8s(
+                    reg,
+                    &name,
+                    &args,
+                    dry_run,
+                    K8sUnsupported {
+                        config_mode: config_dir.is_some()
+                            || config_name.is_some()
+                            || config_key.is_some()
+                            || !set.is_empty()
+                            || !sweep.is_empty(),
+                        shared_cache,
+                        no_cache,
+                        sync_io,
+                        tenant_is_default: tenant.is_default(),
+                        experiment: experiment.is_some(),
+                    },
+                )
+                .await;
+            }
             // M2.1: fail before compilation or job-dir creation when the tenant
             // is unknown to the active quota policy. With no config, only the
             // flat `default` tenant exists and owns 100% of usable RAM.
@@ -321,85 +497,120 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 || config_key.is_some()
                 || !set.is_empty()
                 || !sweep.is_empty();
-            if config_mode {
-                if args != "{}" {
-                    eprintln!(
-                        "warning: --args is ignored in config mode (args come from the config)"
-                    );
-                }
-                run_recipe_sweep(
-                    reg,
-                    &name,
-                    config_dir,
-                    config_name,
-                    config_key,
-                    &set,
-                    &sweep,
-                    dry_run,
-                    shared_cache,
-                    launch_target,
-                    no_cache,
-                    sync_io,
-                    tenant,
-                    experiment,
-                )
-                .await?;
+            // A real p2p run joins the mesh once; a sweep's combos share it.
+            let mesh = if launch_target == crate::config::launcher::LaunchTarget::P2P && !dry_run {
+                Some(super::mesh_launch::join(&mesh_args, "`recipe run`").await?)
             } else {
-                let raw: serde_json::Value = serde_json::from_str(&args)
-                    .with_context(|| format!("parse --args as JSON: {args}"))?;
-                if dry_run {
-                    let raw =
-                        crate::registry_args::resolve_recipe_args(raw, &tenant, launch_target)
-                            .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
-                    // `--dry-run` is documented as "without running anything". The
-                    // config-mode sweep path honors that (run_recipe_sweep), but the
-                    // single-invocation `--args` path previously fell straight into
-                    // run_one_recipe — which compiled the plan AND executed every
-                    // stage (spawning the warm systemd-run unit + acquiring the
-                    // exclusive GPU lock) before any value was produced. Short-circuit
-                    // here: VALIDATE the args + confirm the plan COMPILES (so a
-                    // dry-run can't report "OK" on invalid args — B/P5), then report
-                    // the resolved RAM footprint and return WITHOUT executing or
-                    // touching any resource (compile builds the plan; it never runs).
-                    let def = reg
-                        .find(&name)
-                        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
-                    let plan = (def.compile_fn)(raw.clone()).map_err(|e| anyhow!("{e}"))?;
-                    let fp = plan.declared_footprint();
-                    if !plan.has_resource_declarations() {
+                None
+            };
+            let outcome: Result<()> = async {
+                if config_mode {
+                    if args != "{}" {
                         eprintln!(
-                            "warning: no stage in this plan declares a resource \
-                             envelope — billing the 2G compatibility floor. \
-                             Implement Stage::resource_envelope (ADR 0133) for \
-                             real admission."
+                            "warning: --args is ignored in config mode (args come from the config)"
                         );
                     }
-                    let gib = fp.ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                    println!(
-                        "[dry-run] recipe={name} resolved RAM footprint ≈ {gib:.1}G \
-                         (admission would gate this against free RAM + the 6G floor). \
-                         No ingredients executed; no GPU/cgroup acquired."
-                    );
-                    return Ok(());
+                    run_recipe_sweep(
+                        reg,
+                        &name,
+                        config_dir,
+                        config_name,
+                        config_key,
+                        &set,
+                        &sweep,
+                        dry_run,
+                        shared_cache,
+                        launch_target,
+                        no_cache,
+                        sync_io,
+                        tenant,
+                        experiment,
+                    )
+                    .await?;
+                } else {
+                    let raw: serde_json::Value = serde_json::from_str(&args)
+                        .with_context(|| format!("parse --args as JSON: {args}"))?;
+                    if dry_run {
+                        let raw =
+                            crate::registry_args::resolve_recipe_args(raw, &tenant, launch_target)
+                                .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
+                        // `--dry-run` is documented as "without running anything". The
+                        // config-mode sweep path honors that (run_recipe_sweep), but the
+                        // single-invocation `--args` path previously fell straight into
+                        // run_one_recipe — which compiled the plan AND executed every
+                        // stage (spawning the warm systemd-run unit + acquiring the
+                        // exclusive GPU lock) before any value was produced. Short-circuit
+                        // here: VALIDATE the args + confirm the plan COMPILES (so a
+                        // dry-run can't report "OK" on invalid args — B/P5), then report
+                        // the resolved RAM footprint and return WITHOUT executing or
+                        // touching any resource (compile builds the plan; it never runs).
+                        let def = reg.find(&name).ok_or_else(|| {
+                            anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)")
+                        })?;
+                        let plan = (def.compile_fn)(raw.clone()).map_err(|e| anyhow!("{e}"))?;
+                        println!("{}", dry_run_footprint(&name, &plan)?.1);
+                        return Ok(());
+                    }
+                    run_one_recipe(
+                        reg,
+                        &name,
+                        raw,
+                        None,
+                        shared_cache,
+                        launch_target,
+                        None,
+                        no_cache,
+                        sync_io,
+                        tenant,
+                        experiment,
+                    )
+                    .await?;
                 }
-                run_one_recipe(
-                    reg,
-                    &name,
-                    raw,
-                    None,
-                    shared_cache,
-                    launch_target,
-                    None,
-                    no_cache,
-                    sync_io,
-                    tenant,
-                    experiment,
-                )
-                .await?;
+                Ok(())
             }
+            .await;
+            if let Some(mesh) = mesh {
+                mesh.close().await;
+            }
+            outcome?;
         }
     }
     Ok(())
+}
+
+/// The RAM footprint `recipe run --dry-run` reports, and its report line. It is
+/// the footprint launch admission bills before auto-tuning
+/// ([`prepare_compiled_plan_launch`]): the plan's largest declared envelope at
+/// byte granularity (resolved against the measured-peak store when it declares
+/// calibration dimensions), or the 2 GiB compatibility floor when no stage
+/// declares one ([`footprint_or_floor`] warns, and refuses under
+/// `BLUT_STRICT_DECLARATIONS=1`, as a launch does). The line says which.
+///
+/// It used to report `CompiledPlan::declared_footprint`, whole GiB of the
+/// legacy `memory_gib_for` with the 2 GiB floor applied to every plan, so a
+/// stage declaring 256 MiB read "≈ 2.0G" while the launch billed 256 MiB.
+fn dry_run_footprint(
+    name: &str,
+    plan: &crate::framework::plan::CompiledPlan,
+) -> Result<(crate::broker::Footprint, String)> {
+    let declared = plan.max_declared_envelope();
+    let warm = warm_context(plan.exec_view().recipe_args);
+    let footprint = footprint_or_floor(
+        plan_footprint_declared(declared.as_ref(), name, None, warm),
+        name,
+    )?;
+    let basis = match &declared {
+        Some((stage, _)) => format!("the largest declared envelope, stage '{stage}'"),
+        None => "the compatibility floor: no stage declares an envelope".to_string(),
+    };
+    let line = format!(
+        "[dry-run] recipe={name} resolved RAM footprint ≈ {} ({basis}; before \
+         auto-tune). Admission would gate it against free RAM + the {}G floor. \
+         No ingredients executed; no GPU/cgroup acquired.",
+        human_bytes(footprint.ram_bytes),
+        crate::broker::admission::DEFAULT_FLOOR_GIB
+    );
+    Ok((footprint, line))
 }
 
 /// Run ONE recipe invocation end-to-end: compile → job dir → admission gate →
@@ -547,7 +758,7 @@ pub(super) fn prepare_one_partitioned_recipe(
     .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
     let recipe = reg
         .find(name)
-        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)"))?;
     let plan = (recipe.compile_fn)(resolved_args.clone())
         .map_err(|error| anyhow!("recipe compile failed: {error}"))?
         .with_partition(partition);
@@ -558,6 +769,7 @@ pub(super) fn prepare_one_partitioned_recipe(
         &plan.execution_fingerprint(),
     );
     let launch = prepare_compiled_plan_launch(
+        reg,
         name,
         plan,
         Some(RecipeMarker {
@@ -565,6 +777,7 @@ pub(super) fn prepare_one_partitioned_recipe(
             args: resolved_args,
             source_args: Some(source_args),
             resolved_handles,
+            launcher: Some(launch_target.as_str().to_string()),
         }),
         None,
         shared_cache,
@@ -602,7 +815,7 @@ async fn run_one_recipe_resolved(
 ) -> Result<(String, serde_json::Value, String)> {
     let r = reg
         .find(name)
-        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)"))?;
     let mut plan =
         (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
     if let Some(partition) = partition {
@@ -618,6 +831,7 @@ async fn run_one_recipe_resolved(
     // oracle for `blut plan resume`). Declarative `.toml` launches pass `None`
     // (no registry recipe to re-compile from) — see `launch_compiled_plan`.
     launch_compiled_plan(
+        reg,
         name,
         plan,
         Some(RecipeMarker {
@@ -625,6 +839,7 @@ async fn run_one_recipe_resolved(
             args,
             source_args: Some(source_args),
             resolved_handles,
+            launcher: Some(launch_target.as_str().to_string()),
         }),
         sweep_fp,
         shared_cache,
@@ -646,7 +861,7 @@ async fn run_one_recipe_resolved(
 /// verbatim. All three resolve stage NAMES against the registry (no dynamic
 /// code loading) and are fully kind-checked before returning. Returns
 /// `(plan_name, plan, n_nodes)`.
-fn compile_declared_recipe(
+pub(super) fn compile_declared_recipe(
     reg: &crate::framework::Registry,
     path: &std::path::Path,
     args_json: &str,
@@ -822,7 +1037,7 @@ fn resolve_declarative_args_with(
 /// sibling of the current executable (the usual install layout), else bare
 /// `blut-dsl` resolved on `$PATH`.
 fn blut_dsl_binary() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("BLUT_DSL_BIN") {
+    if let Some(p) = std::env::var_os("BLUT_DSL_BIN") {
         return std::path::PathBuf::from(p);
     }
     if let Ok(exe) = std::env::current_exe()
@@ -858,6 +1073,8 @@ pub(super) struct PreparedRecipeLaunch {
     job_dir: std::path::PathBuf,
     ctx: crate::framework::ExecCtx,
     device_index: Option<usize>,
+    #[cfg(feature = "cloud")]
+    cloud: Option<super::cloud::CloudRun>,
 }
 
 impl PreparedRecipeLaunch {
@@ -893,28 +1110,91 @@ impl PreparedRecipeLaunch {
             job_dir,
             ctx,
             device_index,
+            #[cfg(feature = "cloud")]
+            cloud,
         } = self;
+
+        // The cloud queue is reached before anything is written for the job,
+        // so a wrong endpoint or rejected credentials leave nothing behind.
+        #[cfg(feature = "cloud")]
+        if let Some(cloud) = &cloud {
+            cloud.probe().await?;
+        }
+
+        // Admission and the scheduler lock come BEFORE anything is written for
+        // this job. A launch refused here never started: it used to leave a
+        // job directory marked `failed` behind, one per refused attempt, in
+        // `blut jobs` (the same reason `plan resume` takes them first).
+        //
+        // This reservation consumes the same exact footprint and immutable
+        // TenantAdmission snapshot used during profile selection. In
+        // particular, a prepared partition cell cannot silently re-probe or
+        // resolve a second async-I/O candidate before execution.
+        //
+        // A cloud run takes neither: its stages run on the workers, so this
+        // machine's free RAM and its one training slot say nothing about it.
+        #[cfg(feature = "cloud")]
+        let runs_here = cloud.is_none();
+        #[cfg(not(feature = "cloud"))]
+        let runs_here = true;
+        let _tenant_reservation = if runs_here {
+            Some(
+                tenant_admission
+                    .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
+                    .map_err(|reason| anyhow!("recipe '{name}' admission refused: {reason}"))?,
+            )
+        } else {
+            None
+        };
+
+        let holder = format!("blut-recipe:{job_id}");
+        let lock = if runs_here {
+            Some(
+                match device_index {
+                    Some(dev) => {
+                        scheduler_lock::acquire_exclusive_device(dev, holder, LockKind::Training)
+                    }
+                    None => scheduler_lock::acquire_exclusive(holder, LockKind::Training),
+                }
+                .map_err(|error| anyhow!("acquire_exclusive: {error}"))?,
+            )
+        } else {
+            None
+        };
 
         // Preparation may wait behind an outer scheduler, so it must not leave
         // an orphan job directory merely by computing an admission witness.
         // Materialize persistent job state only once execution actually owns
         // that scheduler permit.
+        //
+        // The experiment label is settled before anything is written. A launch
+        // named by a deploy URI (`registry://plan@prod`) defaulted it to that
+        // URI, which is not a valid experiment name, and failed after the job
+        // directory existed but before its state did: `blut jobs` then listed a
+        // job that read as `running` forever.
+        let experiment = experiment.unwrap_or_else(|| experiment_label(&name));
+        if !crate::experiment_registry::is_safe_experiment_name(&experiment) {
+            return Err(anyhow!(
+                "invalid --experiment '{experiment}' (expected [A-Za-z0-9_.-]+)"
+            ));
+        }
         let materialized_job_dir = crate::paths::job_dir(&job_id)?;
         debug_assert_eq!(materialized_job_dir, job_dir);
-        crate::jobs::write_tenant(&job_id, &tenant)
-            .with_context(|| format!("persist tenant for {job_id}"))?;
-        crate::jobs::write_experiment(&job_id, experiment.as_deref().unwrap_or(&name))
-            .with_context(|| format!("persist experiment for {job_id}"))?;
-
-        // Mark recipe for plan resume — only for a registry recipe (a
-        // declarative `.toml` launch passes `None`: there is no registry recipe
-        // to re-compile from on resume, so writing a marker would be dangling).
-        if let Some(marker) = marker {
-            marker.write_to(&job_dir)?;
+        let markerless = marker.is_none();
+        if let Err(error) = persist_launch_records(&job_id, &job_dir, &tenant, &experiment, marker)
+        {
+            // Nothing ran: remove the partial job rather than leave one behind.
+            let _ = std::fs::remove_dir_all(&job_dir);
+            return Err(error);
         }
-
-        crate::jobs::write_state(&job_id, JobState::Running)
-            .with_context(|| format!("write Running state for {job_id}"))?;
+        let _driver = crate::jobs::record_driver(&job_id);
+        #[cfg(feature = "cloud")]
+        if let Some(cloud) = &cloud
+            && let Err(error) = cloud.record(&job_dir)
+        {
+            let _ = crate::jobs::write_state(&job_id, JobState::Failed);
+            return Err(error);
+        }
 
         // KILL-2/KILL-3: bind this job so backend spawns mirror the python
         // child's PROCESS GROUP id into the job pid file (not blut's own pid).
@@ -923,39 +1203,6 @@ impl PreparedRecipeLaunch {
         // KILL-3: trap SIGTERM/ctrl-c. On signal, cancel the executor token AND
         // killpg the live child group, then return so the scheduler lock drops.
         install_cancel_handler(ctx.cancel.clone());
-
-        // This reservation consumes the same exact footprint and immutable
-        // TenantAdmission snapshot used during profile selection. In
-        // particular, a prepared partition cell cannot silently re-probe or
-        // resolve a second async-I/O candidate before execution.
-        let _tenant_reservation = match tenant_admission
-            .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
-        {
-            Ok(reservation) => reservation,
-            Err(reason) => {
-                crate::python_kill::unbind_current_job();
-                if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                    tracing::warn!("write Failed state for {job_id}: {se}");
-                }
-                return Err(anyhow!("recipe '{name}' admission refused: {reason}"));
-            }
-        };
-
-        let holder = format!("blut-recipe:{job_id}");
-        let lock = match device_index {
-            Some(dev) => scheduler_lock::acquire_exclusive_device(dev, holder, LockKind::Training),
-            None => scheduler_lock::acquire_exclusive(holder, LockKind::Training),
-        };
-        let lock = match lock {
-            Ok(lock) => lock,
-            Err(error) => {
-                crate::python_kill::unbind_current_job();
-                if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                    tracing::warn!("write Failed state for {job_id}: {se}");
-                }
-                return Err(anyhow!("acquire_exclusive: {error}"));
-            }
-        };
 
         // Sensord marks an event dispatched only after this exact recipe owns
         // both its tenant reservation and scheduler lock. The durable marker
@@ -974,12 +1221,29 @@ impl PreparedRecipeLaunch {
         eprintln!("recipe {name}");
         eprintln!("job    {job_id}");
         eprintln!("dir    {}", job_dir.display());
-        eprintln!("lock   {}", lock.path().display());
+        if let Some(lock) = &lock {
+            eprintln!("lock   {}", lock.path().display());
+        }
 
-        persist_plan_graph(&plan, &job_dir);
+        // A launch with no recipe marker (a plan file, a declared recipe, a
+        // deploy pointer) is re-indexed from its plan graph, so the graph
+        // carries the name the run is recorded under. A pointer launch is
+        // recorded as `registry://plan@<name>` while its graph kept the
+        // published spec's name: `lineage reindex` then refused the run
+        // ("recipe is immutable"), or on a fresh index recorded the spec name,
+        // so an SLA rule scoped to the pointer stopped matching its runs.
+        if markerless {
+            persist_plan_graph_as(&plan, &job_dir, &name);
+        } else {
+            persist_plan_graph(&plan, &job_dir);
+        }
         // `ctx` owns the private preparation witness, so `execute_plan`
         // dispatches this exact post-DCE plan/profile without resolving again.
         let result = crate::framework::execute_plan(plan, ctx).await;
+        #[cfg(feature = "cloud")]
+        if let Some(cloud) = &cloud {
+            cloud.sweep(&job_dir).await;
+        }
         drop(lock);
         crate::python_kill::unbind_current_job();
         match result {
@@ -1011,23 +1275,134 @@ impl PreparedRecipeLaunch {
                 if let Err(error) = crate::lineage_db::ingest_job(&job_id, &name, "done") {
                     tracing::warn!("lineage index {job_id}: {error}");
                 }
+                write_run_summary(
+                    &job_id,
+                    &job_dir,
+                    RunOutcome::Succeeded {
+                        stages_total: result.n_stages,
+                        cache_hits: result.n_cache_hits,
+                        cache_misses: result.n_cache_misses,
+                        warnings: result.warnings.len(),
+                    },
+                );
                 Ok(job_id)
             }
             Err(error) => {
-                if let Err(state_error) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                    tracing::warn!("write Failed state for {job_id}: {state_error}");
+                let (state, outcome) = terminal_for_error(&error);
+                if let Err(state_error) = crate::jobs::write_state(&job_id, state) {
+                    tracing::warn!("write {outcome} state for {job_id}: {state_error}");
                 }
-                if let Err(index_error) = crate::lineage_db::ingest_job(&job_id, &name, "failed") {
-                    tracing::debug!("lineage index (failed) {job_id}: {index_error}");
+                if let Err(index_error) = crate::lineage_db::ingest_job(&job_id, &name, outcome) {
+                    tracing::debug!("lineage index ({outcome}) {job_id}: {index_error}");
                 }
-                Err(anyhow::Error::from(error).context("plan execution failed"))
+                let error = anyhow::Error::from(error).context("plan execution failed");
+                write_run_summary(&job_id, &job_dir, RunOutcome::Failed { error: &error });
+                Err(error)
             }
         }
     }
 }
 
+/// The job state and lineage outcome for a plan that ended in `error`. A run
+/// stopped by `blut cancel` or Ctrl-C used to be recorded as `failed` in the
+/// lineage index, beside a `cancelled` job state.
+pub(super) fn terminal_for_error(error: &crate::framework::PlanError) -> (JobState, &'static str) {
+    let cancelled = match error {
+        crate::framework::PlanError::Cancelled => true,
+        crate::framework::PlanError::StageFailed { source, .. } => {
+            matches!(source, crate::framework::StageError::Cancelled)
+        }
+        _ => false,
+    };
+    if cancelled {
+        (JobState::Cancelled, "cancelled")
+    } else {
+        (JobState::Failed, "failed")
+    }
+}
+
+/// The default experiment label for a launch named `name`: the name itself
+/// when it is a valid experiment name, else the name with every other
+/// character replaced by `_` (a deploy URI, say).
+fn experiment_label(name: &str) -> String {
+    if crate::experiment_registry::is_safe_experiment_name(name) {
+        return name.to_string();
+    }
+    let label: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let label = label.trim_start_matches(['.', '-']).replace("..", "_");
+    if crate::experiment_registry::is_safe_experiment_name(&label) {
+        label
+    } else {
+        "plan".to_string()
+    }
+}
+
+/// Write a starting job's records: tenant, experiment, launch provenance, the
+/// resume marker (registry recipes only — a declared plan has no recipe to
+/// re-compile on resume), and finally `state = running`.
+fn persist_launch_records(
+    job_id: &str,
+    job_dir: &std::path::Path,
+    tenant: &crate::tenant::Tenant,
+    experiment: &str,
+    marker: Option<RecipeMarker>,
+) -> Result<()> {
+    crate::jobs::write_tenant(job_id, tenant)
+        .with_context(|| format!("persist tenant for {job_id}"))?;
+    crate::jobs::write_experiment(job_id, experiment)
+        .with_context(|| format!("persist experiment for {job_id}"))?;
+    crate::jobs::write_provenance(job_id, crate::lineage_db::git_head_sha())
+        .with_context(|| format!("persist provenance for {job_id}"))?;
+    if let Some(marker) = marker {
+        marker.write_to(job_dir)?;
+    }
+    crate::jobs::write_state(job_id, JobState::Running)
+        .with_context(|| format!("write Running state for {job_id}"))
+}
+
+/// Backstop: every local launch passes through `prepare_compiled_plan_launch`.
+/// A k8s placement that reaches it was not submitted to a cluster, and a p2p
+/// or cloud placement has no execution adapter on any command path; running
+/// either on this machine would claim a placement that did not happen. It
+/// refuses before the job directory exists.
+fn refuse_unplaced_local_launch(
+    name: &str,
+    launch_target: crate::config::launcher::LaunchTarget,
+) -> Result<()> {
+    let surface = format!("'{name}' on this path");
+    if launch_target == crate::config::launcher::LaunchTarget::K8s {
+        return Err(anyhow!(crate::config::k8s_cluster::refuse_surface(
+            &surface
+        )));
+    }
+    // A p2p launch is placed when the command that started it joined a mesh.
+    #[cfg(feature = "p2p")]
+    if launch_target == crate::config::launcher::LaunchTarget::P2P
+        && super::mesh_launch::active().is_some()
+    {
+        return Ok(());
+    }
+    // A cloud launch installs its adapter below; what it needs is checked
+    // there, so a build without the feature still refuses here.
+    if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+        return crate::config::launcher::check_cloud_launch(&surface).map_err(|e| anyhow!("{e}"));
+    }
+    crate::config::launcher::check_launcher_placeable(launch_target, &surface)
+        .map_err(|e| anyhow!("{e}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_compiled_plan_launch(
+    reg: &crate::framework::Registry,
     name: &str,
     plan: crate::framework::plan::CompiledPlan,
     marker: Option<RecipeMarker>,
@@ -1042,6 +1417,8 @@ pub(super) fn prepare_compiled_plan_launch(
     tenant_admission: std::sync::Arc<crate::broker::tenant_quota::TenantAdmission>,
 ) -> Result<PreparedRecipeLaunch> {
     use crate::framework::ExecCtx;
+
+    refuse_unplaced_local_launch(name, launch_target)?;
 
     let admission_snapshot = tenant_admission.snapshot();
     // One scan: the plan's largest declared envelope feeds auto-tune, the
@@ -1083,6 +1460,10 @@ pub(super) fn prepare_compiled_plan_launch(
     ctx = ctx
         .with_launch_target(launch_target)
         .with_device_index(device_index);
+    #[cfg(feature = "p2p")]
+    if launch_target == crate::config::launcher::LaunchTarget::P2P {
+        ctx = super::mesh_launch::attach(ctx)?;
+    }
     let gpu_pool = crate::config::launcher::launcher_for(launch_target).capacity();
     let gpu_inventory = crate::broker::gpu::GpuInventory::probe();
     let gpu_inventory = if gpu_inventory.len() >= gpu_pool.max(1) {
@@ -1121,6 +1502,21 @@ pub(super) fn prepare_compiled_plan_launch(
         }
         ctx.cache = std::sync::Arc::new(cache_handle);
     }
+    if let Some(remote) = remote_cache_from_env(&tenant)? {
+        let cache_handle = (*ctx.cache).clone().with_remote(remote);
+        ctx.cache = std::sync::Arc::new(cache_handle);
+    }
+    #[cfg(feature = "cloud")]
+    let cloud = if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+        let (with_cloud, cloud) =
+            super::cloud::install_cloud_launch(reg, ctx, &job_dir, &tenant, &format!("'{name}'"))?;
+        ctx = with_cloud;
+        Some(cloud)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "cloud"))]
+    let _ = reg;
 
     Ok(PreparedRecipeLaunch {
         name: name.to_string(),
@@ -1135,11 +1531,96 @@ pub(super) fn prepare_compiled_plan_launch(
         job_dir,
         ctx,
         device_index,
+        #[cfg(feature = "cloud")]
+        cloud,
     })
+}
+
+/// Environment variable naming the content-addressed remote cache tier for a
+/// recipe launch: a directory, or (with the `s3` feature) a `file://` or
+/// `s3://bucket/prefix` URL. Stage outputs are written through to it and a
+/// cold machine or pod reads earlier results back from it.
+pub(super) const REMOTE_CACHE_ENV: &str = "BLUT_REMOTE_CACHE";
+
+/// Open the remote cache tier named by [`REMOTE_CACHE_ENV`], if set.
+///
+/// Credentials for an `s3://` URL come from the `AWS_*` environment only, never
+/// from the value itself. The store is probed once here so a wrong endpoint or
+/// rejected credentials fail the launch before any stage runs: writes to the
+/// remote tier are best-effort later on, and a run that silently kept its
+/// outputs local would look like a success to whoever reads the store.
+fn remote_cache_from_env(
+    tenant: &crate::tenant::Tenant,
+) -> Result<Option<crate::framework::object_store::BlockingObjectStore>> {
+    let Some(raw) = std::env::var_os(REMOTE_CACHE_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| anyhow!("{REMOTE_CACHE_ENV} is not valid UTF-8"))?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let prefix = if tenant.is_default() {
+        "cache".to_string()
+    } else {
+        format!("cache/{}", tenant.as_path().display())
+    };
+    let store = open_remote_cache(raw, &prefix)?;
+    let probe =
+        crate::framework::object_store::ObjectKey::Chunk(crate::framework::ContentHash([0; 32]));
+    store
+        .contains(probe)
+        .map_err(|error| anyhow!("{REMOTE_CACHE_ENV}: remote cache is not reachable: {error}"))?;
+    eprintln!("remote cache {}", redact_store_location(raw));
+    Ok(Some(store))
+}
+
+fn open_remote_cache(
+    raw: &str,
+    prefix: &str,
+) -> Result<crate::framework::object_store::BlockingObjectStore> {
+    use crate::framework::object_store::BlockingObjectStore;
+    if raw.contains("://") {
+        #[cfg(feature = "s3")]
+        {
+            let store = crate::framework::object_store::ObjectStore::from_url(raw, prefix)
+                .map_err(|error| anyhow!("{REMOTE_CACHE_ENV}: {error}"))?;
+            return Ok(store.blocking());
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = prefix;
+            return Err(anyhow!(
+                "{REMOTE_CACHE_ENV} is a URL, but this binary was built without the \
+                 `s3` feature; rebuild with it, or name a local directory"
+            ));
+        }
+    }
+    let root = std::path::Path::new(raw).join(prefix);
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("create remote cache dir {}", root.display()))?;
+    Ok(BlockingObjectStore::filesystem(root))
+}
+
+/// Scheme and bucket only: a remote-cache location is printed in job logs, so
+/// anything after the bucket (and any userinfo, which `from_url` refuses
+/// anyway) stays out of them.
+fn redact_store_location(raw: &str) -> String {
+    match raw.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.split('/').next().unwrap_or("");
+            let host = host.rsplit('@').next().unwrap_or(host);
+            format!("{scheme}://{host}/…")
+        }
+        None => raw.to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn launch_compiled_plan(
+    reg: &crate::framework::Registry,
     name: &str,
     plan: crate::framework::plan::CompiledPlan,
     marker: Option<RecipeMarker>,
@@ -1157,6 +1638,7 @@ pub(super) async fn launch_compiled_plan(
             .map_err(|error| anyhow!("tenant admission: {error}"))?,
     );
     prepare_compiled_plan_launch(
+        reg,
         name,
         plan,
         marker,
@@ -1251,35 +1733,76 @@ pub(super) async fn run_recipe_sweep(
 ) -> Result<()> {
     // Fail on a bad recipe name before composing anything.
     if reg.find(name).is_none() {
-        return Err(anyhow!("recipe '{name}' not in catalog"));
+        return Err(anyhow!(
+            "recipe '{name}' not in catalog (see `blut recipe list`)"
+        ));
     }
     let dir = config_dir.ok_or_else(|| anyhow!("--config-dir is required in config/sweep mode"))?;
     let cfg_name =
         config_name.ok_or_else(|| anyhow!("--config-name is required in config/sweep mode"))?;
-    // Args subtree key (default = recipe name). Overrides/sweeps must be dotted
-    // paths INTO this subtree; dot-less keys are consumed by the compose layer
-    // as defaults-list group selections and silently never reach a config value.
+    // Args subtree key (default = recipe name). When the config nests the
+    // Args under it, overrides must be dotted paths into that subtree.
     let key = config_key.unwrap_or_else(|| name.to_string());
-    warn_dotless_overrides(set, "--set", &key);
-    warn_dotless_overrides(sweep, "--sweep", &key);
 
     let entries = crate::config::expand_and_fingerprint(&dir, &cfg_name, set, sweep)
         .map_err(|e| anyhow!("config compose/expand: {e}"))?;
     if entries.is_empty() {
         return Err(anyhow!("sweep expanded to 0 combos"));
     }
+    if let Some(first) = entries.first() {
+        warn_overrides_outside_args(&first.config.json, &key, set, sweep);
+    }
+    // Two combos that hand the recipe the same args are one run, launched
+    // twice under different labels: an override did not reach the args.
+    let projected: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| project_args(e.config.json.clone(), &key))
+        .collect();
+    if let Some((i, j)) = first_duplicate(&projected) {
+        return Err(anyhow!(
+            "sweep combos {:?} and {:?} give the recipe identical args, so an override \
+             does not reach them; when the config nests the args under '{key}:', \
+             address them as '{key}.<field>=…'",
+            entries[i].overrides,
+            entries[j].overrides
+        ));
+    }
     let total = entries.len();
     eprintln!("sweep: {total} combo(s) for recipe '{name}'");
 
     if dry_run {
         eprintln!("args subtree key: '{key}'");
+        let def = reg
+            .find(name)
+            .ok_or_else(|| anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)"))?;
+        let mut invalid = 0usize;
         for (i, e) in entries.iter().enumerate() {
+            let verdict = match check_sweep_combo(
+                def,
+                project_args(e.config.json.clone(), &key),
+                &tenant,
+                launch_target,
+            ) {
+                Ok(()) => "ok".to_string(),
+                Err(error) => {
+                    invalid += 1;
+                    format!("INVALID: {error}")
+                }
+            };
             eprintln!(
-                "[{i}] fp={} skip={} overrides={:?}",
+                "[{i}] fp={} skip={} overrides={:?} {verdict}",
                 e.fingerprint.to_hex(),
                 e.cache_skip,
                 e.overrides,
             );
+        }
+        // A dry run that lists combos without compiling them reported a sweep
+        // as fine when every combo would fail at launch (e.g. a misspelled
+        // `--sweep` key). It now compiles each, as the single-run dry run does.
+        if invalid > 0 {
+            return Err(anyhow!(
+                "{invalid} of {total} sweep combo(s) would fail to compile; nothing was run"
+            ));
         }
         return Ok(());
     }
@@ -1331,8 +1854,22 @@ pub(super) async fn run_recipe_sweep(
 /// nests them under `key` (the recipe name by default) as an object, return
 /// that subtree — so `--set`/`--sweep` dotted paths `<key>.field=v` reach the
 /// Args. Otherwise (a flat config with no such subtree) return the whole config
-/// as-is (it feeds the Args directly, but top-level overrides can't apply — a
-/// compose-grammar limitation; `warn_dotless_overrides` surfaces it).
+/// as-is; it feeds the Args directly and dot-less overrides reach it.
+/// Resolve and compile one sweep combo's args without running anything (the
+/// check `recipe run --dry-run` applies to a single invocation).
+fn check_sweep_combo(
+    def: &crate::recipes::recipe::RecipeDef,
+    args: serde_json::Value,
+    tenant: &crate::tenant::Tenant,
+    launch_target: crate::config::launcher::LaunchTarget,
+) -> Result<()> {
+    let args = crate::registry_args::resolve_recipe_args(args, tenant, launch_target)
+        .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
+    (def.compile_fn)(args)
+        .map(|_| ())
+        .map_err(|e| anyhow!("{e}"))
+}
+
 pub(super) fn project_args(mut config: serde_json::Value, key: &str) -> serde_json::Value {
     if let serde_json::Value::Object(map) = &mut config
         && let Some(sub) = map.get_mut(key)
@@ -1343,20 +1880,277 @@ pub(super) fn project_args(mut config: serde_json::Value, key: &str) -> serde_js
     config
 }
 
-/// Warn about `key=val` overrides whose key has no `.` — the compose layer
-/// treats those as defaults-list group selections, NOT config-value overrides,
-/// so they silently don't change a value (and the sweep would collapse to
-/// identical fingerprints). `subtree_key` is the Args subtree to target.
-pub(super) fn warn_dotless_overrides(items: &[String], flag: &str, subtree_key: &str) {
-    for it in items {
-        let key = it.split_once('=').map_or(it.as_str(), |(k, _)| k);
-        if !key.contains('.') {
-            eprintln!(
-                "warning: {flag} '{it}' key is dot-less — it is treated as a \
-                 defaults-list group selection, not a value override; nest Args under \
-                 '{subtree_key}:' and use a dotted path (e.g. '{subtree_key}.{key}=…')."
+/// The first pair of equal values, by index.
+fn first_duplicate(values: &[serde_json::Value]) -> Option<(usize, usize)> {
+    for (i, a) in values.iter().enumerate() {
+        if let Some(offset) = values[i + 1..].iter().position(|b| b == a) {
+            return Some((i, i + 1 + offset));
+        }
+    }
+    None
+}
+
+/// Warn about a dot-less `key=val` override when the composed config nests the
+/// recipe's Args under `subtree_key`: the override sets a top-level value the
+/// recipe never reads. (On a flat config, dot-less keys are value overrides
+/// and reach the Args directly.)
+pub(super) fn warn_overrides_outside_args(
+    composed: &serde_json::Value,
+    subtree_key: &str,
+    set: &[String],
+    sweep: &[String],
+) {
+    if !composed.get(subtree_key).is_some_and(|v| v.is_object()) {
+        return;
+    }
+    for (flag, items) in [("--set", set), ("--sweep", sweep)] {
+        for it in items {
+            let key = it.split_once('=').map_or(it.as_str(), |(k, _)| k);
+            let key = key.trim_start_matches(['+', '~']);
+            if !key.contains('.') && key != subtree_key && composed.get(key).is_some() {
+                eprintln!(
+                    "warning: {flag} '{it}' sets top-level '{key}', but the recipe args are \
+                     read from the '{subtree_key}:' subtree; use '{subtree_key}.{key}=…'."
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod experiment_label_tests {
+    use super::experiment_label;
+
+    /// `recipe declare registry://plan@prod --run` defaulted the experiment to
+    /// the URI and failed with "invalid experiment name" after creating the job.
+    #[test]
+    fn a_launch_name_always_yields_a_valid_experiment_label() {
+        assert_eq!(experiment_label("e2e_train"), "e2e_train");
+        assert_eq!(
+            experiment_label("registry://plan@prod"),
+            "registry___plan_prod"
+        );
+        assert_eq!(experiment_label("../x"), "_x");
+        assert_eq!(experiment_label(""), "plan");
+        for name in ["registry://plan@prod", "a b", "-x", ".hidden", "é"] {
+            assert!(
+                crate::experiment_registry::is_safe_experiment_name(&experiment_label(name)),
+                "{name:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_refusal_tests {
+    use super::{JobState, terminal_for_error};
+    use crate::framework::{PlanError, StageError};
+
+    #[test]
+    fn a_cancelled_plan_is_recorded_as_cancelled() {
+        assert_eq!(terminal_for_error(&PlanError::Cancelled).1, "cancelled");
+        let stage = PlanError::StageFailed {
+            idx: 1,
+            stage: "s".into(),
+            source: StageError::Cancelled,
+        };
+        assert_eq!(terminal_for_error(&stage).0, JobState::Cancelled);
+        let failed = PlanError::StageFailed {
+            idx: 1,
+            stage: "s".into(),
+            source: StageError::BadInput("x".into()),
+        };
+        assert_eq!(terminal_for_error(&failed), (JobState::Failed, "failed"));
+    }
+
+    /// A launch refused by the scheduler lock used to leave a `failed` job
+    /// directory behind in `blut jobs`.
+    // The env lock must span the awaited launch: the launch reads these vars.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_launch_refused_by_the_scheduler_lock_leaves_no_job() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let keys = [
+            "LAMU_TRAIN_JOBS_DIR",
+            "LAMU_TRAIN_DATA_DIR",
+            "XDG_DATA_HOME",
+        ];
+        let prev: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: TEST_ENV_LOCK serializes env mutation; restored below.
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path().join("jobs"));
+            std::env::set_var("LAMU_TRAIN_DATA_DIR", td.path().join("data"));
+            std::env::set_var("XDG_DATA_HOME", td.path().join("xdg"));
+        }
+        let held = crate::scheduler_lock::acquire_exclusive(
+            "test-holder",
+            crate::scheduler_lock::LockKind::Training,
+        );
+        let plan = crate::framework::plan::CompiledPlan::from_components(
+            "refused".into(),
+            serde_json::json!({}),
+            vec![],
+        )
+        .0;
+        let result = super::launch_compiled_plan(
+            &crate::framework::Registry::new(),
+            "refused",
+            plan,
+            None,
+            None,
+            false,
+            crate::config::launcher::LaunchTarget::Local,
+            None,
+            false,
+            false,
+            crate::tenant::Tenant::default(),
+            None,
+        )
+        .await;
+        let jobs = crate::jobs::list_jobs();
+        drop(held);
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let err = result
+            .expect_err("the held lock must refuse the launch")
+            .to_string();
+        assert!(err.contains("acquire_exclusive"), "{err}");
+        assert!(
+            jobs.unwrap().is_empty(),
+            "a refused launch must not create a job"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pointer_launch_identity_tests {
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..).rev() {
+                // SAFETY: TEST_ENV_LOCK is held for this guard's whole life.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A pointer launch (`recipe declare registry://plan@prod --run`) runs
+    /// under the recipe `registry://plan@prod`. An SLA rule could not name
+    /// that recipe (its URI failed rule validation), and `lineage reindex`
+    /// rebuilt the run under the published spec's name, so a rule scoped to
+    /// the pointer could never select the run, before or after a reindex.
+    // The env lock must span the awaited launch: the launch reads these vars.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_sla_rule_selects_a_pointer_launch_before_and_after_reindex() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let vars: [(&'static str, std::path::PathBuf); 6] = [
+            ("LAMU_TRAIN_JOBS_DIR", td.path().join("jobs")),
+            ("LAMU_TRAIN_DATA_DIR", td.path().join("data")),
+            ("XDG_DATA_HOME", td.path().join("xdg-data")),
+            ("XDG_CACHE_HOME", td.path().join("xdg-cache")),
+            ("BLUT_NO_CONTAIN", "1".into()),
+            ("CUDA_VISIBLE_DEVICES", std::path::PathBuf::new()),
+        ];
+        let _env = EnvRestore(
+            vars.iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var_os(key);
+                    // SAFETY: TEST_ENV_LOCK serializes env mutation.
+                    unsafe { std::env::set_var(key, value) };
+                    (*key, previous)
+                })
+                .collect(),
+        );
+
+        let reg = super::super::toy_plan::registry();
+        let spec = super::super::toy_plan::spec("nightly-spec");
+        let plan = spec.compile(&reg).unwrap();
+        let uri = "registry://plan@prod";
+        let job_id = super::launch_compiled_plan(
+            &reg,
+            uri,
+            plan,
+            None,
+            None,
+            false,
+            crate::config::launcher::LaunchTarget::Local,
+            None,
+            false,
+            false,
+            crate::tenant::Tenant::default(),
+            Some("plan.prod".into()),
+        )
+        .await
+        .expect("the pointer launch runs");
+
+        let recorded = || {
+            crate::lineage_db::LineageDb::open()
+                .unwrap()
+                .all_runs()
+                .unwrap()
+                .into_iter()
+                .find(|run| run.job_id == job_id)
+                .expect("the run is indexed")
+        };
+        let rules_path = td.path().join("sla.toml");
+        std::fs::write(
+            &rules_path,
+            "[[rule]]\nname = \"prod-runtime\"\nrecipe = \"registry://plan@prod\"\n\
+             max_runtime_secs = 60\n\n\
+             [[rule]]\nname = \"spec-runtime\"\nrecipe = \"nightly-spec\"\n\
+             max_runtime_secs = 60\n",
+        )
+        .unwrap();
+        let rules = crate::sla::load_rules(&rules_path).expect("a pointer URI is a valid scope");
+        // Judge the run as if it were still running long past the cap, so the
+        // only question is whether a rule selects it.
+        let breaches_for = |run: &crate::lineage_db::RunRow| {
+            let mut observation = crate::sla::observation_from_run(run).unwrap();
+            observation.ended_unix = None;
+            let now = observation.started_unix + 3_600;
+            crate::sla::evaluate(&rules, &[observation], now)
+                .into_iter()
+                .map(|breach| breach.rule)
+                .collect::<Vec<_>>()
+        };
+
+        let live = recorded();
+        assert_eq!(live.recipe, uri);
+        assert_eq!(breaches_for(&live), vec!["prod-runtime".to_string()]);
+        let job_dir = crate::paths::job_dir(&job_id).unwrap();
+        assert_eq!(
+            crate::framework::PlanGraph::read_from(&job_dir)
+                .expect("plan.json")
+                .name,
+            uri,
+            "the graph a reindex reads must name what the run is recorded under"
+        );
+
+        // A deleted index is rebuilt from the job dirs: the run keeps its
+        // recipe, so the rule still selects it.
+        std::fs::remove_file(td.path().join("data").join("lineage.db")).unwrap();
+        super::super::lineage::run_lineage_reindex().unwrap();
+        let rebuilt = recorded();
+        assert_eq!(rebuilt.recipe, uri);
+        assert_eq!(breaches_for(&rebuilt), vec!["prod-runtime".to_string()]);
     }
 }
 
@@ -1464,6 +2258,8 @@ mod recipe_declare_flag_tests {
                         sync_io,
                         tenant: _,
                         experiment: _,
+                        launcher: _,
+                        mesh: _,
                     },
             }) => (file, run, shared_cache, no_cache, sync_io),
             other => panic!("expected recipe declare, got {other:?}"),
@@ -1520,6 +2316,85 @@ mod recipe_declare_flag_tests {
                 cmd: RecipeCommand::Declare { args, .. },
             }) => assert_eq!(args, r#"{"n":1}"#),
             other => panic!("expected declare, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declare_launcher_defaults_to_local_and_takes_k8s() {
+        let launcher_of = |argv: &[&str]| match Cli::try_parse_from(argv).expect("parse").command {
+            Some(Command::Recipe {
+                cmd: RecipeCommand::Declare { launcher, .. },
+            }) => launcher,
+            other => panic!("expected declare, got {other:?}"),
+        };
+        assert_eq!(
+            launcher_of(&["blut", "recipe", "declare", "r.toml", "--run"]),
+            "local"
+        );
+        assert_eq!(
+            launcher_of(&[
+                "blut",
+                "recipe",
+                "declare",
+                "r.toml",
+                "--run",
+                "--launcher",
+                "k8s"
+            ]),
+            "k8s"
+        );
+    }
+}
+
+#[cfg(test)]
+mod k8s_refusal_tests {
+    //! `--launcher k8s` must never fall back to running here. Every surface
+    //! that cannot submit to a cluster refuses, naming the operator route.
+    use super::*;
+
+    #[test]
+    fn the_local_launch_path_refuses_a_k8s_placement() {
+        use crate::config::launcher::LaunchTarget;
+        refuse_unplaced_local_launch("demo", LaunchTarget::Local).unwrap();
+        let msg = refuse_unplaced_local_launch("demo", LaunchTarget::K8s)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("`recipe run`"), "{msg}");
+        assert!(msg.contains("kubectl apply"), "{msg}");
+        assert!(msg.contains("Nothing ran locally"), "{msg}");
+    }
+
+    /// `--launcher p2p` and `cloud` fell through to the local launcher the
+    /// same way. The backstop refuses p2p whatever path reached it, and cloud
+    /// unless the build has the feature and a queue is configured.
+    #[test]
+    fn the_local_launch_path_refuses_p2p_and_cloud_placements() {
+        use crate::config::launcher::LaunchTarget;
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by TEST_ENV_LOCK.
+        unsafe { std::env::remove_var(crate::config::launcher::CLOUD_QUEUE_ENV) };
+        let cloud = if cfg!(feature = "cloud") {
+            "BLUT_CLOUD_QUEUE"
+        } else {
+            "`cloud` feature"
+        };
+        for (target, names) in [
+            (LaunchTarget::P2P, "--launcher p2p --p2p-seed"),
+            (LaunchTarget::Cloud, cloud),
+        ] {
+            let msg = refuse_unplaced_local_launch("demo", target)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                msg.contains(&format!(
+                    "--launcher {} cannot place 'demo' on this path",
+                    target.as_str()
+                )),
+                "{msg}"
+            );
+            assert!(msg.contains(names), "{msg}");
         }
     }
 }
@@ -1717,5 +2592,210 @@ mod declare_dispatch_tests {
             msg.contains("blut-dsl") && msg.contains(".json"),
             "actionable evaluator-missing error: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dry_run_footprint_tests {
+    use crate::framework::plan::CompiledPlan;
+    use crate::framework::{Resource, Stage, StageContext, StageDyn, StageError};
+    use std::sync::Arc;
+
+    const MIB: u64 = 1024 * 1024;
+
+    struct Declares256Mib;
+
+    #[async_trait::async_trait]
+    impl Stage for Declares256Mib {
+        const NAME: &'static str = "declares_256_mib";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = ();
+        type Args = serde_json::Value;
+
+        fn resource_envelope(
+            &self,
+            _args: &serde_json::Value,
+        ) -> blut_types::envelope::ResourceEnvelope {
+            blut_types::envelope::ResourceEnvelope {
+                ram_bytes: 256 * MIB,
+                ..Default::default()
+            }
+        }
+
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &serde_json::Value,
+        ) -> Result<(), StageError> {
+            Ok(())
+        }
+    }
+
+    /// E2E follow-up: the dry run showed "≈ 2.0G" for a stage declaring a
+    /// 256 MiB envelope; the launch bills 256 MiB.
+    #[test]
+    fn a_dry_run_reports_the_declared_envelope_not_the_floor() {
+        let stage: Arc<dyn StageDyn> = Arc::new(Declares256Mib);
+        let plan = CompiledPlan::from_erased_chain(
+            "small",
+            serde_json::json!({}),
+            vec![(stage, serde_json::json!({}))],
+        )
+        .unwrap();
+        let (footprint, line) = super::dry_run_footprint("small", &plan).unwrap();
+        assert_eq!(footprint.ram_bytes, 256 * MIB);
+        assert!(line.contains("≈ 256.00 MiB"), "{line}");
+        assert!(line.contains("stage 'declares_256_mib'"), "{line}");
+
+        // An undeclared plan is billed the floor, and the line says so.
+        let empty = CompiledPlan::from_components("empty".into(), serde_json::json!({}), vec![]).0;
+        let (footprint, line) = super::dry_run_footprint("empty", &empty).unwrap();
+        assert_eq!(footprint.ram_bytes, 2 * 1024 * MIB);
+        assert!(
+            line.contains("≈ 2.00 GiB (the compatibility floor"),
+            "{line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sweep_dry_run_tests {
+    use super::check_sweep_combo;
+    use crate::recipes::recipe::{RecipeCategory, RecipeDef};
+
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct SweepArgs {
+        #[serde(default)]
+        steps: u32,
+    }
+
+    static DEF: RecipeDef = RecipeDef {
+        name: "sweep_dry",
+        description: "d",
+        backend_id: "b",
+        category: RecipeCategory::User,
+        input_kinds: &[],
+        output_kind: "k",
+        schedule: None,
+        args_schema_fn: crate::recipes::recipe::schema_of::<SweepArgs>,
+        compile_fn: |raw| {
+            crate::recipes::recipe::validate_args_against_schema(
+                "sweep_dry",
+                &crate::recipes::recipe::schema_of::<SweepArgs>(),
+                &raw,
+            )?;
+            Ok(crate::framework::plan::CompiledPlan::from_components(
+                "sweep_dry".into(),
+                raw,
+                vec![],
+            )
+            .0)
+        },
+    };
+
+    /// `--sweep seed=1,2` over a flat config ran two identical combos (the
+    /// dot-less key never reached a value), and over a nested config it still
+    /// sets a key the recipe never reads. The first now varies the args; the
+    /// second is caught before anything runs.
+    #[test]
+    fn a_sweep_axis_must_reach_the_recipe_args() {
+        let flat = tempfile::tempdir().unwrap();
+        std::fs::write(flat.path().join("config.yaml"), "steps: 0\n").unwrap();
+        let sweep = ["steps=1,2".to_string()];
+        let entries = crate::config::expand_and_fingerprint(
+            flat.path().to_str().unwrap(),
+            "config",
+            &[],
+            &sweep,
+        )
+        .unwrap();
+        let args: Vec<_> = entries
+            .iter()
+            .map(|e| super::project_args(e.config.json.clone(), "sweep_dry"))
+            .collect();
+        assert_eq!(args[0]["steps"], 1);
+        assert_eq!(args[1]["steps"], 2);
+        assert_eq!(super::first_duplicate(&args), None);
+
+        let nested = tempfile::tempdir().unwrap();
+        std::fs::write(
+            nested.path().join("config.yaml"),
+            "steps: 0\nsweep_dry:\n  steps: 0\n",
+        )
+        .unwrap();
+        let entries = crate::config::expand_and_fingerprint(
+            nested.path().to_str().unwrap(),
+            "config",
+            &[],
+            &sweep,
+        )
+        .unwrap();
+        let args: Vec<_> = entries
+            .iter()
+            .map(|e| super::project_args(e.config.json.clone(), "sweep_dry"))
+            .collect();
+        assert_eq!(super::first_duplicate(&args), Some((0, 1)));
+    }
+
+    /// `--sweep count.stpes=1,2 --dry-run` listed both combos as fine; the
+    /// real run then failed every one.
+    #[test]
+    fn a_dry_run_combo_is_compiled_not_just_listed() {
+        let tenant = crate::tenant::Tenant::default();
+        let local = crate::config::launcher::LaunchTarget::Local;
+        assert!(check_sweep_combo(&DEF, serde_json::json!({"steps": 2}), &tenant, local).is_ok());
+        let err = check_sweep_combo(&DEF, serde_json::json!({"stpes": 2}), &tenant, local)
+            .expect_err("a misspelled key must fail the dry run");
+        assert!(err.to_string().contains("stpes"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod remote_cache_tests {
+    use super::{open_remote_cache, redact_store_location};
+    use crate::framework::ContentHash;
+    use crate::framework::object_store::ObjectKey;
+
+    #[test]
+    fn a_directory_opens_a_filesystem_tier_under_the_prefix() {
+        let td = tempfile::tempdir().unwrap();
+        let store = open_remote_cache(td.path().to_str().unwrap(), "cache").unwrap();
+        let key = ObjectKey::Chunk(ContentHash::of_bytes(b"remote tier"));
+        store.put(key, b"remote tier").unwrap();
+        assert!(store.contains(key).unwrap());
+        assert!(
+            td.path().join("cache").is_dir(),
+            "objects live under the prefix, not the root"
+        );
+    }
+
+    #[cfg(not(feature = "s3"))]
+    #[test]
+    fn a_url_without_the_s3_feature_is_refused_by_name() {
+        let err =
+            open_remote_cache("s3://bucket/runs", "cache").expect_err("a URL needs the s3 feature");
+        assert!(err.to_string().contains("s3"), "{err}");
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn an_s3_url_with_credentials_in_it_is_refused() {
+        let err = open_remote_cache("s3://key:secret@bucket/runs", "cache")
+            .expect_err("credentials in the URL must be refused");
+        assert!(!err.to_string().contains("secret"), "{err}");
+    }
+
+    #[test]
+    fn the_logged_location_keeps_only_scheme_and_bucket() {
+        assert_eq!(redact_store_location("s3://bucket/runs/a"), "s3://bucket/…");
+        assert_eq!(
+            redact_store_location("s3://user:pw@bucket/x"),
+            "s3://bucket/…"
+        );
+        assert_eq!(redact_store_location("/var/cache"), "/var/cache");
     }
 }

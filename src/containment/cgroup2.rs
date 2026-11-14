@@ -50,11 +50,21 @@ fn writable_base() -> Option<PathBuf> {
     }
 }
 
+/// A probe directory name no other thread or process is using. Stages spawn
+/// concurrently and several `blut` processes can share one base; with a fixed
+/// name, two probes collide, the loser's mkdir fails, and a writable base
+/// reads as unwritable.
+fn probe_name(what: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("blut-probe-{what}-{}-{n}", std::process::id())
+}
+
 /// Probe writability by attempting a probe mkdir + rmdir. The cgroupfs is
 /// often mounted read-only in unprivileged containers, so a stat is not
 /// enough — only an actual mkdir tells the truth.
 fn dir_writable(base: &Path) -> bool {
-    let probe = base.join("blut-probe-wcheck");
+    let probe = base.join(probe_name("wcheck"));
     match std::fs::create_dir(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_dir(&probe);
@@ -76,10 +86,9 @@ fn probe() -> Availability {
             return Availability::Unavailable;
         }
         // Mounted, but is a subtree writable (delegated)?
-        if writable_base().is_some() {
-            Availability::Present
-        } else {
-            Availability::BusOffline
+        match writable_base() {
+            Some(base) if leaf_gets_memory_controller(&base) => Availability::Present,
+            _ => Availability::BusOffline,
         }
     })
 }
@@ -87,6 +96,23 @@ fn probe() -> Availability {
 /// Ensure the `memory` controller is enabled in the base's `subtree_control`
 /// so child leaves can set `memory.max`. Best-effort: if it's already enabled
 /// (or we lack permission), proceed — the cap write will surface a real error.
+/// Whether a leaf created under `base` gets the memory controller, so that
+/// `memory.max` can be written. A writable base is not enough: the caller's
+/// own cgroup is often writable (a terminal's scope, a service) but holds
+/// processes, and cgroup v2 refuses to enable a controller for the children
+/// of a cgroup with processes in it, so the leaf has no `memory.max` and the
+/// first cap write fails. Probed with a throwaway leaf.
+fn leaf_gets_memory_controller(base: &Path) -> bool {
+    enable_memory_subtree(base);
+    let probe = base.join(probe_name("memcheck"));
+    if std::fs::create_dir(&probe).is_err() {
+        return false;
+    }
+    let ok = probe.join("memory.max").exists();
+    let _ = std::fs::remove_dir(&probe);
+    ok
+}
+
 fn enable_memory_subtree(base: &Path) {
     let f = base.join("cgroup.subtree_control");
     if let Ok(cur) = std::fs::read_to_string(&f)
@@ -138,6 +164,22 @@ impl Containment for CgroupV2Direct {
         // `write_caps_or_cleanup` removes the leaf itself before propagating.
         write_caps_or_cleanup(&cgdir, caps)?;
 
+        // The child runs in its own session inside the leaf, so it keeps
+        // running when this process is SIGKILLed (no drop, no `cleanup`).
+        // Inside a job the leaf is recorded before the child starts, so `blut
+        // cancel` stops it and `plan resume` refuses while it is populated,
+        // also after this process died (`jobs::record_cgroup_leaf`), as a
+        // systemd unit is recorded.
+        if let Some(job_dir) = crate::jobs::current_job_dir()
+            && let Err(e) = crate::jobs::record_cgroup_leaf(&job_dir, &cgdir)
+        {
+            tracing::warn!(
+                "containment: record {} with job {}: {e}",
+                cgdir.display(),
+                job_dir.display()
+            );
+        }
+
         let mut c = tokio::process::Command::new(program);
         for a in args {
             c.arg(a);
@@ -173,6 +215,12 @@ impl Containment for CgroupV2Direct {
         // memory.peak (kernel ≥5.19) is the high-water RSS of the leaf.
         let s = std::fs::read_to_string(dir.join("memory.peak")).ok()?;
         s.trim().parse::<u64>().ok()
+    }
+
+    fn read_oom_kills(&self, teardown: &TeardownHandle) -> Option<u64> {
+        let dir = teardown.cgroup_path.as_ref()?;
+        let events = std::fs::read_to_string(dir.join("memory.events")).ok()?;
+        super::memsize::parse_memory_events_oom_kill(&events)
     }
 
     fn cancel(&self, _unit: &str, teardown: &TeardownHandle) -> Option<tokio::process::Command> {
@@ -304,6 +352,174 @@ fn fmt_i32(n: i32, buf: &mut [u8; 24]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A writable directory whose new children get no `memory.max` (the
+    /// caller's own busy cgroup, or here a plain directory) is not usable:
+    /// the first cap write would fail with EACCES.
+    #[test]
+    fn a_writable_base_without_the_memory_controller_is_not_usable() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(dir_writable(tmp.path()));
+        assert!(!leaf_gets_memory_controller(tmp.path()));
+        let left: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with("blut-probe"))
+            .collect();
+        assert!(left.is_empty(), "probe leaf left behind: {left:?}");
+    }
+
+    /// Stages spawn concurrently, and each spawn probes its base. A probe
+    /// must not collide with another thread's: a collision reads as "not
+    /// writable" and sends the run to the wrong base.
+    #[test]
+    fn concurrent_writability_probes_do_not_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let failures = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| (0..500).filter(|_| !dir_writable(tmp.path())).count()))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .sum::<usize>()
+        });
+        assert_eq!(failures, 0, "a writable directory probed as unwritable");
+    }
+
+    /// Live: the kernel's `oom_kill` counter is what says a run was an OOM.
+    /// A tree killed at its cap reports at least one; a run that fails on its
+    /// own reports zero. Same skip rule as the leaf test below.
+    #[tokio::test]
+    async fn live_oom_kills_come_from_the_kernel_counter() {
+        use crate::containment::ContainedChild;
+        let availability = CgroupV2Direct.available();
+        if availability != Availability::Present {
+            assert!(
+                std::env::var_os("BLUT_REQUIRE_CGROUP2_LIVE").is_none(),
+                "BLUT_REQUIRE_CGROUP2_LIVE is set but the cgroup2 backend is {availability:?}"
+            );
+            eprintln!("SKIP live cgroup2 oom test: backend is {availability:?}");
+            return;
+        }
+        let caps = CapSpec {
+            mem_max: Some(64 * 1024 * 1024),
+            mem_high: None,
+            // Zero would mean "default"; this is as close to no swap as a
+            // knob gets, so the hog dies instead of paging out.
+            swap_max: Some(1024 * 1024),
+        };
+        let run = |script: &str, unit: &str| {
+            CgroupV2Direct
+                .wrap_command(
+                    Path::new("sh"),
+                    &["-c".to_string(), script.to_string()],
+                    Path::new("/"),
+                    &[],
+                    unit,
+                    &caps,
+                )
+                .expect("wrap in a cgroup2 leaf")
+        };
+        let wait = std::time::Duration::from_secs(120);
+
+        let unit = format!("blut-live-oom-{}-1", std::process::id());
+        let hog = run("head -c 700000000 /dev/zero | tail", &unit);
+        let mut child = ContainedChild::spawn(Box::new(CgroupV2Direct), hog, &unit, |_| {})
+            .await
+            .expect("spawn hog");
+        let status = tokio::time::timeout(wait, child.wait())
+            .await
+            .expect("hog exited")
+            .expect("wait");
+        assert!(!status.success(), "the hog fit in 64M: {status:?}");
+        let kills = child.oom_kills().expect("memory.events was read");
+        assert!(kills >= 1, "oom_kill {kills}");
+
+        let unit = format!("blut-live-oom-{}-2", std::process::id());
+        let failing = run("exit 3", &unit);
+        let mut child = ContainedChild::spawn(Box::new(CgroupV2Direct), failing, &unit, |_| {})
+            .await
+            .expect("spawn failing");
+        let status = tokio::time::timeout(wait, child.wait())
+            .await
+            .expect("exited")
+            .expect("wait");
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(child.oom_kills(), Some(0), "a plain failure is not an OOM");
+    }
+
+    /// Live: a stage left running in a REAL cgroup-v2 leaf after its driver
+    /// is gone (nothing calls `cleanup`) is recorded with the job when the
+    /// leaf is made, blocks `plan resume` while populated, and is stopped
+    /// and removed by the cancel path. Runs where this backend is usable (a
+    /// delegated subtree with the memory controller, e.g. via
+    /// `$BLUT_CGROUP_PARENT`); elsewhere it says it skipped, and
+    /// `BLUT_REQUIRE_CGROUP2_LIVE=1` turns that skip into a failure.
+    #[tokio::test]
+    async fn live_an_orphaned_leaf_is_recorded_and_cancelled() {
+        let availability = CgroupV2Direct.available();
+        if availability != Availability::Present {
+            assert!(
+                std::env::var_os("BLUT_REQUIRE_CGROUP2_LIVE").is_none(),
+                "BLUT_REQUIRE_CGROUP2_LIVE is set but the cgroup2 backend is {availability:?}"
+            );
+            eprintln!("SKIP live cgroup2 leaf test: backend is {availability:?}");
+            return;
+        }
+        let jobs = tempfile::tempdir().unwrap();
+        let job_dir = jobs.path().join("20261030-000000-000000009");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        let unit = format!("blut-live-orphan-{}-1", std::process::id());
+        let caps = CapSpec {
+            mem_max: Some(256 * 1024 * 1024),
+            mem_high: None,
+            swap_max: None,
+        };
+        let run = crate::jobs::in_job(job_dir.clone(), async {
+            CgroupV2Direct.wrap_command(
+                Path::new("sleep"),
+                &["300".to_string()],
+                Path::new("/"),
+                &[],
+                &unit,
+                &caps,
+            )
+        })
+        .await
+        .expect("wrap in a cgroup2 leaf");
+        let leaf = run.teardown.cgroup_path.clone().expect("a leaf");
+        let mut command = run.command;
+        let child = command.spawn().expect("spawn into the leaf");
+        let pid = child.id().expect("pid");
+        // The driver is gone: no teardown runs for this leaf.
+        drop(child);
+        let procs = std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap();
+        assert!(
+            procs.lines().any(|l| l.trim() == pid.to_string()),
+            "{procs}"
+        );
+
+        assert_eq!(
+            crate::jobs::live_cgroup_leaves_at(&job_dir).unwrap(),
+            vec![leaf.clone()],
+            "the leaf was recorded with the job before the process started"
+        );
+        let why = crate::jobs::cgroup_resume_blocker_at("j", &job_dir)
+            .unwrap()
+            .expect("a populated leaf blocks the resume");
+        assert!(why.contains(&leaf.display().to_string()), "{why}");
+
+        let stopped =
+            crate::jobs::cancel_cgroup_leaves_at(&job_dir, std::time::Duration::from_secs(5))
+                .unwrap();
+        assert_eq!(stopped, vec![leaf.clone()]);
+        assert!(!leaf.exists(), "the emptied leaf is removed");
+        assert_eq!(
+            crate::jobs::cgroup_resume_blocker_at("j", &job_dir).unwrap(),
+            None
+        );
+        eprintln!("live cgroup2 leaf test ran: {} (pid {pid})", leaf.display());
+    }
 
     #[test]
     fn fmt_i32_basic() {

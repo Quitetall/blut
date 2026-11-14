@@ -23,12 +23,12 @@ release_version = "1.0.0"
 release_tag = "v1.0.0"
 engine_prefix = ""
 release_workflow = ".github/workflows/release.yml"
-publish_chain = ["blut-types", "blut", "blut-metrics", "blut-dsl", "blut-notify"]
+publish_chain = ["blut-types", "blut", "blut-metrics", "blut-dsl", "blut-notify", "blut-operator"]
 binary_artifacts = ["blut-tui", "blut-web", "blut-operator", "blut-metrics", "blut-notify"]
 
 [toolchain]
-engine_rust = "1.88.0"
-operator_rust = "1.89.0"
+engine_rust = "1.99.0"
+operator_rust = "1.99.0"
 mdbook = "0.4.40"
 cargo_deny = "0.20.2"
 cargo_local_registry = "0.2.12"
@@ -84,7 +84,8 @@ distribution = "embedded"
 [[rust_packages]]
 name = "blut-operator"
 manifest = "crates/blut-operator/Cargo.toml"
-distribution = "binary"
+distribution = "crates-io"
+binary = true
 
 [[python_packages]]
 name = "blut-sdk"

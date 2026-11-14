@@ -58,7 +58,9 @@ use crate::framework::execution::{
     ExecutionDeadline, ExecutionRequest, ExecutionResources, LocalExecutionAdapter,
 };
 #[cfg(feature = "p2p")]
-use crate::framework::execution::{ExecutionFailureKind, ExecutionResult, drive_execution};
+use crate::framework::execution::{
+    ExecutionFailure, ExecutionFailureKind, ExecutionResult, drive_execution,
+};
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
 use crate::framework::stage::{ErasedArtifact, InProcessArtifact, StageContext, StageDyn};
@@ -219,6 +221,10 @@ pub struct ExecCtx {
     training_io_node_admission_resolver: Option<TrainingIoNodeAdmissionResolver>,
     /// Force every declaring stage onto its explicit Inline candidate.
     pub sync_io: bool,
+    /// Where mid-stage checkpoint slots are created (CONTRACT.md §8).
+    /// `None` resolves [`crate::framework::stage_checkpoint::checkpoints_root`]
+    /// from `job_dir`.
+    pub checkpoint_root: Option<PathBuf>,
     /// Optional live-availability ceiling used only while selecting a profile.
     /// Executor permits still use `memory_budget_gib`; this tighter byte value
     /// prevents choosing a fast profile that whole-job admission would
@@ -234,6 +240,12 @@ pub struct ExecCtx {
     training_io_downgrade_reason: Option<crate::framework::async_io::TrainingIoDowngradeReason>,
     /// Select-once witness consumed by the chosen executor implementation.
     prepared_execution: Option<PreparedExecution>,
+    /// Treat a node's terminal stage failure like an advisory one: record it,
+    /// prune the node's descendants and keep running every other branch,
+    /// instead of failing the plan fast. Set for HPO plans, whose trials are
+    /// independent branches: one trial that crashes (or diverges past its
+    /// retries) must not cancel healthy siblings. Parallel executor only.
+    isolate_stage_failures: bool,
     #[cfg(test)]
     status_writer_failure: Option<std::io::ErrorKind>,
     #[cfg(test)]
@@ -315,10 +327,12 @@ impl ExecCtx {
             training_io_resolver: None,
             training_io_node_admission_resolver: None,
             sync_io: false,
+            checkpoint_root: None,
             training_io_selection_budget_bytes: None,
             training_io_whole_job_base_bytes: None,
             training_io_downgrade_reason: None,
             prepared_execution: None,
+            isolate_stage_failures: false,
             #[cfg(test)]
             status_writer_failure: None,
             #[cfg(test)]
@@ -373,6 +387,20 @@ impl ExecCtx {
     /// inline tail. This is execution-only and cache-neutral.
     pub fn with_sync_io(mut self, sync_io: bool) -> Self {
         self.sync_io = sync_io;
+        self
+    }
+
+    /// Isolate terminal stage failures to their own branch (see the field).
+    pub(crate) fn with_isolated_stage_failures(mut self) -> Self {
+        self.isolate_stage_failures = true;
+        self
+    }
+
+    /// Create mid-stage checkpoint slots under `root` instead of the default
+    /// sibling of the jobs directory. It must outlive the job directory and,
+    /// for a multi-node stage, be reachable from the node that runs rank 0.
+    pub fn with_checkpoint_root(mut self, root: PathBuf) -> Self {
+        self.checkpoint_root = Some(root);
         self
     }
 
@@ -495,7 +523,7 @@ pub struct PlanResult {
     pub n_cache_hits: usize,
     pub n_cache_misses: usize,
     pub elapsed: std::time::Duration,
-    /// Advisory stages that FAILED (ADR 0071): each warns + prunes its
+    /// Advisory stages that FAILED (ADR 0156): each warns + prunes its
     /// descendants but does not fail the plan. NON-EMPTY ⇒ the run completed
     /// "with warnings" — the machine-parseable signal that distinguishes this
     /// from a clean success (both exit 0). Tooling that acts on `final_output`
@@ -503,7 +531,7 @@ pub struct PlanResult {
     pub warnings: Vec<StageWarning>,
 }
 
-/// One advisory stage that tripped (ADR 0071).
+/// One advisory stage that tripped (ADR 0156).
 #[derive(Debug, Clone)]
 pub struct StageWarning {
     /// Topo index of the advisory stage.
@@ -518,12 +546,10 @@ pub struct StageWarning {
     pub origin: Option<crate::framework::error_domain::FaultOrigin>,
 }
 
-/// Whether advisory stages are forced FATAL for this run (ADR 0071 strict mode),
+/// Whether advisory stages are forced FATAL for this run (ADR 0156 strict mode),
 /// via `BLUT_STRICT_ADVISORY=1` — for CI that wants the old fail-hard behaviour.
 fn strict_advisory() -> bool {
-    std::env::var("BLUT_STRICT_ADVISORY")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false)
+    crate::config::env_flag("BLUT_STRICT_ADVISORY")
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -579,6 +605,12 @@ struct NodeEnv {
     dispatch_policy: Option<Arc<dyn crate::p2p::dispatch::DispatchPolicy>>,
     #[cfg(feature = "p2p")]
     execution_adapter: Option<Arc<dyn ExecutionAdapter>>,
+    /// Root of mid-stage checkpoint slots. `None` disables slots (private
+    /// speculative environments).
+    checkpoint_root: Option<PathBuf>,
+    /// Identity of this plan execution, shared by in-process retries and
+    /// different for a `plan resume` or a requeued job.
+    invocation: String,
 }
 
 impl NodeEnv {
@@ -1307,6 +1339,22 @@ fn cancel_failure(
     }
 }
 
+/// The `StageFailed` error text of a node stopped by a policy's `KillBranch`
+/// prune (HPO early stopping). It keeps the word "cancelled", which every
+/// status reader already treats as a deliberate stop rather than a crash, and
+/// adds "by the control policy" so a reader can tell an early-stopped branch
+/// from a cancelled plan.
+pub(crate) const CONTROL_PRUNE_MESSAGE: &str = "cancelled by the control policy (branch pruned)";
+
+/// The status text for a cancelled node: [`CONTROL_PRUNE_MESSAGE`] for a
+/// targeted prune, `plain` for a plan cancel.
+fn cancel_message(failure: &NodeFailure, plain: &str) -> String {
+    match failure {
+        NodeFailure::Killed { .. } => CONTROL_PRUNE_MESSAGE.to_string(),
+        _ => plain.to_string(),
+    }
+}
+
 /// Coordinator-side DIVERGENCE kill (S1 / ADR 0044 P7). Records the offending
 /// step's detail in the divergence registry under the emitting node's id
 /// (`env.diverged`) BEFORE cancelling its token, so `run_node` — unwinding on
@@ -1387,6 +1435,28 @@ fn record_divergence_and_kill(
     tok.cancel();
 }
 
+/// Coordinator-side PRUNE kill: a policy's `KillBranch` on a step that did NOT
+/// diverge (HPO early stopping). Cancels the emitting node's token without a
+/// divergence-registry entry, so `run_node` unwinds to `NodeFailure::Killed`
+/// and the coordinator prunes the branch while the rest of the plan keeps
+/// running. A no-op when the node is already kill-flagged for a divergence
+/// this attempt, or its token already fired.
+fn prune_kill(
+    nid: Option<NodeId>,
+    node_tokens: &HashMap<NodeId, KillSlot>,
+    kill_flagged: &HashSet<NodeId>,
+) {
+    let Some(nid) = nid else { return };
+    if kill_flagged.contains(&nid) {
+        return;
+    }
+    if let Some(tok) = node_tokens.get(&nid)
+        && !tok.is_cancelled()
+    {
+        tok.cancel();
+    }
+}
+
 /// Run ONE node: cache lookup → tmp dir → resource permits → run →
 /// (cancel check) → atomic promote → rebase → sidecar → cache insert →
 /// events. The single home of the FW-2 atomicity contract. Emits
@@ -1424,11 +1494,7 @@ async fn cache_presence_probe_off_thread(
 }
 
 fn install_builtin_control(ctx: &mut ExecCtx) {
-    if ctx.control.is_none()
-        && std::env::var("BLUT_KILL_ON_NAN")
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    {
+    if ctx.control.is_none() && crate::config::env_flag("BLUT_KILL_ON_NAN") {
         ctx.control = Some(Arc::new(crate::framework::control::KillOnNaN));
     }
 }
@@ -2125,42 +2191,67 @@ fn build_local_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> Executio
     }
 }
 
+/// Decide where one attempt of `task` runs when an execution adapter is
+/// installed, and build its portable request if it leaves this machine.
+///
+/// `Ok(None)` keeps the attempt here. That is correct, not a fall-through, for
+/// a stage that declares it must stay ([`Stage::placement`]), restricted data,
+/// a restricted tenant, or a training-I/O node, and each such decision is
+/// logged with its reason. `Err` names an eligible stage whose input could not
+/// be made portable: under `--launcher p2p` that fails the stage, because
+/// running it here would be the silent local run the placement refuses.
+///
+/// [`Stage::placement`]: crate::framework::Stage::placement
 #[cfg(feature = "p2p")]
-fn build_remote_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> Option<ExecutionRequest> {
-    let (policy, _adapter) = (
-        env.dispatch_policy.as_ref()?,
-        env.execution_adapter.as_ref()?,
-    );
-    if env.tenant.is_restricted()
-        || env.training_io_node(task.node_id).is_some()
-        || !policy.is_dispatchable(task.stage.name())
-    {
-        return None;
+fn build_remote_request(
+    task: &NodeTask,
+    env: &NodeEnv,
+    attempt: u32,
+) -> Result<Option<ExecutionRequest>, String> {
+    let (Some(policy), Some(_adapter)) =
+        (env.dispatch_policy.as_ref(), env.execution_adapter.as_ref())
+    else {
+        return Ok(None);
+    };
+    let stays = |reason: &str| {
+        tracing::info!(
+            "stage {} (node {}) runs on this machine: {reason}",
+            task.stage.name(),
+            task.node_idx
+        );
+        Ok(None)
+    };
+    if env.tenant.is_restricted() {
+        return stays("its tenant is restricted");
     }
-    let input = match capture(
+    if env.training_io_node(task.node_id).is_some() {
+        return stays("it uses this machine's admitted training I/O");
+    }
+    let Some(data_class) = policy.remote_class(task.stage.as_ref(), &task.args) else {
+        return stays(match task.stage.placement_erased(&task.args) {
+            crate::framework::stage::StagePlacement::Remote { .. } => {
+                "its data is restricted, and restricted data never leaves this machine"
+            }
+            _ => "the stage does not declare that it may run on another machine",
+        });
+    };
+    let input = capture(
         task.stage.as_ref(),
         task.input.clone(),
         &env.job_dir,
         ArtifactRole::Input,
         None,
-    ) {
-        Ok(input) => input,
-        Err(error) => {
-            tracing::warn!(
-                "portable input capture failed for node {} ({}), running locally: {error}",
-                task.node_idx,
-                task.stage.name()
-            );
-            return None;
-        }
-    };
-    let data_class = match policy.classify_stage(task.stage.name(), &task.args) {
-        crate::p2p::trust::DataClass::Public => DataClassification::Public,
-        crate::p2p::trust::DataClass::Internal => DataClassification::Internal,
-        crate::p2p::trust::DataClass::Restricted => DataClassification::Restricted,
-    };
+    )
+    .map_err(|error| {
+        format!(
+            "stage {} (node {}) may run on a peer, but its input could not be packed \
+             for transfer: {error}",
+            task.stage.name(),
+            task.node_idx
+        )
+    })?;
     let resources = task.stage.resources();
-    Some(ExecutionRequest {
+    Ok(Some(ExecutionRequest {
         protocol_version: EXECUTION_PROTOCOL_VERSION,
         execution_id: format!(
             "exec-{}-{}-{}",
@@ -2182,9 +2273,47 @@ fn build_remote_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> Option<
             gpu: resources.contains(&Resource::Gpu),
             gpu_vram_gib: None,
         },
-        data_class,
+        data_class: data_class.into(),
         deadline: execution_deadline(task, env),
-    })
+    }))
+}
+
+/// Why [`build_remote_request`] kept `task` local, for the `--launcher cloud`
+/// refusal. Re-derives the same conditions in the same order; only reached on
+/// that failure path.
+#[cfg(feature = "cloud")]
+fn cloud_unplaceable_reason(task: &NodeTask, env: &NodeEnv) -> String {
+    if env.execution_adapter.is_none() || env.dispatch_policy.is_none() {
+        return "no cloud execution adapter is installed".into();
+    }
+    if env.tenant.is_restricted() {
+        return format!(
+            "tenant '{}' is restricted, and restricted data never leaves this machine",
+            env.tenant
+        );
+    }
+    if env.training_io_node(task.node_id).is_some() {
+        return "it was admitted with a training I/O profile, which is local-only".into();
+    }
+    if env.dispatch_policy.as_ref().is_some_and(|policy| {
+        policy
+            .remote_class(task.stage.as_ref(), &task.args)
+            .is_none()
+    }) {
+        return "the dispatch policy keeps it local".into();
+    }
+    match capture(
+        task.stage.as_ref(),
+        task.input.clone(),
+        &env.job_dir,
+        ArtifactRole::Input,
+        None,
+    ) {
+        Err(error) => format!(
+            "its input cannot be shipped (every file must be inside the job directory): {error}"
+        ),
+        Ok(_) => "it runs fused with the stage before it".into(),
+    }
 }
 
 async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, NodeFailure> {
@@ -2312,6 +2441,11 @@ async fn run_node_with_admission(
     let mut attempt = 0u32;
     #[cfg(feature = "p2p")]
     let mut remote_enabled = true;
+    // Mid-stage checkpoint slot (CONTRACT.md §8). The lease is taken by the
+    // first local attempt and held across retries until the node finishes,
+    // so no other BLUT process can drive this slot in between.
+    let wants_slot = env.checkpoint_root.is_some() && task.stage.checkpoint_slot_erased(&task.args);
+    let mut slot_lease: Option<crate::framework::stage_checkpoint::SlotLease> = None;
     let (stage_output, run_elapsed, returned_content_id, local_attempt) = loop {
         attempt += 1;
         if env
@@ -2338,13 +2472,14 @@ async fn run_node_with_admission(
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = cur.cancelled() => {
+                        let failure = cancel_failure(task.node_id, &task.node_cancel, &env.cancel);
                         env.status.emit(StageEvent::StageFailed {
                             node_idx: idx,
                             stage_name: stage_name.clone(),
-                            error: "cancelled during retry backoff".into(),
+                            error: cancel_message(&failure, "cancelled during retry backoff"),
                             failure: None,
                         });
-                        return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
+                        return Err(failure);
                     }
                     _ = sleep_until_opt(env.deadline) => {
                         return Err(deadline_failure(&env));
@@ -2353,13 +2488,14 @@ async fn run_node_with_admission(
             }
         }
         if task.node_cancel.is_cancelled() {
+            let failure = cancel_failure(task.node_id, &task.node_cancel, &env.cancel);
             env.status.emit(StageEvent::StageFailed {
                 node_idx: idx,
                 stage_name: stage_name.clone(),
-                error: "cancelled before stage attempt".into(),
+                error: cancel_message(&failure, "cancelled before stage attempt"),
                 failure: None,
             });
-            return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
+            return Err(failure);
         }
 
         // Clean tmp per attempt — each attempt starts from an empty dir.
@@ -2385,16 +2521,60 @@ async fn run_node_with_admission(
         // attempt starts clean yet stays killable by the coordinator.
         let stage_cancel = task.node_cancel.current().child_token();
         #[cfg(feature = "p2p")]
-        let remote_request = (remote_enabled
+        let remote_request = if remote_enabled
             && shared_admission.is_none()
             && pre_acquired_admission.is_none()
-            && !fused_handoff)
-            .then(|| build_remote_request(&task, &env, attempt))
-            .flatten();
+            && !fused_handoff
+        {
+            match build_remote_request(&task, &env, attempt) {
+                Ok(request) => request,
+                // `--launcher p2p` was asked for: an eligible stage that cannot
+                // be placed fails rather than running here.
+                Err(reason) if env.launch_target == crate::config::launcher::LaunchTarget::P2P => {
+                    let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                    let source = ExecutionFailure::artifact(reason).into_stage_error();
+                    env.status.emit(StageEvent::StageFailed {
+                        node_idx: idx,
+                        stage_name: stage_name.clone(),
+                        error: source.to_string(),
+                        failure: None,
+                    });
+                    return Err(NodeFailure::Stage {
+                        idx,
+                        stage: stage_name,
+                        source,
+                    });
+                }
+                Err(reason) => {
+                    tracing::warn!("{reason}; running it on this machine");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         #[cfg(feature = "p2p")]
         let is_remote = remote_request.is_some();
         #[cfg(not(feature = "p2p"))]
         let is_remote = false;
+        // `--launcher cloud` promises that stages run on the workers: a stage
+        // the cloud adapter cannot take fails here, named, instead of quietly
+        // running on the submitting machine.
+        #[cfg(feature = "cloud")]
+        if !is_remote && env.launch_target == crate::config::launcher::LaunchTarget::Cloud {
+            let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+            return Err(NodeFailure::Stage {
+                idx,
+                stage: stage_name.clone(),
+                source: StageError::Execution(Box::new(
+                    crate::framework::execution::ExecutionFailure::protocol(format!(
+                        "--launcher cloud cannot place stage '{stage_name}' on a worker: {}. \
+                         It was not run here either",
+                        cloud_unplaceable_reason(&task, &env)
+                    )),
+                )),
+            });
+        }
         let local_request = (!is_remote).then(|| build_local_request(&task, &env, attempt));
         let local_attempt = if is_remote {
             None
@@ -2440,6 +2620,7 @@ async fn run_node_with_admission(
             cache_key: task.key,
             attempt,
             resume_from: None,
+            checkpoint: None,
         };
 
         // ── Auto-resume on retry (S3 / P7) ──────────────────────────
@@ -2507,6 +2688,47 @@ async fn run_node_with_admission(
                 }
             }
         }
+
+        // ── Mid-stage checkpoint slot (CONTRACT.md §8) ─────────────
+        if wants_slot && !is_remote {
+            match prepare_checkpoint_slot(&env, &task, &stage_name, idx, attempt, &mut slot_lease) {
+                Ok(slot) => stage_ctx.checkpoint = slot,
+                Err(detail) => {
+                    let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                    // `CheckpointBusy` displays as "resume checkpoint busy: …",
+                    // so the detail names the stage and the holder only.
+                    let source = StageError::CheckpointBusy {
+                        detail: format!("stage '{stage_name}': {detail}"),
+                    };
+                    env.status.emit(StageEvent::StageFailed {
+                        node_idx: idx,
+                        stage_name: stage_name.clone(),
+                        error: source.to_string(),
+                        failure: None,
+                    });
+                    return Err(NodeFailure::Stage {
+                        idx,
+                        stage: stage_name,
+                        source,
+                    });
+                }
+            }
+        }
+
+        // ── Slurm job name (orphan detection) ──────────────────────
+        // Under `--launcher slurm` the stage is told to name its Slurm job
+        // `StageContext::slurm_job_name()`; record that name with the job so
+        // `blut cancel` and `plan resume` can find a Slurm job that outlives
+        // this process.
+        let slurm_name = (env.launch_target == crate::config::launcher::LaunchTarget::Slurm
+            && !is_remote)
+            .then(|| {
+                let name = crate::jobs::slurm_job_name(&env.job_dir, idx);
+                if let Err(e) = crate::jobs::record_slurm_job_name(&env.job_dir, &name) {
+                    tracing::warn!("record Slurm job name for node {idx} ({stage_name}): {e}");
+                }
+                name
+            });
 
         // ── Resource/GPU/memory admission ───────────────────────────
         // Ordinary nodes acquire their own canonical envelope per attempt. A
@@ -2627,8 +2849,17 @@ async fn run_node_with_admission(
                     },
                     Some(content_id),
                 )),
+                // No peer could take it. A library caller that installed an
+                // adapter without asking for a remote placement keeps the
+                // local fallback; `--launcher p2p` fails the stage instead
+                // (the arm below), never running it here in silence.
                 ExecutionResult::Failed(failure)
-                    if failure.kind == ExecutionFailureKind::Unavailable =>
+                    if failure.kind == ExecutionFailureKind::Unavailable
+                        && !matches!(
+                            env.launch_target,
+                            crate::config::launcher::LaunchTarget::P2P
+                                | crate::config::launcher::LaunchTarget::Cloud
+                        ) =>
                 {
                     tracing::warn!(
                         "remote execution unavailable for node {idx} ({stage_name}); running locally"
@@ -2714,6 +2945,10 @@ async fn run_node_with_admission(
                             })
                     }
                 };
+                // A systemd unit the stage places a process in is recorded
+                // with the job before the process starts, so `blut cancel`
+                // and `plan resume` find it after this process is killed.
+                let run_fut = crate::jobs::in_job(env.job_dir.clone(), run_fut);
                 let timed_fut = run_with_timeout(
                     run_fut,
                     &stage_cancel,
@@ -2761,6 +2996,15 @@ async fn run_node_with_admission(
         // stopped it on the panic exit; this is the normal-return path).
         if let Some(h) = gpu_sampler {
             h.stop().await;
+        }
+        if let Some(slot) = stage_ctx.checkpoint.as_ref() {
+            report_checkpoint_outcome(&env, idx, &stage_name, attempt, slot);
+        }
+        // A failed, cancelled or timed-out attempt killed its `srun`, and
+        // killing `srun` does not end the Slurm job. End it, so a retry or a
+        // later run never shares the allocation with a leftover trainer.
+        if let (Some(name), Err(_)) = (slurm_name.clone(), &run_result) {
+            stop_slurm_job(name, idx, &stage_name).await;
         }
         // Preserve the historical ordinary-node boundary: CPU/network/disk
         // permits are available to other work before divergence classification
@@ -2818,17 +3062,15 @@ async fn run_node_with_admission(
                         Some(detail) => StageError::Diverged { detail },
                         // A plain plan cancel / targeted kill: unchanged.
                         None => {
+                            let failure =
+                                cancel_failure(task.node_id, &task.node_cancel, &env.cancel);
                             env.status.emit(StageEvent::StageFailed {
                                 node_idx: idx,
                                 stage_name,
-                                error: "cancelled during stage".into(),
+                                error: cancel_message(&failure, "cancelled during stage"),
                                 failure: None,
                             });
-                            return Err(cancel_failure(
-                                task.node_id,
-                                &task.node_cancel,
-                                &env.cancel,
-                            ));
+                            return Err(failure);
                         }
                     }
                 } else {
@@ -2920,7 +3162,20 @@ async fn run_node_with_admission(
             }
             continue;
         }
-        // Terminal failure.
+        // Terminal failure. A token-fired, NON-diverged node keeps the EXACT
+        // prior outcome (targeted kill → Killed prune; plan cancel or a bare
+        // `Cancelled` error → Cancelled, fail-fast); its status line says which,
+        // so a reader can tell an early-stopped branch from a cancelled plan.
+        if !diverged && (token_fired || matches!(err, StageError::Cancelled)) {
+            let failure = cancel_failure(task.node_id, &task.node_cancel, &env.cancel);
+            env.status.emit(StageEvent::StageFailed {
+                node_idx: idx,
+                stage_name: stage_name.clone(),
+                error: cancel_message(&failure, &format!("{err}")),
+                failure: crate::framework::error_domain::extract_failure_summary(&err),
+            });
+            return Err(failure);
+        }
         env.status.emit(StageEvent::StageFailed {
             node_idx: idx,
             stage_name: stage_name.clone(),
@@ -2941,13 +3196,6 @@ async fn run_node_with_admission(
                 stage: stage_name,
                 source: err,
             });
-        }
-        // A token-fired, NON-diverged node keeps the EXACT prior behaviour:
-        // targeted kill → Killed (prune); plan cancel or a bare Cancelled error
-        // → Cancelled (fail-fast).
-        let cancelled = token_fired || matches!(err, StageError::Cancelled);
-        if cancelled {
-            return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
         }
         return Err(NodeFailure::Stage {
             idx,
@@ -3014,8 +3262,12 @@ async fn run_node_with_admission(
         Ok(stored) => (stored.manifest.content_id, Some(stored)),
         // A declared external reference is an expected ownership policy outcome,
         // not a failed store write. `capture` has only read the promoted output.
+        // Only an artifact type that opts into `ALLOW_EXTERNAL_PATHS` gets here,
+        // so this is its declared contract, not a fault: it is logged at debug
+        // (the sidecar records `persisted: false`). As a warning it was printed
+        // on every run of `check_jsonl`, `load_dataset` and the like.
         Err(error @ ArtifactStoreError::NonPortable(_)) => {
-            tracing::warn!(
+            tracing::debug!(
                 "executor: output for stage '{stage_name}' is not portable and will not be cached: {error}"
             );
             (
@@ -3086,6 +3338,7 @@ async fn run_node_with_admission(
     // Cache insert — STRICTLY after the atomic promote (the load-bearing
     // FW-2 ordering: the resume oracle appears only once the output is
     // fully in place).
+    let mut keep_slot: Option<String> = None;
     if let Some(stored) = stored {
         match env.cache.insert_stored(task.key, stored) {
             Ok(stored_id) => {
@@ -3102,8 +3355,16 @@ async fn run_node_with_admission(
                 tracing::warn!(
                     "executor: cache insert for stage '{stage_name}' failed: {e}; continuing"
                 );
+                keep_slot = Some(format!("cache insert failed: {e}"));
             }
         }
+    }
+
+    // The output is committed: its mid-stage checkpoints are no longer
+    // needed. If the cache insert failed they are kept, since a rerun would
+    // otherwise retrain from scratch.
+    if let Some(lease) = slot_lease.take() {
+        finish_checkpoint_slot(&env, idx, &stage_name, attempt, lease, keep_slot);
     }
 
     env.status.emit(StageEvent::StageEnd {
@@ -3135,6 +3396,208 @@ async fn run_node_with_admission(
         logical,
         cache_hit: false,
     })
+}
+
+/// Take (or keep) the node's checkpoint slot lease and decide whether this
+/// attempt resumes.
+///
+/// * `Ok(Some(slot))` — hand the slot to the stage.
+/// * `Ok(None)` — the slot could not be set up (an I/O error, logged): the
+///   attempt runs without one and restarts from step 0, as it would without
+///   checkpoint support. A storage problem must not stop training.
+/// * `Err(why)` — another process holds the slot, or a trainer from an earlier
+///   attempt may still be writing to it. Running now could put two trainers on
+///   one checkpoint directory, so the attempt is refused.
+fn prepare_checkpoint_slot(
+    env: &NodeEnv,
+    task: &NodeTask,
+    stage_name: &str,
+    idx: u32,
+    attempt: u32,
+    lease: &mut Option<crate::framework::stage_checkpoint::SlotLease>,
+) -> Result<Option<crate::framework::stage_checkpoint::CheckpointSlot>, String> {
+    use crate::framework::stage_checkpoint as sc;
+    let Some(root) = env.checkpoint_root.as_ref() else {
+        return Ok(None);
+    };
+    let dir = sc::slot_dir(root, &env.tenant, stage_name, &task.key);
+    let unavailable = |what: &str, e: &dyn std::fmt::Display| {
+        tracing::warn!(
+            "checkpoint: node {idx} ({stage_name}) attempt {attempt} runs without a slot: \
+             {what} {}: {e}",
+            dir.display()
+        );
+        Ok(None)
+    };
+    if lease.is_none() {
+        match sc::SlotLease::try_acquire(&dir) {
+            Ok(Some(l)) => *lease = Some(l),
+            Ok(None) => {
+                return Err(format!(
+                    "{} is locked by another BLUT process running the same stage",
+                    dir.display()
+                ));
+            }
+            Err(e) => return unavailable("lock", &e),
+        }
+    }
+    let Some(held) = lease.as_ref() else {
+        return Ok(None);
+    };
+    let run_id = env
+        .job_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let me = sc::SlotOwner::current(&run_id, &env.invocation, attempt);
+    let decision = sc::decide_slot(
+        sc::SlotMarker::read(&dir).as_ref(),
+        sc::SlotOwner::read(&dir).as_ref(),
+        &me,
+        sc::now_unix(),
+        crate::framework::resume::DEFAULT_STALE_AFTER_SECS,
+        &sc::pid_alive,
+    );
+    let offered = match decision {
+        sc::SlotDecision::Resume { step } => Some(step),
+        sc::SlotDecision::Fresh => {
+            if let Err(e) = held.clear() {
+                return unavailable("clear", &e);
+            }
+            None
+        }
+        sc::SlotDecision::Busy { reason } => return Err(reason),
+    };
+    if let Err(e) = me.write(&dir) {
+        return unavailable("write the owner record in", &e);
+    }
+    let mut slot = sc::CheckpointSlot::new(dir.clone(), offered.is_some(), run_id, me.attempt_id);
+    slot.offered_step = offered;
+    match offered {
+        Some(step) => tracing::info!(
+            "checkpoint: node {idx} ({stage_name}) attempt {attempt} resumes from step {step} in {}",
+            dir.display()
+        ),
+        None => tracing::info!(
+            "checkpoint: node {idx} ({stage_name}) attempt {attempt} starts fresh in {}",
+            dir.display()
+        ),
+    }
+    env.status.emit(StageEvent::StageCheckpoint {
+        node_idx: idx,
+        stage_name: stage_name.to_string(),
+        attempt,
+        action: if offered.is_some() {
+            sc::CheckpointAction::ResumeOffered
+        } else {
+            sc::CheckpointAction::Fresh
+        },
+        step: offered,
+        detail: Some(dir.to_string_lossy().into_owned()),
+    });
+    Ok(Some(slot))
+}
+
+/// After an attempt ran, record whether its trainer actually resumed (the
+/// trainer writes `resumed_from_step` into its marker once it has loaded a
+/// checkpoint).
+fn report_checkpoint_outcome(
+    env: &NodeEnv,
+    idx: u32,
+    stage_name: &str,
+    attempt: u32,
+    slot: &crate::framework::stage_checkpoint::CheckpointSlot,
+) {
+    use crate::framework::stage_checkpoint as sc;
+    if !slot.resume {
+        return;
+    }
+    let marker = sc::SlotMarker::read(&slot.dir)
+        .filter(|m| m.attempt_id.as_deref() == Some(slot.attempt_id.as_str()));
+    let (action, step, detail) = match marker.and_then(|m| m.resumed_from_step) {
+        Some(step) => {
+            tracing::info!(
+                "checkpoint: node {idx} ({stage_name}) attempt {attempt} resumed from step {step}"
+            );
+            (sc::CheckpointAction::Resumed, Some(step), None)
+        }
+        None => (
+            sc::CheckpointAction::Fresh,
+            None,
+            Some("offered a checkpoint, but the trainer recorded no resume".to_string()),
+        ),
+    };
+    env.status.emit(StageEvent::StageCheckpoint {
+        node_idx: idx,
+        stage_name: stage_name.to_string(),
+        attempt,
+        action,
+        step,
+        detail,
+    });
+}
+
+/// Delete a finished stage's slot, or keep it when its output did not reach
+/// the cache.
+fn finish_checkpoint_slot(
+    env: &NodeEnv,
+    idx: u32,
+    stage_name: &str,
+    attempt: u32,
+    lease: crate::framework::stage_checkpoint::SlotLease,
+    keep: Option<String>,
+) {
+    use crate::framework::stage_checkpoint::CheckpointAction;
+    let dir = lease.dir().to_path_buf();
+    let (action, detail) = match keep {
+        Some(why) => (CheckpointAction::Kept, why),
+        None => match lease.remove() {
+            Ok(()) => (
+                CheckpointAction::Cleaned,
+                dir.to_string_lossy().into_owned(),
+            ),
+            Err(e) => {
+                tracing::warn!("checkpoint: could not delete {}: {e}", dir.display());
+                (
+                    CheckpointAction::Kept,
+                    format!("delete {} failed: {e}", dir.display()),
+                )
+            }
+        },
+    };
+    env.status.emit(StageEvent::StageCheckpoint {
+        node_idx: idx,
+        stage_name: stage_name.to_string(),
+        attempt,
+        action,
+        step: None,
+        detail: Some(detail),
+    });
+}
+
+/// `scancel` the Slurm job named `name`, logging what happened.
+async fn stop_slurm_job(name: String, idx: u32, stage_name: &str) {
+    let job = name.clone();
+    match tokio::task::spawn_blocking(move || crate::config::launcher::scancel_named(&job)).await {
+        Ok(Ok(ids)) if ids.is_empty() => {}
+        Ok(Ok(ids)) => tracing::info!(
+            "node {idx} ({stage_name}): cancelled Slurm job(s) {} ({name}) left by the failed attempt",
+            ids.join(", ")
+        ),
+        Ok(Err(e)) => {
+            tracing::warn!("node {idx} ({stage_name}): could not stop Slurm job {name}: {e}")
+        }
+        Err(e) => tracing::warn!("node {idx} ({stage_name}): scancel task failed: {e}"),
+    }
+}
+
+/// A process-unique id for one plan execution.
+fn new_invocation_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos:x}", std::process::id())
 }
 
 /// Execute one optimizer-authorized target against a job-private scratch
@@ -3216,6 +3679,8 @@ async fn prepare_private(
         training_io_profiles.insert(node_id, selected);
     }
     let private_env = Arc::new(NodeEnv {
+        checkpoint_root: None,
+        invocation: canonical_env.invocation.clone(),
         started_at: canonical_env.started_at,
         job_dir: scratch_root.clone(),
         cache: Arc::new(CacheHandle::job_local(scratch_root.join("_cache"))),
@@ -3831,8 +4296,9 @@ fn publish_speculative_inner(
         None,
     ) {
         Ok(stored) => (stored.manifest.content_id, Some(stored)),
+        // Declared by the artifact type (`ALLOW_EXTERNAL_PATHS`): debug, as above.
         Err(error @ ArtifactStoreError::NonPortable(_)) => {
-            tracing::warn!(
+            tracing::debug!(
                 "executor: speculative output for stage '{stage_name}' is not portable and will not be cached: {error}"
             );
             (
@@ -4151,17 +4617,17 @@ fn gather_input_hash(
     }
 }
 
-/// Build the `NodeTask` for `node_id`, reading its input + input_hash
-/// from the coordinator's maps and computing the cache key.
-/// The code identity that keys the cache for a node (S4 / P9): the build-time
-/// git hash of THIS binary (catches a committed engine/cookbook change) folded
-/// with the stage's own `code_fingerprint` (the script content hash — catches an
-/// UNCOMMITTED kernel edit the git hash misses). A pure stage with no external
-/// code returns `None` and is keyed on the git hash alone.
+/// The code identity that keys the cache for a node (S4 / P9): the process's
+/// [`code_identity`](crate::framework::code_identity) digest — the engine and
+/// every registered cookbook, each by name, version, build commit and dirty
+/// digest — folded with the stage's own `code_fingerprint` (the content hash
+/// of an external script the binary does not contain). A stage with no
+/// external code is keyed on the code identity alone.
 fn node_code_sha(stage: &dyn StageDyn) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(env!("BLUT_GIT_HASH").as_bytes());
+    h.update(b"blut.code-sha.v3");
+    h.update(crate::framework::code_identity::current_digest());
     if let Some(fp) = stage.code_fingerprint() {
         h.update([0u8]);
         h.update(&fp);
@@ -5007,7 +5473,14 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
     let writer_handle = spawn_status_writer_checked(&ctx.status, lifecycle_rx, &ctx.job_dir)?;
 
     // MOVE ctx's fields into env — the hub Arc lives only here now.
+    let checkpoint_root = Some(
+        ctx.checkpoint_root
+            .clone()
+            .unwrap_or_else(|| crate::framework::stage_checkpoint::checkpoints_root(&ctx.job_dir)),
+    );
     let env = Arc::new(NodeEnv {
+        checkpoint_root,
+        invocation: new_invocation_id(),
         started_at: Instant::now(),
         job_dir: ctx.job_dir,
         cache: ctx.cache,
@@ -5095,7 +5568,59 @@ pub async fn execute_plan(plan: CompiledPlan, mut ctx: ExecCtx) -> Result<PlanRe
     execute_prepared_plan(plan, ctx).await
 }
 
+/// A placement this executor cannot honour must not run here instead. A k8s
+/// run is a whole plan submitted to blut-operator, never executed in-process;
+/// p2p and cloud place stages only through an installed [`ExecutionAdapter`]
+/// (`ExecCtx::with_execution_adapter`). Without one every stage ran on this
+/// machine while the job recorded the remote placement, which is what `recipe
+/// run --launcher p2p` did. The CLI refuses these targets earlier; this is the
+/// backstop for every path into the executor, library callers included.
+fn refuse_unplaced_target(ctx: &ExecCtx) -> Result<(), PlanError> {
+    use crate::config::launcher::LaunchTarget;
+    match ctx.launch_target {
+        LaunchTarget::K8s => Err(PlanError::Other(
+            crate::config::k8s_cluster::refuse_surface("a plan executed in-process").to_string(),
+        )),
+        LaunchTarget::P2P | LaunchTarget::Cloud if !has_execution_adapter(ctx) => {
+            crate::config::launcher::check_launcher_placeable(
+                ctx.launch_target,
+                "a plan executed without an execution adapter",
+            )
+            .map_err(|error| PlanError::Other(error.to_string()))
+        }
+        LaunchTarget::P2P if !p2p_adapter_places_on_peers(ctx) => Err(PlanError::Other(
+            "--launcher p2p needs a peer-to-peer execution adapter; the installed adapter \
+             places stages elsewhere. Nothing ran"
+                .into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(feature = "p2p")]
+fn has_execution_adapter(ctx: &ExecCtx) -> bool {
+    ctx.execution_adapter.is_some()
+}
+
+#[cfg(feature = "p2p")]
+fn p2p_adapter_places_on_peers(ctx: &ExecCtx) -> bool {
+    ctx.execution_adapter
+        .as_ref()
+        .is_some_and(|adapter| adapter.mode() == crate::framework::execution::ExecutionMode::P2p)
+}
+
+#[cfg(not(feature = "p2p"))]
+fn p2p_adapter_places_on_peers(_ctx: &ExecCtx) -> bool {
+    false
+}
+
+#[cfg(not(feature = "p2p"))]
+fn has_execution_adapter(_ctx: &ExecCtx) -> bool {
+    false
+}
+
 async fn execute_prepared_plan(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
+    refuse_unplaced_target(&ctx)?;
     let mode = ctx
         .prepared_execution
         .as_ref()
@@ -5209,7 +5734,7 @@ impl SequentialExecutor {
                     content_outputs.insert(outcome.node_id, outcome.content_id);
                 }
                 Err(f) => {
-                    // ADR 0071: an advisory stage's failure is a non-fatal warning,
+                    // ADR 0156: an advisory stage's failure is a non-fatal warning,
                     // not a plan failure — record it and STOP (the remaining topo
                     // nodes are its descendants and can't run). `strict_advisory()`
                     // forces the old fail-hard behaviour for CI.
@@ -5238,7 +5763,7 @@ impl SequentialExecutor {
 
         // If an advisory stage pruned the terminal node, surface the last COMPLETED
         // node in topo order (the upstream train ckpt in the canonical linear
-        // train→gate plan) rather than None (ADR 0071).
+        // train→gate plan) rather than None (ADR 0156).
         let final_output = if warnings.is_empty() {
             order.last().and_then(|id| outputs.remove(id))
         } else {
@@ -5737,6 +6262,7 @@ impl ParallelExecutor {
         // → the watcher is never subscribed and the loop is byte-identical to
         // the pre-control path.
         let control = ctx.control.clone();
+        let isolate_stage_failures = ctx.isolate_stage_failures;
         let Prelude {
             writer_handle,
             env,
@@ -5898,6 +6424,8 @@ impl ParallelExecutor {
                                 .chain(appended.iter())
                                 .find_map(|node| node.partition.clone())
                         });
+                    let spawn_label = delta.label.clone();
+                    let order_before = order.len();
                     match inject_spawn(
                         delta,
                         resolved_training_io,
@@ -5915,7 +6443,24 @@ impl ParallelExecutor {
                         &mut outputs,
                         &mut logical_outputs,
                     ) {
-                        Ok(k) => spawns_total += k,
+                        Ok(k) => {
+                            spawns_total += k;
+                            // Tell the policy which topo positions its spawn
+                            // got, so it can attribute their steps (HPO trial
+                            // bookkeeping); `order` grew by exactly these.
+                            if let Some(policy) = control.as_ref() {
+                                let nodes: Vec<(u32, &str)> = order[order_before..]
+                                    .iter()
+                                    .map(|gid| {
+                                        (
+                                            node_idx_of.get(gid).copied().unwrap_or(0),
+                                            node_at(&view, &appended, orig_n, *gid).stage.name(),
+                                        )
+                                    })
+                                    .collect();
+                                policy.on_spawned(spawn_label.as_deref(), &nodes);
+                            }
+                        }
                         Err(SpawnInjectionError::TrainingIo(error)) => {
                             // A child profile/calibration refusal is an
                             // admission failure, not a best-effort HPO shape
@@ -6391,16 +6936,27 @@ impl ParallelExecutor {
                                                     );
                                                 }
                                                 Control::Continue => {}
-                                                // A `KillBranch` IS a divergence kill — KillOnNaN
-                                                // is its only emitter (non-finite step metric); the
-                                                // separate `Spawn` arm below is NOT a kill. Record
-                                                // the divergence + cancel the token so `run_node`
-                                                // retries it (auto-resume) instead of pruning.
-                                                Control::KillBranch => {
+                                                // A `KillBranch` on a DIVERGED step (non-finite
+                                                // metric, or the stage's own `divergence_check`)
+                                                // is a divergence kill: record it + cancel the
+                                                // token so `run_node` retries it (auto-resume).
+                                                Control::KillBranch
+                                                    if stage_diverged || m.has_non_finite() =>
+                                                {
                                                     record_divergence_and_kill(
                                                         nid, node_idx, &stage_name, &update,
                                                         &node_tokens, &mut kill_flagged, &env,
                                                     );
+                                                }
+                                                // Any other `KillBranch` is the documented
+                                                // branch prune: HPO early stopping (ASHA /
+                                                // median / percentile / PBT cull) kills a
+                                                // HEALTHY trial whose metric is finite. Routing
+                                                // it through the divergence path turned every
+                                                // early stop into a retry and then a terminal
+                                                // `Diverged` that failed the whole HPO job.
+                                                Control::KillBranch => {
+                                                    prune_kill(nid, &node_tokens, &kill_flagged);
                                                 }
                                                 // Queue the delta; it is injected at
                                                 // the top of the loop (never mid-select!).
@@ -7282,11 +7838,15 @@ impl ParallelExecutor {
                     if let NodeFailure::Stage { idx, stage, source } = &f
                         && let Some(&nid) = order.get(*idx as usize)
                     {
-                        let is_adv = node_stages
-                            .get(&nid)
-                            .map(|s| s.is_advisory())
-                            .unwrap_or(false)
-                            && !strict_advisory();
+                        // An isolated plan (HPO) treats every terminal stage
+                        // failure like an advisory one: the failing branch is
+                        // pruned and its siblings keep running.
+                        let is_adv = isolate_stage_failures
+                            || node_stages
+                                .get(&nid)
+                                .map(|s| s.is_advisory())
+                                .unwrap_or(false)
+                                && !strict_advisory();
                         node_tokens.remove(&nid);
                         node_stages.remove(&nid);
                         ordinary_admission_demands.remove(&nid);
@@ -7299,7 +7859,14 @@ impl ParallelExecutor {
                         // Advisory failure: WARN, prune descendants exactly like a
                         // KILL (their input can't materialize), but do NOT fail the
                         // plan — other branches keep running.
-                        tracing::warn!("advisory stage '{stage}' failed (non-fatal): {reason}");
+                        if isolate_stage_failures {
+                            tracing::warn!(
+                                "stage '{stage}' (node {idx}) failed; its branch is pruned and \
+                                 the rest of the plan continues: {reason}"
+                            );
+                        } else {
+                            tracing::warn!("advisory stage '{stage}' failed (non-fatal): {reason}");
+                        }
                         // No StageFailure downcast happens on this path today
                         // (reason is only stringified above) — nothing to thread
                         // through yet (ADR 0072 B-series wires real origins into
@@ -7401,7 +7968,7 @@ impl ParallelExecutor {
         // If the terminal node was pruned, there is no final output — a killed
         // branch legitimately changed the graph (the caller sees the missing
         // output + the StageFailed events in status.jsonl). EXCEPT when an
-        // advisory stage did the pruning (ADR 0071): surface the last completed
+        // advisory stage did the pruning (ADR 0156): surface the last completed
         // node in topo order (the upstream train ckpt for a linear train→gate plan)
         // so the operator gets it live.
         let final_output = if warnings.is_empty() {

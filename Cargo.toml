@@ -23,7 +23,7 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/Quitetall/blut"
 homepage = "https://github.com/Quitetall/blut"
 documentation = "https://docs.rs/blut"
-rust-version = "1.88"
+rust-version = "1.99"
 publish = ["crates-io"]
 description = "Typed DAG orchestration, caching, containment, and observability for ML training workflows."
 readme = "README.md"
@@ -80,12 +80,12 @@ async-trait = "0.1"
 # DOWNSTREAM consumer (the cookbooks, codec-lossless, firmware) failed too. A
 # feature a crate needs must be declared by that crate; borrowing it from a
 # sibling only works until someone depends on you.
-nix = { version = "0.29", features = ["signal", "process", "resource", "fs"] }
+nix = { version = "0.29", features = ["signal", "process", "resource", "fs", "hostname"] }
 dirs = "5"
 parking_lot = "0.12"
 clap = { version = "4", features = ["derive"] }
 humantime = "2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3"
 sha2 = "0.10"
 memmap2 = "0.9"
@@ -99,9 +99,8 @@ schemars = "0.8"
 tokio-util = "0.7"
 rayon = "1"
 which = "6"
-# Local-filesystem object store used by the experimental cloud queue. Public
-# preview excludes network providers until their XML dependency chain clears
-# the advisory gate.
+# The object store behind the cloud queue and `--launcher cloud`. The default
+# build has only the local filesystem; network providers come with `s3`.
 # `aws` is additive and only compiled under the `s3` feature below. It brings
 # the HTTP client and signing path, which is why network object storage was
 # held out of the preview until it could be audited.
@@ -134,8 +133,29 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 # transitively — rustls's own "ring" feature enables "webpki/ring" — so this
 # just exposes the existing dependency directly rather than hand-rolling a
 # DER parser over attacker-controlled certificate bytes.
-webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"], optional = true }
+webpki = { package = "rustls-webpki", version = "0.103.16", default-features = false, features = ["alloc"], optional = true }
 rcgen = { version = "0.13", optional = true }
+
+# Windows Job Object containment (src/containment/windows.rs), the run
+# ledger's LockFileEx lock and the scheduler lock's liveness probe. Windows-only, so
+# Linux and macOS builds never compile it. windows-sys is MIT OR Apache-2.0 and
+# 0.61.2 is already in the lockfile through tokio/mio, so this adds no package.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+# Test-only: `tests/storage_conformance.rs` marks a file sparse before growing
+# it to 16 GiB, which NTFS would otherwise allocate on the runner's disk.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_IO", "Win32_System_Ioctl"] }
+
 [features]
 # The cockpit moved to the `crates/blut-tui` sidecar (ADR 0083 M2); the lean
 # CLI is now THE default build — no terminal-UI deps in the engine tree.

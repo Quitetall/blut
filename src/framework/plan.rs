@@ -747,8 +747,8 @@ impl CompiledPlan {
         }
 
         let mut hasher = Sha256::new();
-        hasher.update(b"blut.plan.execution.v1");
-        hasher.update(env!("BLUT_GIT_HASH").as_bytes());
+        hasher.update(b"blut.plan.execution.v2");
+        hasher.update(crate::framework::code_identity::current_digest());
         for node in &self.nodes {
             add_node(&mut hasher, node);
         }
@@ -796,16 +796,6 @@ impl CompiledPlan {
         self
     }
 
-    /// Generic pre-launch resource envelope derived from the plan's typed stage
-    /// declarations. The maximum single-stage ask: used by the dry-run report
-    /// and by the runtime-spawn guard (a sub-plan whose largest declared stage
-    /// exceeds the whole-job RAM reservation is rejected, never silently
-    /// clamped). Undeclared plans receive a small 2 GiB compatibility estimate;
-    /// the engine never infers domain meaning from recipe JSON keys.
-    /// Did ANY node declare a real envelope? `false` ⇒ the 2 GiB
-    /// compatibility floor is doing the billing — reported loudly per the
-    /// ADR 0133 floor policy (fail-loud now; an operator strict mode that
-    /// refuses undeclared plans arrives with the launch-consumer flip).
     /// Range-scoped variant of [`Self::max_declared_envelope`] — the largest
     /// declared envelope among TOP-LEVEL nodes whose id falls in `range`, plus
     /// any map template whose parent does (ADR 0133: per-TRIAL admission for a
@@ -858,15 +848,14 @@ impl CompiledPlan {
         best
     }
 
-    pub(crate) fn has_resource_declarations(&self) -> bool {
-        fn any(nodes: &[PlanNode]) -> bool {
-            nodes
-                .iter()
-                .any(|n| n.stage.resource_envelope(&n.args).is_declared())
-        }
-        any(&self.nodes) || self.expansions.iter().any(|e| any(&e.template.nodes))
-    }
-
+    /// Generic pre-launch resource envelope derived from the plan's typed stage
+    /// declarations, in whole GiB of the legacy `memory_gib_for` with a 2 GiB
+    /// floor. The maximum single-stage ask: used by the runtime-spawn guard (a
+    /// sub-plan whose largest declared stage exceeds the whole-job RAM
+    /// reservation is rejected, never silently clamped). The engine never
+    /// infers domain meaning from recipe JSON keys. Launch admission and
+    /// `recipe run --dry-run` bill the byte-granular
+    /// [`Self::max_declared_envelope`] instead.
     pub(crate) fn declared_footprint(&self) -> crate::broker::Footprint {
         fn visit(nodes: &[PlanNode], ram_gib: &mut u32, vram_mib: &mut u64) {
             for node in nodes {
@@ -1199,6 +1188,14 @@ impl CompiledPlan {
                     pair[1].0.name()
                 )));
             }
+        }
+        // Args are checked now, not when each node is reached: a bad argument
+        // to the last stage used to surface only after every earlier stage
+        // had run.
+        for (i, (stage, args)) in chain.iter().enumerate() {
+            stage.check_args(args).map_err(|e| {
+                PlanError::Other(format!("stage '{}' (node {i}): {e}", stage.name()))
+            })?;
         }
         let mut nodes: Vec<PlanNode> = Vec::with_capacity(chain.len());
         let mut edges: Vec<PlanEdge> = Vec::new();

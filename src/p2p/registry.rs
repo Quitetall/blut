@@ -47,12 +47,25 @@ impl PeerRegistry {
 
     /// Save the registry to disk (atomic write via fsync + rename).
     pub fn save(&self) -> Result<(), TrainError> {
+        self.ensure_dir()?;
+        self.write_atomic()
+    }
+
+    /// Create the directory the registry file lives in.
+    pub(crate) fn ensure_dir(&self) -> Result<(), TrainError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| TrainError::Io {
                 path: parent.to_path_buf(),
                 source: e,
             })?;
         }
+        Ok(())
+    }
+
+    /// [`save`](Self::save) into a directory that must already exist. A
+    /// background save uses this: running after its directory was removed, it
+    /// fails rather than bringing the directory back.
+    pub(crate) fn write_atomic(&self) -> Result<(), TrainError> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| TrainError::other(format!("serialize registry: {e}")))?;
         let tmp = self.path.with_extension("json.tmp");

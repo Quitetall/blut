@@ -6,7 +6,7 @@
 # result; it never learns this repository's test layout, so reorganising tests is
 # a local change that breaks nothing upstream.
 #
-# ADR 0092 invariant 5: owner-local tests exercise implementation; the meta
+# Module-ownership invariant 5 (LamQuant meta-project): owner-local tests exercise implementation; the meta
 # exercises public interfaces. This file is the seam between those two.
 
 schema_version = 1

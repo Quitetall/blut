@@ -600,6 +600,14 @@ impl PartitionSet {
                     d.axis
                 )));
             }
+            // `--dim seed=1,1` defined two cells with the same key.
+            let mut values = std::collections::BTreeSet::new();
+            if let Some(dup) = d.values.iter().find(|v| !values.insert(v.as_str())) {
+                return Err(TrainError::other(format!(
+                    "partition axis '{}' lists value '{dup}' more than once",
+                    d.axis
+                )));
+            }
             cells = cells
                 .checked_mul(d.values.len())
                 .filter(|&c| c <= MAX_CELLS)
@@ -644,8 +652,11 @@ impl PartitionSet {
     /// Directory holding all partition definitions + status logs
     /// (`~/.config/blut/partitions/`). `$BLUT_PARTITIONS_DIR` overrides (tests).
     pub fn dir() -> Result<PathBuf> {
-        if let Ok(p) = std::env::var("BLUT_PARTITIONS_DIR") {
+        if let Some(p) = std::env::var_os("BLUT_PARTITIONS_DIR") {
             return Ok(PathBuf::from(p));
+        }
+        if let Some(p) = crate::paths::under_state_root("partitions") {
+            return Ok(p);
         }
         let base = dirs::config_dir().ok_or_else(|| {
             TrainError::other("cannot resolve ~/.config (set $BLUT_PARTITIONS_DIR)")

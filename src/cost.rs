@@ -35,13 +35,10 @@ pub fn default_cap_path() -> std::path::PathBuf {
 
 /// `~/.blut`. NOTE: `sensord.rs` and `cli/mod.rs` each carry their own private
 /// copy of this; consolidating the three is exactly the kind of ownership
-/// question ADR 0092 exists to settle, so it is left alone here rather than
+/// question a module-ownership decision has to settle, so it is left alone here rather than
 /// refactored mid-ADR.
 fn dot_blut() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join(".blut")
+    crate::paths::blut_home()
 }
 
 /// One `[cap]` table: a per-tenant ceiling in whole cents.

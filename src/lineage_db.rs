@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
     schema_ver    INTEGER NOT NULL,
     sidecar_path  TEXT,
     produced_unix INTEGER,
+    -- 1 when this job served the artifact from cache instead of producing it.
+    reused        INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (job_id, stage_idx)
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_hash ON artifacts(content_hash);
@@ -83,8 +85,9 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_hash ON artifacts(content_hash);
 -- it FOLDS its parents' `output_hash`es AND its data-source content hashes,
 -- so a single `input_hash`→`output_hash` edge encodes BOTH the parent edge
 -- (lineage) AND the data dependency. CODE provenance is carried separately,
--- per-run, on `runs.git_sha` (the cache key also busts on `code_sha`, surfaced
--- as `code_freshness`). So (data, code, parent) are each represented; only the
+-- per-run, on `runs.git_sha` (the launch directory's HEAD); the engine build
+-- commit the cache key busts on is in the job's provenance.json, surfaced as
+-- `code_freshness`). So (data, code, parent) are each represented; only the
 -- FIELD NAMING is terse — no extra columns are needed to recover any of them.
 CREATE TABLE IF NOT EXISTS lineage_edges (
     job_id      TEXT NOT NULL,
@@ -198,11 +201,12 @@ pub struct PartitionStatusRow {
     pub recorded_unix: i64,
 }
 
-/// FRESHNESS verdict for a run's code (Phase G): did the code that built
-/// this output drift from the current `HEAD`? `Stale` means a re-run would
-/// re-execute (the cache key includes `code_sha`); `Unknown` means there
-/// was no recorded git SHA or no git HEAD to compare against (not stale —
-/// just unverifiable).
+/// FRESHNESS verdict for a run's code (Phase G): was this output built by a
+/// different engine commit than the running binary? `Stale` means a re-run
+/// would re-execute (the cache key includes the build commit); `Unknown`
+/// means the run records no build commit, or either binary was built
+/// without git (not stale — just unverifiable). `git_sha`, `built_sha` and
+/// `head` hold engine build commits.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "freshness", rename_all = "snake_case")]
 pub enum CodeFreshness {
@@ -211,8 +215,14 @@ pub enum CodeFreshness {
     Unknown,
 }
 
-/// Pure freshness verdict (testable without a real git HEAD): compare a
-/// run's recorded git SHA against the current HEAD.
+/// A build commit that identifies code: `build.rs` stamps `unknown` when the
+/// engine is built without git (a crates.io source, a tarball).
+fn is_known_build(hash: &str) -> bool {
+    !hash.is_empty() && hash != "unknown"
+}
+
+/// Pure freshness verdict (testable without a real build): compare a run's
+/// recorded build commit against the running binary's.
 fn freshness_verdict(recorded: Option<String>, head: Option<String>) -> CodeFreshness {
     match (recorded, head) {
         (Some(r), Some(h)) if r == h => CodeFreshness::Fresh { git_sha: r },
@@ -378,6 +388,14 @@ impl LineageDb {
             .map_err(|e| {
                 TrainError::other(format!("migrate partition_status.input_fingerprint: {e}"))
             })?;
+        }
+        // Additive: rows indexed before it read as produced (0) until reindexed.
+        if !table_has_column(&conn, "artifacts", "reused")? {
+            conn.execute(
+                "ALTER TABLE artifacts ADD COLUMN reused INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| TrainError::other(format!("migrate artifacts.reused: {e}")))?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| TrainError::other(format!("set user_version: {e}")))?;
@@ -719,6 +737,24 @@ impl LineageDb {
         Ok(())
     }
 
+    /// Record whether a job served its `stage_idx` artifact from cache (`true`)
+    /// or produced it. Call after [`record_artifact`](Self::record_artifact),
+    /// whose upsert resets the flag.
+    pub(crate) fn mark_artifact_reused(
+        &self,
+        job_id: &str,
+        stage_idx: i64,
+        reused: bool,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE artifacts SET reused = ?3 WHERE job_id = ?1 AND stage_idx = ?2",
+                params![job_id, stage_idx, i64::from(reused)],
+            )
+            .map_err(|e| TrainError::other(format!("mark artifact reuse: {e}")))?;
+        Ok(())
+    }
+
     /// Idempotent upsert of a lineage edge. Hashes lowercased so the upstream
     /// `trace` walk (which lowercases) matches `artifact_by_hash`'s `=` lookup.
     /// The `input_hash` is a fold of (parent `output_hash`es + data-source
@@ -836,8 +872,57 @@ impl LineageDb {
             .map_err(|e| TrainError::other(format!("final_metrics collect: {e}")))
     }
 
+    /// A run's headline metrics for a comparison. For an ordinary run that is
+    /// [`Self::final_metrics`]. For an HPO search it is the final values of the
+    /// best completed trial's nodes only: the job-wide aggregate mixes trials
+    /// (the max of every trial's loss, the cost of a stopped trial), which is
+    /// not a property of the search.
+    pub fn headline_metrics(&self, job_id: &str) -> Result<Vec<(String, f64)>> {
+        match crate::hpo::results::job_headline_trial(job_id) {
+            Some((_, nodes)) => self.final_metrics_for_nodes(job_id, &nodes),
+            None => self.final_metrics(job_id),
+        }
+    }
+
+    /// [`Self::final_metrics`] restricted to the nodes at topo positions
+    /// `nodes` (MAX per metric across them).
+    pub fn final_metrics_for_nodes(
+        &self,
+        job_id: &str,
+        nodes: &[u32],
+    ) -> Result<Vec<(String, f64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT metric, node_idx, value FROM metrics WHERE job_id=?1 AND step=-1
+                 ORDER BY metric",
+            )
+            .map_err(|e| TrainError::other(format!("final_metrics_for_nodes prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![job_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
+            })
+            .map_err(|e| TrainError::other(format!("final_metrics_for_nodes query: {e}")))?;
+        let mut best: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+        for row in rows {
+            let (metric, node, value) =
+                row.map_err(|e| TrainError::other(format!("final_metrics_for_nodes row: {e}")))?;
+            if !nodes.iter().any(|n| i64::from(*n) == node) {
+                continue;
+            }
+            best.entry(metric)
+                .and_modify(|v| *v = v.max(value))
+                .or_insert(value);
+        }
+        Ok(best.into_iter().collect())
+    }
+
     /// The per-step TRAJECTORY of `metric` for a job (real samples, `step >= 0`),
-    /// ordered by step — for `blut results` (ADR 0071 A3). Excludes the `step = -1`
+    /// ordered by step — for `blut results` (ADR 0156 A3). Excludes the `step = -1`
     /// final marker so the series is the live curve, not the headline.
     ///
     /// Job-level aggregate (no `node_idx` filter), consistent with `final_metrics`:
@@ -1007,7 +1092,8 @@ impl LineageDb {
             .prepare(
                 "SELECT job_id, stage_idx, stage_name, content_hash, kind, schema_ver,
                         sidecar_path, produced_unix
-                 FROM artifacts WHERE content_hash LIKE ?1 ORDER BY produced_unix DESC",
+                 FROM artifacts WHERE content_hash LIKE ?1
+                 ORDER BY reused ASC, produced_unix DESC",
             )
             .map_err(|e| TrainError::other(format!("prepare find_artifacts: {e}")))?;
         let rows = stmt
@@ -1018,14 +1104,23 @@ impl LineageDb {
         Ok(rows)
     }
 
-    /// FRESHNESS (Phase G): is a job's output still current, or was it
-    /// built with code that has since drifted? The cache key already busts
-    /// on `code_sha` + `input_hash` (so a re-run RE-EXECUTES a stale node);
-    /// this just SURFACES that verdict without re-running — by comparing the
-    /// git SHA recorded for the run against the current `HEAD`.
+    /// FRESHNESS (Phase G): was a job built by a different engine commit than
+    /// the running binary? Every stage cache key folds in the engine build
+    /// commit (`BLUT_GIT_HASH`), so a different commit means a re-run
+    /// re-executes every stage. This surfaces that verdict without re-running,
+    /// by comparing the build commit recorded at launch (the job's
+    /// `provenance.json`) with this binary's.
+    ///
+    /// It used to compare `git rev-parse HEAD` of the directory the run was
+    /// indexed from with that of the current directory. Those are not part of
+    /// the cache key, so the verdict depended on where you stood: it reported
+    /// `Stale` for a run that a re-run then served entirely from cache.
     pub fn code_freshness(&self, job_id: &str) -> Result<CodeFreshness> {
-        let recorded = self.get_run(job_id)?.and_then(|r| r.git_sha);
-        Ok(freshness_verdict(recorded, git_head_sha()))
+        let recorded = crate::jobs::read_provenance(job_id)?.map(|p| p.blut_build);
+        Ok(freshness_verdict(
+            recorded.filter(|h| is_known_build(h)),
+            Some(env!("BLUT_GIT_HASH").to_string()).filter(|h| is_known_build(h)),
+        ))
     }
 
     /// A run's provenance row by job id.
@@ -1164,13 +1259,18 @@ impl LineageDb {
         Ok(out)
     }
 
+    /// The row for a content hash, attributed to a job that PRODUCED it (the
+    /// newest such), falling back to a job that reused it from cache only when
+    /// no producing job is indexed. A cache-hit job also writes a sidecar for
+    /// the artifact, and picking the newest row regardless attributed models
+    /// to runs that never trained them: `lineage card` showed no metrics.
     fn artifact_by_hash(&self, content_hash: &str) -> Result<Option<ArtifactRow>> {
         self.conn
             .query_row(
                 "SELECT job_id, stage_idx, stage_name, content_hash, kind, schema_ver,
                         sidecar_path, produced_unix
                  FROM artifacts WHERE content_hash = ?1
-                 ORDER BY produced_unix DESC LIMIT 1",
+                 ORDER BY reused ASC, produced_unix DESC LIMIT 1",
                 params![content_hash],
                 row_to_artifact,
             )
@@ -1403,9 +1503,9 @@ impl LineageDb {
 
         // Metric deltas: union of names, keep only where a and b differ.
         let ma: std::collections::HashMap<String, f64> =
-            self.final_metrics(a)?.into_iter().collect();
+            self.headline_metrics(a)?.into_iter().collect();
         let mb: std::collections::HashMap<String, f64> =
-            self.final_metrics(b)?.into_iter().collect();
+            self.headline_metrics(b)?.into_iter().collect();
         let mut names: Vec<String> = ma.keys().chain(mb.keys()).cloned().collect();
         names.sort();
         names.dedup();
@@ -1541,13 +1641,19 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
             });
         }
     };
+    // Provenance comes from the job directory, never from the indexing
+    // process: a reindex from another checkout must not rewrite history.
+    let provenance = crate::jobs::read_provenance(job_id)?;
     db.record_run(&RunRow {
         job_id: job_id.to_string(),
         recipe: recipe.to_string(),
         config_fingerprint: None, // (sweep/config path supplies this when present)
-        git_sha: git_head_sha(),
-        started_unix: None,
-        ended_unix: Some(chrono::Utc::now().timestamp()),
+        git_sha: provenance.as_ref().and_then(|p| p.git_sha.clone()),
+        started_unix: provenance
+            .as_ref()
+            .map(|p| p.started_unix)
+            .or_else(|| crate::jobs::job_id_unix(job_id)),
+        ended_unix: crate::jobs::terminal_state_unix(job_id),
         outcome: Some(outcome.to_string()),
         host: read_hostname(),
         gpu_name: None,
@@ -1557,13 +1663,15 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
         experiment: Some(experiment),
         args_json,
     })?;
+    let reused = crate::framework::lineage::reused_nodes(job_id)?;
     for rec in crate::framework::lineage::scan_artifacts(job_id)?.into_iter() {
         let Some(content_id) = rec.meta.content_id() else {
             continue;
         };
+        let stage_idx = stage_idx_of(&rec.sidecar_path);
         db.record_artifact(&ArtifactRow {
             job_id: job_id.to_string(),
-            stage_idx: stage_idx_of(&rec.sidecar_path) as i64,
+            stage_idx: stage_idx as i64,
             stage_name: rec.meta.produced_by_stage.clone().unwrap_or_default(),
             content_hash: content_id.to_hex(),
             kind: rec.meta.kind.clone(),
@@ -1571,6 +1679,7 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
             sidecar_path: Some(rec.sidecar_path.display().to_string()),
             produced_unix: Some(rec.meta.produced_at_unix_secs as i64),
         })?;
+        db.mark_artifact_reused(job_id, stage_idx as i64, reused.contains(&stage_idx))?;
     }
     for node in crate::framework::lineage::job_lineage(job_id)?.into_iter() {
         let Some(output) = node.output_content_id else {
@@ -1599,7 +1708,8 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
 }
 
 /// Best-effort `git rev-parse HEAD` of the working tree (None if not a repo).
-fn git_head_sha() -> Option<String> {
+/// Recorded once at launch (see [`crate::jobs::LaunchProvenance`]).
+pub(crate) fn git_head_sha() -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -1667,11 +1777,31 @@ fn row_to_artifact(row: &rusqlite::Row) -> rusqlite::Result<ArtifactRow> {
 mod tests {
     use super::*;
 
-    fn db() -> LineageDb {
-        let td = tempfile::tempdir().unwrap();
-        // Leak the tempdir for the test's lifetime (db holds an open handle).
-        let path = td.keep().join("lineage.db");
-        LineageDb::open_at(path).unwrap()
+    /// A lineage DB in its own temporary directory, removed when the test
+    /// drops it (the DB first, then the directory). It used to leak the
+    /// directory with `TempDir::keep`, one per test per run.
+    struct TestDb {
+        db: LineageDb,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestDb {
+        type Target = LineageDb;
+        fn deref(&self) -> &LineageDb {
+            &self.db
+        }
+    }
+
+    impl std::ops::DerefMut for TestDb {
+        fn deref_mut(&mut self) -> &mut LineageDb {
+            &mut self.db
+        }
+    }
+
+    fn db() -> TestDb {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LineageDb::open_at(dir.path().join("lineage.db")).unwrap();
+        TestDb { db, _dir: dir }
     }
 
     fn art(job: &str, idx: i64, hash: &str) -> ArtifactRow {
@@ -1972,6 +2102,54 @@ mod tests {
         );
     }
 
+    /// A cache-hit job writes a sidecar for the artifact it reused, with a
+    /// newer timestamp than the producing run. `lineage card` and `graph`
+    /// attributed the model to that job and showed none of its metrics.
+    #[test]
+    fn an_artifact_is_attributed_to_the_job_that_produced_it() {
+        let db = db();
+        for job in ["producer", "cache-hit"] {
+            db.record_run(&RunRow {
+                job_id: job.into(),
+                recipe: "train".into(),
+                outcome: Some("done".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let mut produced = art("producer", 1, "modelhash");
+        produced.produced_unix = Some(100);
+        let mut reused = art("cache-hit", 1, "modelhash");
+        reused.produced_unix = Some(200);
+        db.record_artifact(&produced).unwrap();
+        db.record_artifact(&reused).unwrap();
+        db.mark_artifact_reused("cache-hit", 1, true).unwrap();
+        db.record_metrics(&[MetricRow {
+            job_id: "producer".into(),
+            node_idx: 1,
+            step: -1,
+            metric: "val_r".into(),
+            value: 0.5,
+            wall_unix: None,
+        }])
+        .unwrap();
+        let card = db.model_card("modelhash", true).unwrap().expect("a card");
+        let rendered = card.render();
+        assert!(rendered.contains("producer"), "{rendered}");
+        assert!(rendered.contains("val_r"), "{rendered}");
+        assert_eq!(
+            db.find_artifacts("modelhash").unwrap()[0].job_id,
+            "producer"
+        );
+        // Re-recording the row (a reindex) resets the flag until marked again.
+        db.record_artifact(&reused).unwrap();
+        assert_eq!(
+            db.find_artifacts("modelhash").unwrap()[0].job_id,
+            "cache-hit",
+            "unmarked, the newer row wins as before"
+        );
+    }
+
     #[test]
     fn find_artifacts_by_hash_prefix() {
         let db = db();
@@ -2099,6 +2277,155 @@ mod tests {
         assert!(chain.len() <= 2, "cycle guard bounds the walk");
     }
 
+    /// Point the job and data dirs at a fresh tempdir for one test.
+    struct IsolatedDirs {
+        _td: tempfile::TempDir,
+        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+    }
+    impl IsolatedDirs {
+        fn new() -> Self {
+            let td = tempfile::tempdir().unwrap();
+            let prev =
+                ["LAMU_TRAIN_JOBS_DIR", "LAMU_TRAIN_DATA_DIR"].map(|k| (k, std::env::var_os(k)));
+            // SAFETY: callers hold TEST_ENV_LOCK; restored in Drop.
+            unsafe {
+                std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path().join("jobs"));
+                std::env::set_var("LAMU_TRAIN_DATA_DIR", td.path().join("data"));
+            }
+            Self { _td: td, prev }
+        }
+    }
+    impl Drop for IsolatedDirs {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                // SAFETY: still under the caller's TEST_ENV_LOCK.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A run's git SHA and timing came from the INDEXING process: `git
+    /// rev-parse HEAD` of wherever `blut lineage reindex` ran, `ended_unix =
+    /// now`, and no start time at all. They must come from the job directory.
+    #[test]
+    fn ingest_records_launch_provenance_not_the_indexing_process() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _dirs = IsolatedDirs::new();
+        let with = "20261023-010203-000000001";
+        let legacy = "20261023-010203-000000002";
+        crate::jobs::write_provenance(with, Some("launch-sha".into())).unwrap();
+        // Written once: a later call (a resume) keeps the launch record.
+        crate::jobs::write_provenance(with, Some("resume-sha".into())).unwrap();
+        crate::jobs::write_state(with, crate::jobs::JobState::Done).unwrap();
+        crate::jobs::write_state(legacy, crate::jobs::JobState::Failed).unwrap();
+        let recorded = crate::jobs::read_provenance(with).unwrap().unwrap();
+        ingest_job(with, "r", "done").unwrap();
+        ingest_job(legacy, "r", "failed").unwrap();
+        // Reindexing again (from any directory) changes nothing.
+        ingest_job(with, "r", "done").unwrap();
+
+        let db = LineageDb::open().unwrap();
+        let run = db.get_run(with).unwrap().unwrap();
+        assert_eq!(run.git_sha.as_deref(), Some("launch-sha"));
+        assert_eq!(run.started_unix, Some(recorded.started_unix));
+        assert!(
+            run.ended_unix
+                .is_some_and(|e| e >= recorded.started_unix - 1)
+        );
+        let old = db.get_run(legacy).unwrap().unwrap();
+        assert_eq!(
+            old.git_sha, None,
+            "no launch record: unknown, not the indexer's HEAD"
+        );
+        let id_time = chrono::NaiveDate::from_ymd_opt(2026, 10, 23)
+            .unwrap()
+            .and_hms_opt(1, 2, 3)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert_eq!(
+            old.started_unix,
+            Some(id_time),
+            "legacy start from the job id"
+        );
+        assert!(old.ended_unix.is_some());
+    }
+
+    /// `lineage freshness` and partition staleness compared the HEAD of the
+    /// launch directory with the HEAD of the current one, and reported STALE
+    /// ("a re-run re-executes") for a run a re-run then served from cache.
+    /// The verdict must compare what the cache key folds in: the engine build.
+    #[test]
+    fn code_freshness_compares_the_engine_build_commit() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _dirs = IsolatedDirs::new();
+        let this = "20261023-010203-000000003";
+        let other = "20261023-010203-000000004";
+        let legacy = "20261023-010203-000000005";
+        crate::jobs::write_provenance(this, Some("any".into())).unwrap();
+        crate::jobs::write_provenance(other, Some("any".into())).unwrap();
+        let path = crate::paths::job_dir(other)
+            .unwrap()
+            .join("provenance.json");
+        let mut rec = crate::jobs::read_provenance(other).unwrap().unwrap();
+        rec.blut_build = "0123456789ab".into();
+        std::fs::write(&path, serde_json::to_vec(&rec).unwrap()).unwrap();
+        crate::paths::job_dir(legacy).unwrap();
+        let db = LineageDb::open().unwrap();
+        let build = env!("BLUT_GIT_HASH");
+        if is_known_build(build) {
+            assert_eq!(
+                db.code_freshness(this).unwrap(),
+                CodeFreshness::Fresh {
+                    git_sha: build.into()
+                }
+            );
+            assert!(db.code_freshness(other).unwrap().is_stale());
+        } else {
+            assert_eq!(db.code_freshness(this).unwrap(), CodeFreshness::Unknown);
+            assert_eq!(db.code_freshness(other).unwrap(), CodeFreshness::Unknown);
+        }
+        assert_eq!(db.code_freshness(legacy).unwrap(), CodeFreshness::Unknown);
+    }
+
+    /// `blut sla check` evaluated "0 run(s)" forever: no run row ever carried
+    /// a start time, so every run was skipped. A finished run that exceeded a
+    /// `max_runtime_secs` bound must now breach.
+    #[test]
+    fn sla_check_sees_indexed_runs() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dirs = IsolatedDirs::new();
+        let job = "20261023-010203-000000006";
+        crate::jobs::write_provenance(job, None).unwrap();
+        let path = crate::paths::job_dir(job).unwrap().join("provenance.json");
+        let mut rec = crate::jobs::read_provenance(job).unwrap().unwrap();
+        rec.started_unix -= 600;
+        std::fs::write(&path, serde_json::to_vec(&rec).unwrap()).unwrap();
+        crate::jobs::write_state(job, crate::jobs::JobState::Done).unwrap();
+        ingest_job(job, "train", "done").unwrap();
+        let rules = dirs._td.path().join("sla.toml");
+        std::fs::write(
+            &rules,
+            "[[rule]]\nname = \"cap\"\nrecipe = \"train\"\nmax_runtime_secs = 60\n",
+        )
+        .unwrap();
+        let out = dirs._td.path().join("sla.jsonl");
+        let report = crate::sla::check_paths(&rules, &out).unwrap();
+        assert_eq!(report.run_count, 1);
+        assert_eq!(report.breaches.len(), 1, "{:?}", report.breaches);
+    }
+
     #[test]
     fn freshness_verdict_classifies_code_drift() {
         // Same SHA → FRESH.
@@ -2129,5 +2456,37 @@ mod tests {
         // is_stale only true for Stale.
         assert!(freshness_verdict(Some("a".into()), Some("b".into())).is_stale());
         assert!(!freshness_verdict(Some("a".into()), Some("a".into())).is_stale());
+    }
+
+    #[test]
+    fn final_metrics_for_nodes_reads_only_the_named_nodes() {
+        // `exp compare` on an HPO job used the job-wide MAX over every
+        // trial's final values; it now reads the headline trial's nodes.
+        let td = tempfile::tempdir().unwrap();
+        let db = LineageDb::open_at(td.path().join("lineage.db")).unwrap();
+        let row = |node: i64, metric: &str, value: f64| MetricRow {
+            job_id: "hpo-1".into(),
+            node_idx: node,
+            step: -1,
+            metric: metric.into(),
+            value,
+            wall_unix: None,
+        };
+        db.record_metrics(&[
+            row(0, "loss", 0.2),
+            row(0, "val_r", 0.8),
+            row(1, "loss", 0.9),
+            row(1, "val_r", 0.1),
+        ])
+        .unwrap();
+        assert_eq!(
+            db.final_metrics_for_nodes("hpo-1", &[0]).unwrap(),
+            vec![("loss".to_string(), 0.2), ("val_r".to_string(), 0.8)]
+        );
+        assert_eq!(
+            db.final_metrics("hpo-1").unwrap(),
+            vec![("loss".to_string(), 0.9), ("val_r".to_string(), 0.8)],
+            "the job-wide aggregate mixes trials"
+        );
     }
 }

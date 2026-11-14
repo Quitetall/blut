@@ -962,10 +962,7 @@ pub fn spool_dir(trigger: &str) -> PathBuf {
     if let Some(root) = std::env::var_os("BLUT_EVENTS_DIR") {
         return PathBuf::from(root).join(trigger);
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".blut").join("events").join(trigger)
+    crate::paths::blut_home().join("events").join(trigger)
 }
 
 /// Path of the daemon's dedupe log for a trigger (beside the spool root).

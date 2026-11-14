@@ -40,8 +40,8 @@
 # Ten workspaces each carry their own Cargo.lock, and every one of them is a
 # separate update surface. That split is deliberate and stays: blut-dsl must not
 # share a feature graph with the engine (serde_json/arbitrary_precision would
-# break internally-tagged enums), blut-web/ui targets wasm, blut-operator holds
-# a 1.89 MSRV lane, and the sidecars dispatch as external subcommands. So the
+# break internally-tagged enums), blut-web/ui targets wasm, blut-operator is
+# gated on its own, and the sidecars dispatch as external subcommands. So the
 # surface cannot be collapsed -- only the cadence can.
 #
 # Weekly x 10 workspaces produced roughly 26 pull requests and the matching mail

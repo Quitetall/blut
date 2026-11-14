@@ -14,7 +14,7 @@
 name = "blut-web"
 version = "0.2.0-alpha.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "BLUT web sidecar — read-only HTTP views over jobs, lineage, models, and the catalog (ADR 0083)."

@@ -4,7 +4,7 @@
 name = "blut-dsl"
 version = "0.2.0-alpha.2"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 publish = ["crates-io"]
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"

@@ -40,3 +40,19 @@ elsewhere, or any other rule firing on this path, still fails the gate.
 """
 regexes = ['''\b[0-9a-f]{40}\b''']
 regexTarget = "match"
+
+[[allowlists]]
+description = """
+Content-derived IDEMPOTENCY KEYS in governance journals
+(`docs/warrants/*/journal.jsonl`): each `"idempotency_key"` is the lowercase
+hex SHA-256 of the journal event it deduplicates. `generic-api-key` flags the
+`key` name next to 64 hex characters.
+
+Verified 2026-10-20 on the two flagged values: each is a sha256 digest of its
+own event record. They grant no access and carry no credential material.
+Shape-only, like the entry above: the regex matches the whole JSON field
+(name, quotes, exactly 64 lowercase hex characters), so a token in any other
+field, or one of any other length or alphabet, still fails the gate.
+"""
+regexes = ['''idempotency_key":"[0-9a-f]{64}"''']
+regexTarget = "match"

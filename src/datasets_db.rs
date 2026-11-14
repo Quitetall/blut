@@ -114,8 +114,15 @@ pub fn count_jsonl_examples(path: &Path) -> Result<i64> {
 /// Path to the datasets registry — same file LAMU's memory uses.
 /// Override via `$LAMU_MEMORY_DB` (matches `conversations::memory_db_path`).
 pub fn registry_path() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("LAMU_MEMORY_DB") {
+    if let Some(p) = std::env::var_os("LAMU_MEMORY_DB") {
         return Ok(PathBuf::from(p));
+    }
+    if let Some(root) = crate::paths::state_root() {
+        std::fs::create_dir_all(&root).map_err(|e| TrainError::Io {
+            path: root.clone(),
+            source: e,
+        })?;
+        return Ok(root.join("conversations.db"));
     }
     let dir = dirs::data_local_dir()
         .ok_or_else(|| TrainError::other("data_local_dir() unavailable; set $LAMU_MEMORY_DB"))?
@@ -144,6 +151,12 @@ pub fn open_at(path: &Path) -> Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
     )
     .map_err(|e| TrainError::other(format!("open {}: {e}", path.display())))?;
+    // Concurrent CLI invocations (two `dataset ingest add`s, an add racing a pin,
+    // or a catalog reader) must WAIT for the writer lock, not fail with a raw
+    // "database is locked": without a busy timeout SQLite returns SQLITE_BUSY
+    // immediately, so two writers fail instead of taking turns.
+    conn.busy_timeout(std::time::Duration::from_secs(10))
+        .map_err(|e| TrainError::other(format!("busy_timeout: {e}")))?;
     // WAL — same mode lamu-mcp::memory sets. Idempotent. Retry
     // on SQLITE_BUSY: a concurrent startup with lamu-mcp can
     // briefly hold the writer lock during its own pragma calls.
@@ -160,7 +173,10 @@ fn apply_pragma_with_retry(conn: &Connection, sql: &str) {
     loop {
         let r: rusqlite::Result<rusqlite::types::Value> = conn.query_row(sql, [], |row| row.get(0));
         match r {
-            Ok(_) => return,
+            // A setter such as `PRAGMA synchronous=NORMAL` returns no row; it
+            // still ran. Treating that as a failure printed a WARN on every
+            // `blut dataset` command.
+            Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => return,
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.code == rusqlite::ErrorCode::DatabaseBusy && tries < 5 =>
             {
@@ -304,7 +320,7 @@ pub fn add(conn: &Connection, rec: &DatasetRecord) -> Result<()> {
             if e.code == rusqlite::ErrorCode::ConstraintViolation =>
         {
             Err(TrainError::other(format!(
-                "dataset '{}' already registered. Use `lamu-train data rm {}` first \
+                "dataset '{}' already registered. Use `blut dataset ingest rm {}` first \
                  or pick a unique name.",
                 rec.name, rec.name
             )))

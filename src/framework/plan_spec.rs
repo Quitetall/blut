@@ -229,7 +229,20 @@ impl PlanSpec {
                         name: self.name.clone(),
                         stage: sn.stage.clone(),
                     })?;
-            nodes.push((ctor(), sn.args.clone()));
+            let stage = ctor();
+            // Checked at compile, so `plan check` and a `.json`/`.star`
+            // launch refuse bad args before any node runs.
+            stage
+                .check_args(&sn.args)
+                .map_err(|e| PlanSpecError::Plan {
+                    name: self.name.clone(),
+                    source: PlanError::Other(format!(
+                        "node {} stage '{}': {e}",
+                        nodes.len(),
+                        sn.stage
+                    )),
+                })?;
+            nodes.push((stage, sn.args.clone()));
         }
         Ok(nodes)
     }
@@ -847,6 +860,24 @@ mod tests {
         ));
     }
 
+    /// The engine's half of the empty-Starlark-plan fix: a PlanSpec with no
+    /// nodes (what `blut-dsl` emitted for a script that never called `add()`)
+    /// is refused at compile, so a `.json` recipe cannot run an empty plan
+    /// either.
+    #[test]
+    fn an_empty_plan_spec_does_not_compile() {
+        let mut empty = linear_spec();
+        empty.nodes.clear();
+        empty.edges.clear();
+        match empty.compile(&toy_registry()) {
+            Err(e @ PlanSpecError::Plan { .. }) => {
+                assert_eq!(e.to_string(), "plan spec 'chain': plan has no nodes");
+            }
+            Err(e) => panic!("expected an empty-plan error, got {e:?}"),
+            Ok(_) => panic!("an empty PlanSpec compiled"),
+        }
+    }
+
     #[test]
     fn typed_condition_gate_compiles_separately_from_data_edges() {
         let plan = condition_spec("spec_decide", "spec_make_a")
@@ -1095,6 +1126,24 @@ mod tests {
             version: 1,
         };
         assert_ne!(a.canonical_bytes(), c.canonical_bytes());
+    }
+
+    /// Node args are checked when the spec compiles (what `plan check` and a
+    /// `.json`/`.star` launch run), not when the executor reaches the node:
+    /// a bad argument to the last node used to pass `plan check` and fail
+    /// only after every earlier node had run.
+    #[test]
+    fn compile_refuses_bad_node_args_before_anything_runs() {
+        let mut spec = linear_spec();
+        let last = spec.nodes.len() - 1;
+        spec.nodes[last].args = serde_json::json!("not an object");
+        let Err(err) = spec.compile(&toy_registry()) else {
+            panic!("bad args must fail the compile");
+        };
+        assert!(
+            err.to_string().contains(&format!("node {last}")),
+            "names the node: {err}"
+        );
     }
 
     #[test]

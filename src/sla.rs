@@ -21,7 +21,10 @@ use blut_types::trust::DataClass;
 #[serde(deny_unknown_fields)]
 pub struct SlaRule {
     pub name: String,
-    /// Match only runs of this recipe (`None` = any recipe).
+    /// Match only runs of this recipe (`None` = any recipe): a registry
+    /// recipe name, or a deploy pointer URI (`registry://plan@prod`), which is
+    /// the recipe a `recipe declare registry://plan@<name> --run` launch (and
+    /// a sensord dispatch of one) records.
     #[serde(default)]
     pub recipe: Option<String>,
     /// Max wall-clock runtime in seconds before a `MaxRuntime` breach.
@@ -94,8 +97,11 @@ fn breach(
     }
 }
 
-/// Evaluate every rule against every observation at wall-clock `now` (unix s),
-/// returning the breaches. Pure: no I/O, deterministic in its inputs.
+/// Evaluate every rule at wall-clock `now` (unix s), returning the breaches.
+/// `max_runtime_secs` and `freshness_secs` judge the newest matching run per
+/// tenant (by start time and by measured data age respectively), so an old
+/// breach stops counting once a newer run meets the rule; `deadline_unix`
+/// judges every run still running. Pure: no I/O, deterministic in its inputs.
 pub fn evaluate(rules: &[SlaRule], runs: &[RunObservation], now: i64) -> Vec<SlaBreach> {
     let mut out = Vec::new();
     for obs in runs {
@@ -105,13 +111,6 @@ pub fn evaluate(rules: &[SlaRule], runs: &[RunObservation], now: i64) -> Vec<Sla
             {
                 continue; // rule scoped to a different recipe
             }
-            // MaxRuntime: elapsed = (end or now) − start.
-            if let Some(max) = rule.max_runtime_secs {
-                let elapsed = obs.ended_unix.unwrap_or(now) - obs.started_unix;
-                if elapsed > max {
-                    out.push(breach(rule, SlaKind::MaxRuntime, obs, elapsed, max, now));
-                }
-            }
             // Deadline: a run STILL running past the wall-clock deadline.
             if let Some(deadline) = rule.deadline_unix
                 && obs.ended_unix.is_none()
@@ -119,35 +118,101 @@ pub fn evaluate(rules: &[SlaRule], runs: &[RunObservation], now: i64) -> Vec<Sla
             {
                 out.push(breach(rule, SlaKind::Deadline, obs, now, deadline, now));
             }
-            // Freshness: the run's data is older than the allowed window.
-            if let Some(window) = rule.freshness_secs
-                && let Some(age) = obs.data_age_secs
+        }
+    }
+    // MaxRuntime judges the NEWEST run per tenant: elapsed = (end or now) −
+    // start. Judged per run, one historical slow run kept `sla check` failing
+    // forever, however fast every later run was.
+    for rule in rules {
+        let Some(max) = rule.max_runtime_secs else {
+            continue;
+        };
+        for newest in newest_started_per_tenant(rule, runs) {
+            let elapsed = newest.ended_unix.unwrap_or(now) - newest.started_unix;
+            if elapsed > max {
+                out.push(breach(rule, SlaKind::MaxRuntime, newest, elapsed, max, now));
+            }
+        }
+    }
+    // Freshness is a property of the NEWEST data a recipe has produced, per
+    // tenant: one rule breaches when the freshest matching run is older than
+    // the window. Evaluated per run, every historical run past the window was
+    // a breach forever, and once runs were visible to SLA evaluation a single
+    // old run kept `sla check` failing however fresh the latest output was.
+    for rule in rules {
+        let Some(window) = rule.freshness_secs else {
+            continue;
+        };
+        for newest in newest_measured_per_tenant(rule, runs) {
+            if let Some(age) = newest.data_age_secs
                 && age > window
             {
-                out.push(breach(rule, SlaKind::Freshness, obs, age, window, now));
+                out.push(breach(rule, SlaKind::Freshness, newest, age, window, now));
             }
         }
     }
     out
 }
 
-/// Freshness rules are fail-closed: every matching run must carry a measured
-/// artifact timestamp. Returning an error is preferable to a false-clean SLA
-/// report when provenance is incomplete.
+/// For a runtime rule: per tenant, the matching run that started last (ties
+/// broken by job id, which sorts by creation time).
+fn newest_started_per_tenant<'a>(
+    rule: &SlaRule,
+    runs: &'a [RunObservation],
+) -> Vec<&'a RunObservation> {
+    let mut by_tenant: std::collections::BTreeMap<&str, &RunObservation> =
+        std::collections::BTreeMap::new();
+    for obs in runs {
+        if rule.recipe.as_ref().is_some_and(|want| want != &obs.recipe) {
+            continue;
+        }
+        let entry = by_tenant.entry(obs.tenant.as_str()).or_insert(obs);
+        if (obs.started_unix, &obs.job_id) > (entry.started_unix, &entry.job_id) {
+            *entry = obs;
+        }
+    }
+    by_tenant.into_values().collect()
+}
+
+/// For a freshness rule: per tenant, the matching run with the newest
+/// measured data, plus `None`-aged runs only for tenants with no measured run.
+fn newest_measured_per_tenant<'a>(
+    rule: &SlaRule,
+    runs: &'a [RunObservation],
+) -> Vec<&'a RunObservation> {
+    let mut by_tenant: std::collections::BTreeMap<&str, &RunObservation> =
+        std::collections::BTreeMap::new();
+    for obs in runs {
+        if rule.recipe.as_ref().is_some_and(|want| want != &obs.recipe) {
+            continue;
+        }
+        let entry = by_tenant.entry(obs.tenant.as_str()).or_insert(obs);
+        let newer = match (obs.data_age_secs, entry.data_age_secs) {
+            (Some(a), Some(b)) => a < b,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if newer {
+            *entry = obs;
+        }
+    }
+    by_tenant.into_values().collect()
+}
+
+/// Freshness rules are fail-closed: for every tenant with a matching run, at
+/// least one matching run must carry a measured artifact timestamp. Returning
+/// an error is preferable to a false-clean SLA report when provenance is
+/// incomplete. A run that produced nothing (one that failed early) does not
+/// make a tenant unmeasured when another of its runs is measured.
 pub fn require_freshness_measurements(
     rules: &[SlaRule],
     runs: &[RunObservation],
 ) -> Result<(), String> {
-    for observation in runs {
-        for rule in rules {
-            if rule.freshness_secs.is_none()
-                || rule
-                    .recipe
-                    .as_ref()
-                    .is_some_and(|recipe| recipe != &observation.recipe)
-            {
-                continue;
-            }
+    for rule in rules {
+        if rule.freshness_secs.is_none() {
+            continue;
+        }
+        for observation in newest_measured_per_tenant(rule, runs) {
             if observation.data_age_secs.is_none() {
                 return Err(format!(
                     "freshness rule '{}' is unmeasured for job '{}' (lineage has no produced_unix artifact)",
@@ -241,6 +306,21 @@ pub fn load_rules(path: &std::path::Path) -> std::io::Result<Vec<SlaRule>> {
     Ok(parsed.rule)
 }
 
+/// A rule's `recipe` scope: a recipe name (`[A-Za-z0-9_.-]`, not starting
+/// with `-`), or a deploy pointer URI. A pointer launch records the URI as its
+/// recipe, and the URI's `:`, `/` and `@` used to fail this check, so no rule
+/// could select those runs.
+fn valid_recipe_scope(recipe: &str) -> bool {
+    if crate::registry_db::parse_pointer_uri(recipe).is_some() {
+        return true;
+    }
+    !recipe.is_empty()
+        && !recipe.starts_with('-')
+        && recipe
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
 fn validate_rules(rules: &[SlaRule]) -> Result<(), String> {
     let mut names = std::collections::HashSet::new();
     for rule in rules {
@@ -255,14 +335,16 @@ fn validate_rules(rules: &[SlaRule]) -> Result<(), String> {
                 rule.name
             ));
         }
-        if rule.recipe.as_ref().is_some_and(|recipe| {
-            recipe.is_empty()
-                || recipe.starts_with('-')
-                || !recipe
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-        }) {
-            return Err(format!("invalid recipe scope in SLA rule {:?}", rule.name));
+        if rule
+            .recipe
+            .as_deref()
+            .is_some_and(|recipe| !valid_recipe_scope(recipe))
+        {
+            return Err(format!(
+                "invalid recipe scope in SLA rule {:?} (expected a recipe name or \
+                 registry://plan@<name>)",
+                rule.name
+            ));
         }
         if rule.max_runtime_secs.is_none()
             && rule.deadline_unix.is_none()
@@ -372,10 +454,7 @@ pub fn default_sla_path() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("BLUT_SLA_PATH") {
         return std::path::PathBuf::from(p);
     }
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    home.join(".blut").join("sla.jsonl")
+    crate::paths::blut_home().join("sla.jsonl")
 }
 
 #[cfg(test)]
@@ -512,6 +591,76 @@ mod tests {
         require_freshness_measurements(&rules, &[measured]).unwrap();
     }
 
+    /// Freshness judged each run: every run older than the window breached,
+    /// so one old run kept `sla check` failing after a fresh run, and a run
+    /// that failed before producing anything made the rule unmeasured.
+    #[test]
+    fn freshness_judges_the_newest_measured_run_per_tenant() {
+        let rules = vec![SlaRule {
+            name: "fresh".into(),
+            recipe: Some("train".into()),
+            max_runtime_secs: None,
+            deadline_unix: None,
+            freshness_secs: Some(60),
+        }];
+        let aged = |job: &str, tenant: &str, age: Option<i64>| {
+            let mut o = obs("train", tenant, DataClass::Internal, 0, Some(10));
+            o.job_id = job.into();
+            o.data_age_secs = age;
+            o
+        };
+        let runs = vec![
+            aged("old", "a", Some(9_000)),
+            aged("fresh", "a", Some(5)),
+            aged("failed-early", "a", None),
+            aged("stale-b", "b", Some(600)),
+        ];
+        require_freshness_measurements(&rules, &runs).unwrap();
+        let breaches = evaluate(&rules, &runs, 10_000);
+        assert_eq!(breaches.len(), 1, "{breaches:?}");
+        assert_eq!(breaches[0].job_id, "stale-b");
+        // A tenant whose only runs are unmeasured stays fail-closed.
+        assert!(require_freshness_measurements(&rules, &[aged("x", "c", None)]).is_err());
+    }
+
+    /// Runtime was judged per run: one slow run kept `sla check` failing
+    /// forever, however fast every later run was.
+    #[test]
+    fn max_runtime_judges_the_newest_run_per_tenant() {
+        let rules = vec![SlaRule {
+            name: "cap".into(),
+            recipe: Some("train".into()),
+            max_runtime_secs: Some(100),
+            deadline_unix: None,
+            freshness_secs: None,
+        }];
+        let run = |job: &str, tenant: &str, start: i64, end: Option<i64>| {
+            let mut o = obs("train", tenant, DataClass::Internal, start, end);
+            o.job_id = job.into();
+            o
+        };
+        // Tenant a: an old slow run, then a fast one — no breach.
+        // Tenant b: an old fast run, then a slow one — one breach, the new run.
+        let runs = vec![
+            run("a-slow", "a", 0, Some(500)),
+            run("a-fast", "a", 1000, Some(1050)),
+            run("b-fast", "b", 0, Some(50)),
+            run("b-slow", "b", 1000, Some(1300)),
+        ];
+        let breaches = evaluate(&rules, &runs, 2000);
+        assert_eq!(breaches.len(), 1, "{breaches:?}");
+        assert_eq!(breaches[0].job_id, "b-slow");
+        // A newest run still running is judged on its runtime so far.
+        let running = vec![
+            run("a-old", "a", 0, Some(10)),
+            run("a-live", "a", 900, None),
+        ];
+        let breaches = evaluate(&rules, &running, 1200);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].job_id, "a-live");
+        assert_eq!(breaches[0].observed_secs, 300);
+    }
+
     #[test]
     fn rule_validation_rejects_ambiguous_or_nonpositive_contracts() {
         let invalid = SlaRule {
@@ -525,6 +674,53 @@ mod tests {
         let mut valid = invalid;
         valid.max_runtime_secs = Some(1);
         assert!(validate_rules(&[valid.clone(), valid]).is_err());
+    }
+
+    /// A pointer launch records `registry://plan@<name>` as its recipe; the
+    /// URI's `:`, `/` and `@` failed rule validation, so no rule could select
+    /// those runs (a rule with no recipe matched them along with everything).
+    #[test]
+    fn a_rule_can_scope_to_a_deploy_pointer() {
+        let rule = |recipe: &str| SlaRule {
+            name: "r".into(),
+            recipe: Some(recipe.into()),
+            max_runtime_secs: Some(100),
+            deadline_unix: None,
+            freshness_secs: None,
+        };
+        for ok in [
+            "train",
+            "eval-v2.1",
+            "registry://plan@prod",
+            "registry://plan@a_b.c-1",
+        ] {
+            assert!(validate_rules(&[rule(ok)]).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "-x",
+            "a/b",
+            "registry://plan@",
+            "registry://plan@a b",
+            "registry://plan@../x",
+            "registry://model@prod",
+            "registry://plan@prod/x",
+        ] {
+            assert!(validate_rules(&[rule(bad)]).is_err(), "{bad:?}");
+        }
+        let run = |job: &str, recipe: &str| {
+            let mut o = obs(recipe, "default", DataClass::Internal, 0, None);
+            o.job_id = job.into();
+            o
+        };
+        let runs = vec![
+            run("pointer", "registry://plan@prod"),
+            run("spec-name", "prod"),
+            run("other-pointer", "registry://plan@staging"),
+        ];
+        let breaches = evaluate(&[rule("registry://plan@prod")], &runs, 500);
+        assert_eq!(breaches.len(), 1, "{breaches:?}");
+        assert_eq!(breaches[0].job_id, "pointer");
     }
 
     #[test]

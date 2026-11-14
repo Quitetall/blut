@@ -18,7 +18,7 @@
 //! the same second don't collide. Stable sort order matches start
 //! time when listing.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -144,6 +144,97 @@ pub fn read_tenant(job_id: &str) -> Result<Tenant> {
         })
 }
 
+/// What a job's launch knew about itself, recorded once when execution starts.
+///
+/// The lineage index is rebuilt from job directories, so anything it reports
+/// about a run has to be on disk in the job directory. It used to probe the
+/// indexing process instead: `git rev-parse HEAD` of whatever directory
+/// `blut` happened to run in, and "now" as the end time. A `lineage reindex`
+/// from another checkout rewrote every historical run's git SHA, and the
+/// start time was never recorded at all, so no SLA rule could ever match.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LaunchProvenance {
+    /// `git rev-parse HEAD` of the launch directory, when it is a repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_sha: Option<String>,
+    /// The engine build commit (`BLUT_GIT_HASH`) of the binary that launched
+    /// the job.
+    pub blut_build: String,
+    /// The code identity folded into every stage cache key: the engine and
+    /// each registered cookbook by name, version, build commit and dirty
+    /// digest. Absent on jobs launched before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_identity: Option<crate::framework::code_identity::CodeIdentity>,
+    /// Unix seconds when execution started.
+    pub started_unix: i64,
+}
+
+const PROVENANCE_FILE: &str = "provenance.json";
+
+/// Record [`LaunchProvenance`] for a job that is starting. Written once: a
+/// `plan resume` keeps the original launch's record.
+pub(crate) fn write_provenance(job_id: &str, git_sha: Option<String>) -> Result<()> {
+    let path = paths::job_dir(job_id)?.join(PROVENANCE_FILE);
+    if path.exists() {
+        return Ok(());
+    }
+    let record = LaunchProvenance {
+        git_sha,
+        blut_build: env!("BLUT_GIT_HASH").to_string(),
+        code_identity: Some(crate::framework::code_identity::current().clone()),
+        started_unix: chrono::Utc::now().timestamp(),
+    };
+    let body = serde_json::to_vec_pretty(&record)
+        .map_err(|e| TrainError::other(format!("serialize {PROVENANCE_FILE}: {e}")))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body).map_err(|source| TrainError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|source| TrainError::Io { path, source })
+}
+
+/// Read a job's [`LaunchProvenance`]. Jobs launched before it existed return
+/// `None`; a present but unreadable record is an error, never a guess.
+pub(crate) fn read_provenance(job_id: &str) -> Result<Option<LaunchProvenance>> {
+    let path = paths::jobs_dir()?.join(job_id).join(PROVENANCE_FILE);
+    let body = match std::fs::read(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(TrainError::Io { path, source }),
+    };
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| TrainError::other(format!("parse {}: {e}", path.display())))
+}
+
+/// The creation time encoded in a `YYYYMMDD-HHMMSS-NNNNNNNNN` job id (UTC), for
+/// jobs that predate [`LaunchProvenance`]. `None` for any other id shape.
+pub(crate) fn job_id_unix(job_id: &str) -> Option<i64> {
+    let stamp = job_id.get(..15)?;
+    let parsed = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S").ok()?;
+    Some(parsed.and_utc().timestamp())
+}
+
+/// When a job reached its terminal state: the modification time of its
+/// `state` file, which is rewritten on every transition. `None` while the
+/// job is running or when the state cannot be read.
+pub(crate) fn terminal_state_unix(job_id: &str) -> Option<i64> {
+    let path = paths::jobs_dir().ok()?.join(job_id).join("state");
+    let body = std::fs::read_to_string(&path).ok()?;
+    match JobState::parse_label(&body)? {
+        JobState::Running => None,
+        _ => {
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            let secs = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            i64::try_from(secs).ok()
+        }
+    }
+}
+
 /// Persist the experiment grouping key used by `experiment://<name>/<run>`.
 /// Safe identifier grammar keeps the marker URI/log-safe and path-free.
 pub fn write_experiment(job_id: &str, experiment: &str) -> Result<()> {
@@ -245,11 +336,60 @@ pub fn append_status(job_id: &str, update: &StatusUpdate) -> Result<()> {
     })
 }
 
+/// Every trainer [`StatusUpdate`] in a job's `status.jsonl`, in order: bare
+/// update lines, and updates a stage forwarded as a `stage_step` event's
+/// `update` payload. A plan launch only writes the second kind (a trainer
+/// stage relays its trainer's stdout that way), and this read only the first,
+/// so `blut log` printed nothing and `blut jobs` no step or loss for every
+/// job a recipe ran.
 pub fn read_status(job_id: &str) -> Result<Vec<StatusUpdate>> {
+    Ok(read_progress(job_id)?
+        .into_iter()
+        .map(|progress| progress.update)
+        .collect())
+}
+
+/// One trainer update and, when a stage forwarded it, the stage it came from.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Progress {
+    /// `(node_idx, stage_name)` of the forwarding stage; `None` for a bare
+    /// update line.
+    pub(crate) source: Option<(u32, String)>,
+    pub(crate) update: StatusUpdate,
+}
+
+/// [`read_status`], keeping each update's forwarding stage.
+pub(crate) fn read_progress(job_id: &str) -> Result<Vec<Progress>> {
     Ok(read_status_lines(job_id)?
         .iter()
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter_map(|line| progress_from_line(line))
         .collect())
+}
+
+/// The trainer update one `status.jsonl` line carries, if any.
+fn progress_from_line(line: &str) -> Option<Progress> {
+    // Cheap test first: most lines of a plan launch are stage events that are
+    // not `stage_step`, and every bare update line parses directly.
+    if !line.contains("\"stage_step\"") {
+        return serde_json::from_str(line).ok().map(|update| Progress {
+            source: None,
+            update,
+        });
+    }
+    let event: serde_json::Value = serde_json::from_str(line).ok()?;
+    if event.get("kind").and_then(|kind| kind.as_str()) != Some("stage_step") {
+        return None;
+    }
+    let update = serde_json::from_value(event.get("update")?.clone()).ok()?;
+    let node_idx = event
+        .get("node_idx")
+        .and_then(|idx| idx.as_u64())
+        .and_then(|idx| u32::try_from(idx).ok())?;
+    let stage_name = event.get("stage_name")?.as_str()?.to_string();
+    Some(Progress {
+        source: Some((node_idx, stage_name)),
+        update,
+    })
 }
 
 /// Raw `status.jsonl` lines (rotation-aware: `.1` generation then the
@@ -363,7 +503,19 @@ fn summarize(id: &str) -> JobSummary {
     // cockpit shows it Running indefinitely. Reconcile liveness against
     // the recorded pid: if a Running job has a real recorded pid that is
     // *definitively* gone, report it as Failed instead.
-    let state = reconcile_liveness(on_disk_state, pid);
+    // The child pid alone cannot see a job whose stages run IN-PROCESS (no
+    // trainer child, so no `pid` file): kill -9 of the blut process left it
+    // `running` forever. The recorded driver closes that gap.
+    let state = if on_disk_state == JobState::Running
+        && read_driver(id)
+            .ok()
+            .flatten()
+            .is_some_and(|d| driver_gone(&d))
+    {
+        JobState::Failed
+    } else {
+        reconcile_liveness(on_disk_state, pid)
+    };
     JobSummary {
         id: id.to_string(),
         state,
@@ -507,7 +659,7 @@ pub fn unix_to_ymdhms_pub(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
 pub fn resolve_job_id(query: &str) -> Result<String> {
     if query.trim().is_empty() {
         return Err(TrainError::other(
-            "job id is empty. Run `lamu-train jobs` to list.",
+            "job id is empty. Run `blut jobs` to list.",
         ));
     }
     let jobs = list_jobs()?;
@@ -518,7 +670,7 @@ pub fn resolve_job_id(query: &str) -> Result<String> {
     let prefix: Vec<_> = jobs.iter().filter(|j| j.id.starts_with(query)).collect();
     match prefix.len() {
         0 => Err(TrainError::other(format!(
-            "no job matches '{query}'. Run `lamu-train jobs` to list."
+            "no job matches '{query}'. Run `blut jobs` to list."
         ))),
         1 => Ok(prefix[0].id.clone()),
         n => {
@@ -530,17 +682,884 @@ pub fn resolve_job_id(query: &str) -> Result<String> {
     }
 }
 
-/// `lamu-train cancel` core. Reads pid file, sends SIGTERM, waits
-/// up to `grace` for exit, falls back to SIGKILL. Marks the job
-/// state Cancelled regardless. Idempotent: if no pid, no-op success.
+/// `blut cancel` core.
+///
+/// A job whose blut process (its DRIVER, see [`record_driver`]) is still
+/// alive is stopped through that process: SIGTERM runs its cancel handler,
+/// which cancels the executor and kills every trainer group, and after
+/// `grace` it is SIGKILLed. Stopping only the trainer child is not enough —
+/// a job with no subprocess stage has no child at all, and a retrying stage
+/// would spawn a new one. With no live driver, the recorded trainer group (a
+/// child orphaned by a crashed driver) is SIGTERMed and then SIGKILLed.
+///
+/// Either way, the Slurm jobs ([`cancel_slurm_jobs`]) and systemd user units
+/// ([`cancel_systemd_units`]) recorded for the job that still run are
+/// stopped, and each one stopped is reported on stderr: both outlive a
+/// driver that was SIGKILLed. A unit gets SIGTERM and, 10 s later, SIGKILL
+/// (its own stop timeout); `grace` does not apply to it.
+///
+/// A job that already finished (`done`/`failed`/`cancelled`) has only those
+/// stopped; its state is never rewritten.
+/// Refuses, without signalling anything, when the driver also runs other
+/// jobs (a sweep or backfill), because stopping it would stop them all.
 pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> {
+    let state = read_state(job_id).ok();
+    let driver = read_driver(job_id)?
+        .filter(|d| d.pid != std::process::id() && crate::python_kill::identity_alive(d));
+    if let Some(driver) = driver {
+        let siblings = jobs_sharing_driver(job_id, &driver);
+        if !siblings.is_empty() {
+            return Err(TrainError::other(format!(
+                "job {job_id} runs in blut process {} together with {} other running \
+                 job(s) ({}); cancelling it alone is not possible. Stop the whole batch \
+                 with `kill -TERM {}`.",
+                driver.pid,
+                siblings.len(),
+                siblings.join(", "),
+                driver.pid
+            )));
+        }
+        crate::python_kill::terminate_process(&driver, grace)
+            .await
+            .map_err(|e| TrainError::other(format!("cancel {job_id}: {e}")))?;
+    } else if matches!(
+        state,
+        Some(JobState::Done | JobState::Failed | JobState::Cancelled)
+    ) {
+        // Nothing local is left, but a Slurm job, a systemd unit or a cgroup
+        // leaf its stage started can be, and so can a stage it submitted to a
+        // cloud queue.
+        stop_slurm_jobs(job_id);
+        stop_systemd_units(job_id);
+        stop_cgroup_leaves(job_id);
+        return stop_cloud_jobs(job_id).await;
+    }
     let pid = read_pid(job_id)?;
     if let Some(pid) = pid {
         crate::python_kill::graceful_kill_pid(pid, grace).await;
     }
+    stop_slurm_jobs(job_id);
+    stop_systemd_units(job_id);
+    stop_cgroup_leaves(job_id);
+    // A job submitted with `--launcher k8s` runs in a cluster. Its follower
+    // (stopped above) deletes the BlutPlan on SIGTERM; deleting it here too
+    // covers a follower that is already gone. Deletion is idempotent.
+    if let Ok(dir) = job_dir_path(job_id) {
+        crate::config::k8s_cluster::cancel_recorded(&dir)
+            .map_err(|e| TrainError::other(format!("cancel {job_id}: delete its BlutPlan: {e}")))?;
+    }
     let _ = write_state(job_id, JobState::Cancelled);
     let _ = clear_pid(job_id);
+    let _ = clear_driver(job_id);
+    // Last, so the job reads cancelled even when the queue cannot be reached.
+    stop_cloud_jobs(job_id).await
+}
+
+/// Cancel every stage the job submitted to a cloud queue that is still queued
+/// or running (`--launcher cloud`), and say which. A worker running one stops
+/// it at its next status read. The queue is reopened from the job's record, so
+/// an `s3://` queue needs the `AWS_*` variables the run had; without them this
+/// is an error naming them, not a silent success.
+async fn stop_cloud_jobs(job_id: &str) -> Result<()> {
+    #[cfg(feature = "cloud")]
+    {
+        let Ok(dir) = job_dir_path(job_id) else {
+            return Ok(());
+        };
+        if crate::cloud::records::recorded_jobs(&dir).is_empty() {
+            return Ok(());
+        }
+        match crate::cloud::records::cancel_recorded_jobs(&dir, "cancelled by `blut cancel`").await
+        {
+            Ok(ids) if ids.is_empty() => {}
+            Ok(ids) => eprintln!("cancelled cloud job(s) {} of {job_id}", ids.join(", ")),
+            Err(e) => {
+                return Err(TrainError::other(format!(
+                    "cancel {job_id}: its cloud jobs could not be cancelled: {e}. Run `blut \
+                     cancel {job_id}` again with the queue reachable (for an s3:// queue, the \
+                     AWS_* variables the run used)"
+                )));
+            }
+        }
+    }
+    #[cfg(not(feature = "cloud"))]
+    let _ = job_id;
     Ok(())
+}
+
+/// File listing, one per line, the Slurm job names a job's stages were told
+/// to use ([`slurm_job_name`]).
+const SLURM_JOBS_FILE: &str = "slurm_jobs";
+
+/// The Slurm job name for node `node_idx` of the job in `job_dir`:
+/// `blut-<job id>-<node index>`.
+pub fn slurm_job_name(job_dir: &Path, node_idx: u32) -> String {
+    let job = job_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("blut-{job}-{node_idx}")
+}
+
+/// Record `name` in the job directory, once.
+pub fn record_slurm_job_name(job_dir: &Path, name: &str) -> Result<()> {
+    let path = job_dir.join(SLURM_JOBS_FILE);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| l == name) {
+        return Ok(());
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| TrainError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    use std::io::Write;
+    writeln!(f, "{name}").map_err(|source| TrainError::Io { path, source })
+}
+
+/// The Slurm job names recorded for `job_id`.
+pub fn slurm_job_names(job_id: &str) -> Result<Vec<String>> {
+    let path = paths::jobs_dir()?.join(job_id).join(SLURM_JOBS_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(body) => Ok(body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(TrainError::Io { path, source }),
+    }
+}
+
+/// Slurm jobs still queued or running under a name recorded for `job_id`:
+/// `(name, ids)` for each name that has any.
+pub fn live_slurm_jobs(job_id: &str) -> Result<Vec<(String, Vec<String>)>> {
+    let mut live = Vec::new();
+    for name in slurm_job_names(job_id)? {
+        let ids = crate::config::launcher::slurm_jobs_named(&name)?;
+        if !ids.is_empty() {
+            live.push((name, ids));
+        }
+    }
+    Ok(live)
+}
+
+/// Why `plan resume` must not start yet: a Slurm job a stage of `job_id`
+/// started is still queued or running. `None` when there is none.
+pub fn slurm_resume_blocker(job_id: &str) -> Result<Option<String>> {
+    let live = live_slurm_jobs(job_id)?;
+    if live.is_empty() {
+        return Ok(None);
+    }
+    let list = live
+        .iter()
+        .map(|(name, ids)| format!("{} ({name})", ids.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(Some(format!(
+        "job {job_id} still has Slurm job(s) running that its stages started: {list}. \
+         Stop them with `blut cancel {job_id}`, or wait for them to finish, then resume"
+    )))
+}
+
+/// `scancel` every Slurm job still running under a name recorded for
+/// `job_id`. Returns the ids cancelled.
+pub fn cancel_slurm_jobs(job_id: &str) -> Result<Vec<String>> {
+    let mut cancelled = Vec::new();
+    for name in slurm_job_names(job_id)? {
+        cancelled.extend(crate::config::launcher::scancel_named(&name)?);
+    }
+    Ok(cancelled)
+}
+
+/// `scancel` the job's recorded Slurm jobs and say what happened. A Slurm job
+/// keeps running when the process that started it is killed (killing `srun`
+/// does not end the job), so stopping a BLUT job has to stop it too.
+fn stop_slurm_jobs(job_id: &str) {
+    if slurm_job_names(job_id)
+        .map(|n| n.is_empty())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    match cancel_slurm_jobs(job_id) {
+        Ok(ids) if ids.is_empty() => {}
+        Ok(ids) => eprintln!("cancelled Slurm job(s) {} of {job_id}", ids.join(", ")),
+        Err(e) => eprintln!("warning: could not stop the Slurm jobs of {job_id}: {e}"),
+    }
+}
+
+/// File listing, one per line, the systemd user units a job's stages were
+/// placed in ([`record_systemd_unit`]).
+const SYSTEMD_UNITS_FILE: &str = "systemd_units";
+
+tokio::task_local! {
+    /// The job directory of the work running on this task ([`in_job`]).
+    static JOB_DIR: PathBuf;
+}
+
+/// Run `fut` as work of the job in `job_dir`. While it runs, every process
+/// [`LocalSystemd::spawn_contained`](crate::config::launcher::LocalSystemd::spawn_contained)
+/// places in a systemd user unit from this task is recorded with the job
+/// ([`record_systemd_unit`]) before the process starts, so `blut cancel` and
+/// `plan resume` find the unit even after the BLUT process that started it
+/// was killed.
+///
+/// The executor runs every local stage attempt this way. A stage that spawns
+/// its process from a task of its own (`tokio::spawn`) wraps that task's
+/// future in this too: a task does not inherit it.
+pub async fn in_job<F: std::future::Future>(job_dir: PathBuf, fut: F) -> F::Output {
+    JOB_DIR.scope(job_dir, fut).await
+}
+
+/// The job directory [`in_job`] set for the current task, if any.
+#[cfg(target_os = "linux")]
+pub(crate) fn current_job_dir() -> Option<PathBuf> {
+    JOB_DIR.try_with(Clone::clone).ok()
+}
+
+/// The `Description=` of a systemd unit recorded for the job in `job_dir`:
+/// `blut job <job id>`. A recorded unit is only treated as the job's while
+/// its description says so: a unit name is `<unit>-<pid>-<seq>`, and once the
+/// recorded unit is gone, a later BLUT process given the same pid can start
+/// a unit of the same name for another job.
+pub(crate) fn systemd_unit_description(job_dir: &Path) -> String {
+    let job = job_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("blut job {job}")
+}
+
+/// Record `unit` (a systemd user unit name, with or without `.service`) in
+/// the job directory, once.
+pub fn record_systemd_unit(job_dir: &Path, unit: &str) -> Result<()> {
+    let unit = unit.strip_suffix(".service").unwrap_or(unit);
+    if !valid_unit_name(unit) {
+        return Err(TrainError::other(format!(
+            "not a unit name BLUT gives a stage: {unit:?}"
+        )));
+    }
+    let path = job_dir.join(SYSTEMD_UNITS_FILE);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| l == unit) {
+        return Ok(());
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| TrainError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    use std::io::Write;
+    writeln!(f, "{unit}").map_err(|source| TrainError::Io { path, source })
+}
+
+/// A unit name as `LocalSystemd::spawn_contained` makes them: `[A-Za-z0-9_-]`
+/// only. Anything else in the record is skipped, never passed to `systemctl`.
+fn valid_unit_name(unit: &str) -> bool {
+    !unit.is_empty()
+        && unit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The systemd units recorded for `job_id`, without the `.service` suffix.
+pub fn systemd_unit_names(job_id: &str) -> Result<Vec<String>> {
+    let path = paths::jobs_dir()?.join(job_id).join(SYSTEMD_UNITS_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(body) => Ok(body
+            .lines()
+            .map(str::trim)
+            .filter(|l| valid_unit_name(l))
+            .map(String::from)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(TrainError::Io { path, source }),
+    }
+}
+
+/// The units recorded for `job_id` that are still running for it, as
+/// `<name>.service`.
+///
+/// A unit counts while it is active, starting, stopping or reloading and its
+/// description is the job's, `blut job <job id>`: a unit name is
+/// `<unit>-<pid>-<seq>`, so once the recorded unit is gone a later BLUT
+/// process given the same pid can start one of the same name for another
+/// job. A unit that has stopped is gone (`--collect`) and does not count, so
+/// its record never blocks anything. Errors when `systemctl --user` cannot be
+/// asked (no user bus): then no user unit can be running here either, which
+/// is why the resume check does not block on that error.
+pub fn live_systemd_units(job_id: &str) -> Result<Vec<String>> {
+    let names = systemd_unit_names(job_id)?;
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let description = systemd_unit_description(&paths::jobs_dir()?.join(job_id));
+    let services: Vec<String> = names.iter().map(|n| format!("{n}.service")).collect();
+    let out = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=Id,ActiveState,Description",
+            "--",
+        ])
+        .args(&services)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| TrainError::other(format!("systemctl invocation failed: {e}")))?;
+    if !out.status.success() {
+        return Err(TrainError::other(format!(
+            "systemctl --user show failed (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let shown = parse_systemctl_show(&String::from_utf8_lossy(&out.stdout));
+    Ok(services
+        .into_iter()
+        .filter(|s| shown.iter().any(|u| u.id == *s && u.runs_for(&description)))
+        .collect())
+}
+
+/// One unit of `systemctl show --property=Id,ActiveState,Description`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ShownUnit {
+    id: String,
+    active_state: String,
+    description: String,
+}
+
+impl ShownUnit {
+    /// Whether the unit has processes that may be running and is the one
+    /// whose description is `description`.
+    fn runs_for(&self, description: &str) -> bool {
+        self.description == description
+            && matches!(
+                self.active_state.as_str(),
+                "active" | "activating" | "deactivating" | "reloading" | "refreshing"
+            )
+    }
+}
+
+/// `systemctl show` prints one `Key=Value` block per unit, blocks separated
+/// by an empty line.
+fn parse_systemctl_show(stdout: &str) -> Vec<ShownUnit> {
+    let mut units = Vec::new();
+    let mut unit = ShownUnit::default();
+    for line in stdout.lines().chain(std::iter::once("")) {
+        if line.trim().is_empty() {
+            if !unit.id.is_empty() {
+                units.push(std::mem::take(&mut unit));
+            }
+            unit = ShownUnit::default();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "Id" => unit.id = value.to_string(),
+            "ActiveState" => unit.active_state = value.to_string(),
+            "Description" => unit.description = value.to_string(),
+            _ => {}
+        }
+    }
+    units
+}
+
+/// Why `plan resume` must not start yet: a systemd unit a stage of `job_id`
+/// was placed in still runs. `None` when there is none.
+pub fn systemd_resume_blocker(job_id: &str) -> Result<Option<String>> {
+    let live = live_systemd_units(job_id)?;
+    if live.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "job {job_id} still has systemd unit(s) running that its stages started: {}. \
+         Stop them with `blut cancel {job_id}`, or wait for them to finish, then resume",
+        live.join(", ")
+    )))
+}
+
+/// How long [`cancel_systemd_units`] waits for `systemctl --user stop`. A
+/// unit BLUT starts is SIGKILLed 10 s into its stop; this leaves room for
+/// that and for a unit started without that stop timeout.
+const SYSTEMD_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `systemctl --user stop` every unit recorded for `job_id` that still runs
+/// for it ([`live_systemd_units`]), and wait for them to stop: SIGTERM to
+/// every process in the unit, SIGKILL after the unit's stop timeout. Returns
+/// the units stopped, as `<name>.service`; errors naming any still running.
+pub fn cancel_systemd_units(job_id: &str) -> Result<Vec<String>> {
+    let live = live_systemd_units(job_id)?;
+    if live.is_empty() {
+        return Ok(live);
+    }
+    let mut stop = std::process::Command::new("systemctl")
+        .args(["--user", "stop", "--"])
+        .args(&live)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| TrainError::other(format!("systemctl invocation failed: {e}")))?;
+    // The exit status is not the answer: a unit that stopped by itself
+    // between the check and the stop makes `systemctl stop` fail with "not
+    // loaded". What still runs afterwards is.
+    let deadline = std::time::Instant::now() + SYSTEMD_STOP_WAIT;
+    loop {
+        match stop.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                // The stop job stays queued in the user manager.
+                let _ = stop.kill();
+                let _ = stop.wait();
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    let still = live_systemd_units(job_id)?;
+    if !still.is_empty() {
+        return Err(TrainError::other(format!(
+            "systemd unit(s) {} still running {SYSTEMD_STOP_WAIT:?} after `systemctl --user stop`",
+            still.join(", ")
+        )));
+    }
+    Ok(live)
+}
+
+/// Stop the job's recorded systemd units and say what happened. The
+/// transient service a stage runs in keeps running when the BLUT process that
+/// started it is killed, so stopping a BLUT job has to stop it too.
+fn stop_systemd_units(job_id: &str) {
+    if systemd_unit_names(job_id)
+        .map(|n| n.is_empty())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    match cancel_systemd_units(job_id) {
+        Ok(units) if units.is_empty() => {}
+        Ok(units) => eprintln!("stopped systemd unit(s) {} of {job_id}", units.join(", ")),
+        Err(e) => eprintln!("warning: could not stop the systemd units of {job_id}: {e}"),
+    }
+}
+
+/// File listing the cgroup-v2 leaves a job's stages were placed in
+/// ([`record_cgroup_leaf`]), one `<inode> <path>` per line.
+const CGROUP_LEAVES_FILE: &str = "cgroup_leaves";
+
+/// How long [`cancel_cgroup_leaves`] waits after SIGTERM before it kills the
+/// leaf (`cgroup.kill`): the grace a systemd unit gets (`TimeoutStopSec=10s`).
+const CGROUP_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long it then waits for the killed leaf to empty.
+const CGROUP_KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Record a cgroup-v2 `leaf` a stage of the job in `job_dir` is placed in,
+/// before the stage's process starts, once. Under the `cgroup2` backend (no
+/// systemd user bus) a stage's process runs in its own session inside the
+/// leaf, so it keeps running when the BLUT process that started it is
+/// SIGKILLed; the record is how `blut cancel` and `plan resume` find it.
+///
+/// The leaf's inode is recorded with it: a cgroup's inode is its cgroup id,
+/// never reused while the system runs, so a later leaf of the same name (unit
+/// names are `<unit>-<pid>-<seq>`, and pids are reused) is never taken for
+/// this job's.
+pub fn record_cgroup_leaf(job_dir: &Path, leaf: &Path) -> Result<()> {
+    let leaf_str = leaf.to_str().filter(|s| !s.contains('\n'));
+    let (Some(leaf_str), true) = (leaf_str, valid_leaf_path(leaf)) else {
+        return Err(TrainError::other(format!(
+            "not a cgroup leaf BLUT gives a stage: {}",
+            leaf.display()
+        )));
+    };
+    let inode = leaf_inode(leaf).ok_or_else(|| {
+        TrainError::other(format!("stat cgroup leaf {}: not found", leaf.display()))
+    })?;
+    let line = format!("{inode} {leaf_str}");
+    let path = job_dir.join(CGROUP_LEAVES_FILE);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| l == line) {
+        return Ok(());
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| TrainError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    use std::io::Write;
+    writeln!(f, "{line}").map_err(|source| TrainError::Io { path, source })
+}
+
+/// A leaf path as the `cgroup2` backend makes them: absolute, no `..`, and
+/// named like a unit (`[A-Za-z0-9_-]`). Anything else in the record is
+/// skipped, never written to or signalled.
+fn valid_leaf_path(leaf: &Path) -> bool {
+    leaf.is_absolute()
+        && !leaf
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && leaf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(valid_unit_name)
+}
+
+#[cfg(unix)]
+fn leaf_inode(leaf: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(leaf)
+        .ok()
+        .filter(|m| m.is_dir())
+        .map(|m| m.ino())
+}
+
+#[cfg(not(unix))]
+fn leaf_inode(_leaf: &Path) -> Option<u64> {
+    None
+}
+
+/// The cgroup leaves recorded in `job_dir` with their inodes.
+fn recorded_cgroup_leaves(job_dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let path = job_dir.join(CGROUP_LEAVES_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(body) => Ok(body
+            .lines()
+            .filter_map(|l| {
+                let (inode, leaf) = l.split_once(' ')?;
+                let leaf = PathBuf::from(leaf);
+                Some((inode.parse().ok()?, leaf)).filter(|(_, leaf)| valid_leaf_path(leaf))
+            })
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(TrainError::Io { path, source }),
+    }
+}
+
+/// The cgroup leaves recorded for `job_id` ([`record_cgroup_leaf`]).
+pub fn cgroup_leaf_paths(job_id: &str) -> Result<Vec<PathBuf>> {
+    Ok(recorded_cgroup_leaves(&paths::jobs_dir()?.join(job_id))?
+        .into_iter()
+        .map(|(_, leaf)| leaf)
+        .collect())
+}
+
+/// The live processes of a leaf: the pids in its `cgroup.procs` that still
+/// exist. A cgroup lists only its members, so this is its whole list there.
+fn leaf_pids(leaf: &Path) -> Vec<u32> {
+    let procs = std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap_or_default();
+    procs
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .filter(|&pid| pid_exists(pid))
+        .collect()
+}
+
+#[cfg(unix)]
+fn pid_exists(pid: u32) -> bool {
+    !matches!(
+        crate::python_kill::pid_alive(pid),
+        crate::python_kill::PidStatus::Gone
+    )
+}
+
+#[cfg(not(unix))]
+fn pid_exists(_pid: u32) -> bool {
+    false
+}
+
+/// The leaves recorded in `job_dir` that still hold processes and are the
+/// ones recorded (same inode). A leaf that is gone, empty, or was recreated
+/// under the same name does not count, so an old record never blocks.
+pub(crate) fn live_cgroup_leaves_at(job_dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(recorded_cgroup_leaves(job_dir)?
+        .into_iter()
+        .filter(|(inode, leaf)| leaf_inode(leaf) == Some(*inode) && !leaf_pids(leaf).is_empty())
+        .map(|(_, leaf)| leaf)
+        .collect())
+}
+
+/// The cgroup leaves recorded for `job_id` that still hold processes.
+pub fn live_cgroup_leaves(job_id: &str) -> Result<Vec<PathBuf>> {
+    live_cgroup_leaves_at(&paths::jobs_dir()?.join(job_id))
+}
+
+/// Why `plan resume` must not start yet: a cgroup leaf a stage of `job_id`
+/// was placed in still holds processes. `None` when there is none.
+pub fn cgroup_resume_blocker(job_id: &str) -> Result<Option<String>> {
+    cgroup_resume_blocker_at(job_id, &paths::jobs_dir()?.join(job_id))
+}
+
+pub(crate) fn cgroup_resume_blocker_at(job_id: &str, job_dir: &Path) -> Result<Option<String>> {
+    let live = live_cgroup_leaves_at(job_dir)?;
+    if live.is_empty() {
+        return Ok(None);
+    }
+    let names: Vec<String> = live.iter().map(|l| l.display().to_string()).collect();
+    Ok(Some(format!(
+        "job {job_id} still has processes running in cgroup leaf(s) its stages were placed \
+         in: {}. Stop them with `blut cancel {job_id}`, or wait for them to finish, then resume",
+        names.join(", ")
+    )))
+}
+
+/// Stop every process in the leaves recorded for `job_id` that still hold
+/// any: SIGTERM to each, then, after a 10 s grace, `cgroup.kill` (SIGKILL to
+/// the whole leaf at once; each pid when the kernel predates it),
+/// as `systemctl stop` does for a unit. Emptied leaves are removed. Returns
+/// the leaves stopped; errors naming any still populated.
+pub fn cancel_cgroup_leaves(job_id: &str) -> Result<Vec<PathBuf>> {
+    cancel_cgroup_leaves_at(&paths::jobs_dir()?.join(job_id), CGROUP_STOP_GRACE)
+}
+
+pub(crate) fn cancel_cgroup_leaves_at(
+    job_dir: &Path,
+    grace: std::time::Duration,
+) -> Result<Vec<PathBuf>> {
+    let live = live_cgroup_leaves_at(job_dir)?;
+    if live.is_empty() {
+        return Ok(live);
+    }
+    let all_empty = |deadline: std::time::Instant| {
+        wait_until(deadline, || live.iter().all(|l| leaf_pids(l).is_empty()))
+    };
+    for leaf in &live {
+        signal_pids(&leaf_pids(leaf), false);
+    }
+    if !all_empty(std::time::Instant::now() + grace) {
+        for leaf in &live {
+            if std::fs::write(leaf.join("cgroup.kill"), b"1").is_err() {
+                signal_pids(&leaf_pids(leaf), true);
+            }
+        }
+        all_empty(std::time::Instant::now() + CGROUP_KILL_WAIT);
+    }
+    let still: Vec<String> = live
+        .iter()
+        .filter(|l| !leaf_pids(l).is_empty())
+        .map(|l| l.display().to_string())
+        .collect();
+    for leaf in &live {
+        // rmdir succeeds only on an empty cgroup; a leftover is harmless.
+        let _ = std::fs::remove_dir(leaf);
+    }
+    if !still.is_empty() {
+        return Err(TrainError::other(format!(
+            "cgroup leaf(s) {} still hold processes after SIGTERM and cgroup.kill",
+            still.join(", ")
+        )));
+    }
+    Ok(live)
+}
+
+fn wait_until(deadline: std::time::Instant, mut done: impl FnMut() -> bool) -> bool {
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn signal_pids(pids: &[u32], kill: bool) {
+    use nix::sys::signal::{Signal, kill as send};
+    use nix::unistd::Pid;
+    let signal = if kill {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+    for &pid in pids {
+        let _ = send(Pid::from_raw(pid as i32), signal);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_pids(_pids: &[u32], _kill: bool) {}
+
+/// Stop the processes left in the job's recorded cgroup leaves and say what
+/// happened. A stage placed in a leaf by the `cgroup2` backend keeps running
+/// when the BLUT process that started it is killed.
+fn stop_cgroup_leaves(job_id: &str) {
+    if cgroup_leaf_paths(job_id)
+        .map(|n| n.is_empty())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    match cancel_cgroup_leaves(job_id) {
+        Ok(leaves) if leaves.is_empty() => {}
+        Ok(leaves) => {
+            let names: Vec<String> = leaves.iter().map(|l| l.display().to_string()).collect();
+            eprintln!("stopped cgroup leaf(s) {} of {job_id}", names.join(", "));
+        }
+        Err(e) => eprintln!("warning: could not stop the cgroup leaves of {job_id}: {e}"),
+    }
+}
+
+/// Why `plan resume` must not start `job_id` yet, or `None`: its BLUT process
+/// is still running, or a Slurm job ([`slurm_resume_blocker`]), systemd unit
+/// ([`systemd_resume_blocker`]) or cgroup-v2 leaf ([`cgroup_resume_blocker`])
+/// one of its stages started still runs. Resuming next to any of them would
+/// put two trainers on one job's work. A check that cannot be made (no
+/// `squeue`, no systemd user bus) does not block.
+pub fn resume_blocker(job_id: &str) -> Option<String> {
+    if let Some(pid) = live_driver(job_id) {
+        return Some(format!(
+            "job {job_id} is still running (blut pid {pid}); wait for it to finish, \
+             or stop it with `blut cancel {job_id}`, then resume"
+        ));
+    }
+    if let Ok(Some(why)) = slurm_resume_blocker(job_id) {
+        return Some(why);
+    }
+    if let Ok(Some(why)) = systemd_resume_blocker(job_id) {
+        return Some(why);
+    }
+    if let Ok(Some(why)) = cgroup_resume_blocker(job_id) {
+        return Some(why);
+    }
+    None
+}
+
+/// File naming the blut process that executes a job in-process.
+const DRIVER_FILE: &str = "driver";
+
+/// Record THIS process as the driver of `job_id` until the returned guard
+/// drops. The record is what lets a separate process tell a live job from a
+/// dead one when no trainer child exists (`blut jobs`), stop it (`blut
+/// cancel`), and refuse to resume it underneath itself (`blut plan resume`).
+/// It survives only an abnormal exit (SIGKILL, OOM kill, power loss), which
+/// is exactly the case it is there to detect. Recording is best-effort: a
+/// failure is logged and the job runs as before.
+pub fn record_driver(job_id: &str) -> DriverRecord {
+    let me = crate::python_kill::capture_identity(std::process::id());
+    let body = match me.start_time {
+        Some(start) => format!("{} {start}", me.pid),
+        None => me.pid.to_string(),
+    };
+    let written = paths::job_dir(job_id)
+        .and_then(|dir| {
+            let path = dir.join(DRIVER_FILE);
+            std::fs::write(&path, body).map_err(|e| TrainError::Io { path, source: e })
+        })
+        .map_err(|e| tracing::warn!("record driver for {job_id}: {e}"))
+        .is_ok();
+    DriverRecord {
+        job_id: job_id.to_string(),
+        written,
+    }
+}
+
+/// Guard returned by [`record_driver`]; removes the record on drop.
+#[must_use = "the driver record is removed when this guard drops"]
+pub struct DriverRecord {
+    job_id: String,
+    written: bool,
+}
+
+impl Drop for DriverRecord {
+    fn drop(&mut self) {
+        // Keep the record when the job is still marked `running`: the run
+        // ended without recording a final state (the state write failed, e.g.
+        // on a full disk), and the record is then the only thing that lets
+        // `blut jobs` see that this process is gone.
+        if self.written && read_state(&self.job_id).ok() != Some(JobState::Running) {
+            let _ = clear_driver(&self.job_id);
+        }
+    }
+}
+
+/// The recorded driver of `job_id`, if any (`pid` and, where the platform
+/// exposes it, the process start time that guards against pid reuse).
+pub fn read_driver(job_id: &str) -> Result<Option<crate::python_kill::ChildIdentity>> {
+    let path = paths::job_dir(job_id)?.join(DRIVER_FILE);
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(TrainError::Io { path, source: e }),
+    };
+    let mut parts = body.split_whitespace();
+    let Some(pid) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
+        return Ok(None);
+    };
+    let start_time = parts.next().and_then(|s| s.parse::<u64>().ok());
+    Ok(Some(crate::python_kill::ChildIdentity {
+        pid,
+        pgid: pid,
+        start_time,
+    }))
+}
+
+fn clear_driver(job_id: &str) -> Result<()> {
+    let path = paths::job_dir(job_id)?.join(DRIVER_FILE);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// The pid of the process still executing `job_id`, or `None` when no
+/// driver is recorded or the recorded one is gone (or its pid was reused).
+pub fn live_driver(job_id: &str) -> Option<u32> {
+    read_driver(job_id)
+        .ok()
+        .flatten()
+        .filter(crate::python_kill::identity_alive)
+        .map(|d| d.pid)
+}
+
+/// True only when the recorded driver is definitively not running. Off Unix
+/// liveness cannot be probed, so this never claims a driver is gone there.
+#[cfg(unix)]
+fn driver_gone(d: &crate::python_kill::ChildIdentity) -> bool {
+    !crate::python_kill::identity_alive(d)
+}
+
+#[cfg(not(unix))]
+fn driver_gone(_d: &crate::python_kill::ChildIdentity) -> bool {
+    false
+}
+
+/// Other `running` jobs whose recorded driver is the same live process.
+fn jobs_sharing_driver(job_id: &str, driver: &crate::python_kill::ChildIdentity) -> Vec<String> {
+    let Ok(dir) = paths::jobs_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(id) = entry.file_name().into_string() else {
+            continue;
+        };
+        if id == job_id || !entry.path().join(DRIVER_FILE).is_file() {
+            continue;
+        }
+        if read_state(&id).ok() == Some(JobState::Running)
+            && read_driver(&id).ok().flatten().is_some_and(|other| {
+                other.pid == driver.pid && other.start_time == driver.start_time
+            })
+        {
+            out.push(id);
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Remove a job's `pid` file (called when the job's last live child
@@ -726,6 +1745,108 @@ mod tests {
             let back = read_status(id).unwrap();
             assert_eq!(back.len(), 4);
             assert!(matches!(back[3], StatusUpdate::Done { .. }));
+        });
+    }
+
+    /// A plan launch writes trainer progress only as `stage_step` events (the
+    /// trainer stage forwards each `StatusUpdate`), and `read_status` parsed
+    /// only bare update lines: `blut log` printed nothing and `blut jobs` had
+    /// no step, loss or final loss for any job a recipe ran.
+    #[test]
+    fn read_status_includes_updates_a_stage_forwarded() {
+        use crate::framework::status::{HostedEvent, StageEvent};
+        with_jobs_dir(|| {
+            let id = "20261030-000000-000000001";
+            let dir = paths::job_dir(id).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            let step = |update: serde_json::Value| {
+                serde_json::to_string(&HostedEvent::wrap(
+                    &None,
+                    StageEvent::StageStep {
+                        node_idx: 2,
+                        stage_name: "train".into(),
+                        update,
+                    },
+                ))
+                .unwrap()
+            };
+            let as_value = |u: &StatusUpdate| serde_json::to_value(u).unwrap();
+            let lines = [
+                "{\"kind\":\"stage_begin\",\"node_idx\":2,\"stage_name\":\"train\",\"input_hash\":\"x\"}"
+                    .to_string(),
+                step(as_value(&StatusUpdate::Heartbeat {
+                    phase: Some("load".into()),
+                    vram_mb: None,
+                })),
+                step(as_value(&StatusUpdate::Step {
+                    step: 1,
+                    total: 2,
+                    loss: 2.0,
+                    lr: 0.001,
+                    vram_mb: 0,
+                })),
+                // Not trainer protocol: metrics, gauges, a cookbook's own kind.
+                step(serde_json::json!({"step": 1, "val_r": 0.4})),
+                step(serde_json::json!({"kind": "gpu_gauge", "gpu_util": 90.0})),
+                step(serde_json::json!({"kind": "hf_step", "step": 1, "loss": 1.0})),
+                // A forwarded peer's line carries a `host` tag.
+                format!(
+                    "{{\"host\":\"ab12\",{}",
+                    &step(as_value(&StatusUpdate::Step {
+                        step: 2,
+                        total: 2,
+                        loss: 1.0,
+                        lr: 0.001,
+                        vram_mb: 0,
+                    }))[1..]
+                ),
+                step(as_value(&StatusUpdate::Done {
+                    final_loss: 0.5,
+                    checkpoint_dir: PathBuf::from("/ckpt"),
+                })),
+                "{\"kind\":\"stage_end\",\"node_idx\":2,\"stage_name\":\"train\"}".to_string(),
+            ];
+            std::fs::write(dir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
+            // A bare update line (the single-trainer launch's format) still reads.
+            append_status(
+                id,
+                &StatusUpdate::Eval {
+                    step: 2,
+                    eval_loss: 0.7,
+                },
+            )
+            .unwrap();
+
+            let progress = read_progress(id).unwrap();
+            let kinds: Vec<(&str, Option<u32>)> = progress
+                .iter()
+                .map(|p| {
+                    let kind = match p.update {
+                        StatusUpdate::Heartbeat { .. } => "heartbeat",
+                        StatusUpdate::Step { .. } => "step",
+                        StatusUpdate::Done { .. } => "done",
+                        StatusUpdate::Eval { .. } => "eval",
+                        _ => "other",
+                    };
+                    (kind, p.source.as_ref().map(|(idx, _)| *idx))
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    ("heartbeat", Some(2)),
+                    ("step", Some(2)),
+                    ("step", Some(2)),
+                    ("done", Some(2)),
+                    ("eval", None),
+                ]
+            );
+            assert_eq!(read_status(id).unwrap().len(), 5);
+            write_state(id, JobState::Done).unwrap();
+            let summary = list_jobs().unwrap().pop().unwrap();
+            assert_eq!(summary.last_step, Some(2));
+            assert_eq!(summary.last_loss, Some(1.0));
+            assert_eq!(summary.final_loss, Some(0.5));
         });
     }
 
@@ -958,5 +2079,386 @@ mod tests {
         if let Err(p) = result {
             std::panic::resume_unwind(p);
         }
+    }
+
+    // ── Job driver: cancel / liveness for in-process jobs ───────────
+
+    /// Spawn `sleep 30` as a stand-in driver and reap it on a thread, so its
+    /// exit is observable (an unreaped child would linger as a zombie).
+    #[cfg(target_os = "linux")]
+    fn spawn_driver_stand_in() -> (
+        crate::python_kill::ChildIdentity,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn `sleep 30`");
+        let identity = crate::python_kill::capture_identity(child.id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+            let _ = tx.send(());
+        });
+        (identity, rx)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_driver_file(id: &str, d: &crate::python_kill::ChildIdentity) {
+        let body = format!("{} {}", d.pid, d.start_time.expect("linux start time"));
+        std::fs::write(paths::job_dir(id).unwrap().join(DRIVER_FILE), body).unwrap();
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// `blut cancel` on a job whose stages run in-process (no trainer child,
+    /// so no `pid` file) used to print "cancelled." and exit 0 while the job
+    /// ran on to `done`. It must stop the driving process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancel_stops_the_driver_of_an_in_process_job() {
+        let (driver, exited) = spawn_driver_stand_in();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_jobs_dir(|| {
+                let id = "20261020-000000-000000001";
+                write_state(id, JobState::Running).unwrap();
+                write_driver_file(id, &driver);
+                block_on(cancel_job(id, std::time::Duration::from_secs(5))).unwrap();
+                assert!(
+                    exited
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .is_ok(),
+                    "the driver must have been stopped"
+                );
+                assert_eq!(read_state(id).unwrap(), JobState::Cancelled);
+                assert!(read_driver(id).unwrap().is_none());
+            })
+        }));
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(driver.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        if let Err(p) = result {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    /// A driver that runs several jobs (a sweep or backfill) is not stopped to
+    /// cancel one of them; the refusal says how to stop the batch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancel_refuses_a_driver_shared_with_other_running_jobs() {
+        let (driver, exited) = spawn_driver_stand_in();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_jobs_dir(|| {
+                for id in ["20261020-000000-000000002", "20261020-000000-000000003"] {
+                    write_state(id, JobState::Running).unwrap();
+                    write_driver_file(id, &driver);
+                }
+                let err = block_on(cancel_job(
+                    "20261020-000000-000000002",
+                    std::time::Duration::from_secs(1),
+                ))
+                .expect_err("must refuse");
+                assert!(err.to_string().contains("kill -TERM"), "{err}");
+                assert!(
+                    exited
+                        .recv_timeout(std::time::Duration::from_millis(300))
+                        .is_err(),
+                    "the shared driver must not be signalled"
+                );
+                assert_eq!(
+                    read_state("20261020-000000-000000002").unwrap(),
+                    JobState::Running
+                );
+            })
+        }));
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(driver.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        if let Err(p) = result {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    /// Cancelling a job that already finished must not rewrite its state:
+    /// `done` used to become `cancelled`.
+    #[test]
+    fn cancel_leaves_a_finished_job_alone() {
+        with_jobs_dir(|| {
+            let id = "20261020-000000-000000004";
+            write_state(id, JobState::Done).unwrap();
+            block_on(cancel_job(id, std::time::Duration::from_secs(1))).unwrap();
+            assert_eq!(read_state(id).unwrap(), JobState::Done);
+        });
+    }
+
+    /// A job whose driver was SIGKILLed (no trainer child, so no `pid` file)
+    /// used to stay `running` forever in `blut jobs`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_job_whose_driver_died_is_reported_failed() {
+        let (driver, exited) = spawn_driver_stand_in();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(driver.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        exited
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("driver stand-in exits");
+        with_jobs_dir(|| {
+            let id = "20261020-000000-000000005";
+            write_state(id, JobState::Running).unwrap();
+            write_driver_file(id, &driver);
+            let job = list_jobs()
+                .unwrap()
+                .into_iter()
+                .find(|j| j.id == id)
+                .unwrap();
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(live_driver(id), None);
+        });
+    }
+
+    /// The record names this process while the guard lives and is removed
+    /// when it drops (the normal-exit path).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn driver_record_names_this_process_until_dropped() {
+        with_jobs_dir(|| {
+            let id = "20261020-000000-000000006";
+            let guard = record_driver(id);
+            assert_eq!(live_driver(id), Some(std::process::id()));
+            drop(guard);
+            assert!(read_driver(id).unwrap().is_none());
+        });
+    }
+
+    /// A run that could not write its final state (full disk) left the job
+    /// `running` with no trace of its process, so it looked live forever.
+    #[test]
+    fn driver_record_outlives_a_run_that_never_left_running() {
+        with_jobs_dir(|| {
+            let id = "20261020-000000-000000007";
+            write_state(id, JobState::Running).unwrap();
+            drop(record_driver(id));
+            assert!(read_driver(id).unwrap().is_some());
+            write_state(id, JobState::Done).unwrap();
+            drop(record_driver(id));
+            assert!(read_driver(id).unwrap().is_none());
+        });
+    }
+
+    // ── systemd units a job's stages were placed in ─────────────────
+
+    /// The record mirrors the Slurm one: one name per line, recorded once,
+    /// `.service` optional on the way in; a line that is not a unit name BLUT
+    /// gives a stage is never handed to `systemctl`.
+    #[test]
+    fn systemd_units_are_recorded_once_and_read_back() {
+        with_jobs_dir(|| {
+            let id = "20261030-000000-000000001";
+            let dir = paths::job_dir(id).unwrap();
+            assert!(systemd_unit_names(id).unwrap().is_empty());
+            record_systemd_unit(&dir, "blut-train-12-1").unwrap();
+            record_systemd_unit(&dir, "blut-train-12-1.service").unwrap();
+            record_systemd_unit(&dir, "blut-eval-12-2").unwrap();
+            assert!(record_systemd_unit(&dir, "x; rm -rf /").is_err());
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join(SYSTEMD_UNITS_FILE))
+                .unwrap();
+            use std::io::Write;
+            writeln!(f, "planted unit.service\n").unwrap();
+            assert_eq!(
+                systemd_unit_names(id).unwrap(),
+                vec!["blut-train-12-1".to_string(), "blut-eval-12-2".to_string()]
+            );
+        });
+    }
+
+    #[test]
+    fn systemctl_show_blocks_parse_and_only_the_jobs_running_unit_counts() {
+        let out = "Id=blut-a-1-1.service\nDescription=blut job J\nActiveState=active\n\n\
+                   Id=blut-b-1-2.service\nDescription=blut-b-1-2.service\nActiveState=inactive\n\n\
+                   Id=blut-c-1-3.service\nActiveState=deactivating\nDescription=blut job J\n\
+                   \nId=blut-d-1-4.service\nDescription=blut job other\nActiveState=active\n";
+        let units = parse_systemctl_show(out);
+        assert_eq!(units.len(), 4);
+        assert_eq!(
+            units[2],
+            ShownUnit {
+                id: "blut-c-1-3.service".into(),
+                active_state: "deactivating".into(),
+                description: "blut job J".into(),
+            }
+        );
+        let running: Vec<&str> = units
+            .iter()
+            .filter(|u| u.runs_for("blut job J"))
+            .map(|u| u.id.as_str())
+            .collect();
+        // b is gone; d has the name pattern but belongs to another job.
+        assert_eq!(running, ["blut-a-1-1.service", "blut-c-1-3.service"]);
+        for state in ["inactive", "failed", "maintenance", ""] {
+            let u = ShownUnit {
+                id: "x.service".into(),
+                active_state: state.into(),
+                description: "blut job J".into(),
+            };
+            assert!(!u.runs_for("blut job J"), "{state}");
+        }
+    }
+
+    #[test]
+    fn the_unit_description_names_the_job() {
+        assert_eq!(
+            systemd_unit_description(Path::new("/jobs/20261030-000000-000000001")),
+            "blut job 20261030-000000-000000001"
+        );
+    }
+
+    /// No record, no `systemctl` call, nothing to block or stop.
+    #[test]
+    fn a_job_without_units_has_none_live_and_no_blocker() {
+        with_jobs_dir(|| {
+            let id = "20261030-000000-000000002";
+            write_state(id, JobState::Running).unwrap();
+            assert!(live_systemd_units(id).unwrap().is_empty());
+            assert_eq!(systemd_resume_blocker(id).unwrap(), None);
+            assert!(cancel_systemd_units(id).unwrap().is_empty());
+            assert_eq!(resume_blocker(id), None);
+        });
+    }
+
+    // ── cgroup-v2 leaves a job's stages were placed in ─────────────
+
+    /// A process standing in for a stage left running in a leaf: reaped by a
+    /// thread as soon as it exits, so its pid stops existing then.
+    #[cfg(unix)]
+    fn orphan_in_fake_leaf(leaf: &Path) -> (u32, std::thread::JoinHandle<Option<i32>>) {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        std::fs::create_dir_all(leaf).unwrap();
+        std::fs::write(leaf.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        let reaper = std::thread::spawn(move || {
+            use std::os::unix::process::ExitStatusExt as _;
+            child.wait().ok().and_then(|s| s.signal())
+        });
+        (pid, reaper)
+    }
+
+    /// E2E follow-up: a stage contained in a cgroup-v2 leaf (no systemd user
+    /// bus) was not recorded, so a SIGKILLed driver left its trainer running
+    /// where `blut cancel` and `plan resume` could not see it. A plain
+    /// directory stands in for the leaf (`cgroup.procs` lists the process);
+    /// the live test in `containment::cgroup2` uses a real leaf.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_cgroup_leaf_blocks_resume_until_cancel_stops_it() {
+        with_jobs_dir(|| {
+            let id = "20261030-000000-000000003";
+            let dir = paths::job_dir(id).unwrap();
+            write_state(id, JobState::Running).unwrap();
+            let cg = tempfile::tempdir().unwrap();
+            let leaf = cg.path().join("blut-train-77-1");
+            let (pid, reaper) = orphan_in_fake_leaf(&leaf);
+            record_cgroup_leaf(&dir, &leaf).unwrap();
+            record_cgroup_leaf(&dir, &leaf).unwrap();
+            assert_eq!(
+                cgroup_leaf_paths(id).unwrap(),
+                vec![leaf.clone()],
+                "recorded once"
+            );
+            assert_eq!(live_cgroup_leaves(id).unwrap(), vec![leaf.clone()]);
+
+            let why = resume_blocker(id).expect("a populated leaf blocks the resume");
+            assert!(why.contains(&leaf.display().to_string()), "{why}");
+            assert!(why.contains(&format!("blut cancel {id}")), "{why}");
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(cancel_job(id, std::time::Duration::from_secs(1)))
+                .unwrap();
+            assert_eq!(
+                reaper.join().unwrap(),
+                Some(nix::sys::signal::Signal::SIGTERM as i32),
+                "the orphan was stopped with SIGTERM (pid {pid})"
+            );
+            assert!(live_cgroup_leaves(id).unwrap().is_empty());
+            assert_eq!(resume_blocker(id), None);
+            assert_eq!(read_state(id).unwrap(), JobState::Cancelled);
+        });
+    }
+
+    /// Only the leaf recorded counts: a record that is not a leaf path BLUT
+    /// makes is refused or skipped, and a leaf recreated under the same name
+    /// (another inode) is not the job's.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_recorded_cgroup_leaf_counts() {
+        let job = tempfile::tempdir().unwrap();
+        let cg = tempfile::tempdir().unwrap();
+        assert!(record_cgroup_leaf(job.path(), Path::new("relative/blut-x-1-1")).is_err());
+        assert!(record_cgroup_leaf(job.path(), &cg.path().join("bad name")).is_err());
+        assert!(
+            record_cgroup_leaf(job.path(), &cg.path().join("missing-1-1")).is_err(),
+            "a leaf that does not exist has no inode to record"
+        );
+        let leaf = cg.path().join("blut-eval-9-2");
+        let (pid, reaper) = orphan_in_fake_leaf(&leaf);
+        let wrong_inode = leaf_inode(&leaf).unwrap() + 1;
+        std::fs::write(
+            job.path().join(CGROUP_LEAVES_FILE),
+            format!(
+                "{wrong_inode} {}\nnot-a-number {}\n7 ../escape/blut-x-1-1\n",
+                leaf.display(),
+                leaf.display()
+            ),
+        )
+        .unwrap();
+        assert!(live_cgroup_leaves_at(job.path()).unwrap().is_empty());
+        assert_eq!(cgroup_resume_blocker_at("j", job.path()).unwrap(), None);
+        assert!(
+            cancel_cgroup_leaves_at(job.path(), std::time::Duration::from_secs(1))
+                .unwrap()
+                .is_empty(),
+            "nothing recorded as this job's is signalled"
+        );
+        signal_pids(&[pid], true);
+        assert!(reaper.join().unwrap().is_some());
+    }
+
+    /// The job directory reaches code running on the task `in_job` scopes,    /// The job directory reaches code running on the task `in_job` scopes,
+    /// and only there: not outside it, not on a task spawned from it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_job_scopes_the_job_dir_to_its_task() {
+        block_on(async {
+            assert_eq!(current_job_dir(), None);
+            let dir = PathBuf::from("/jobs/20261030-000000-000000003");
+            let seen = in_job(dir.clone(), async {
+                tokio::task::yield_now().await;
+                let here = current_job_dir();
+                let spawned = tokio::spawn(async { current_job_dir() }).await.unwrap();
+                (here, spawned)
+            })
+            .await;
+            assert_eq!(seen, (Some(dir), None));
+            assert_eq!(current_job_dir(), None);
+        });
     }
 }

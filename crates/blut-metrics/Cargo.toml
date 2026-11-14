@@ -16,7 +16,7 @@
 name = "blut-metrics"
 version = "0.2.0-alpha.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "BLUT telemetry sidecar — OpenMetrics scrape endpoint and OTLP span forwarder over engine status records (ADR 0097)."

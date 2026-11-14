@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""ADR 0139 P5 runtime graph-execution producer.\n\nEmits ONE executed-graph receipt as deterministic JSON on stdout. The\nexecution realm is this file's stem; all realm producers are byte-identical.\nEach compiles the conformance graph for its realm and runs it there, then\nrecords whether ordered step evidence survived, whether declared policy\npropagated into the compiled plan, whether transactional receipts stayed\nintact, and whether any step exceeded its declared resource envelope."""
+"""P5 runtime graph-execution producer (LamQuant graph program).\n\nEmits ONE executed-graph receipt as deterministic JSON on stdout. The\nexecution realm is this file's stem; all realm producers are byte-identical.\nEach compiles the conformance graph for its realm and runs it there, then\nrecords whether ordered step evidence survived, whether declared policy\npropagated into the compiled plan, whether transactional receipts stayed\nintact, and whether any step exceeded its declared resource envelope."""
 
 import json
 import subprocess

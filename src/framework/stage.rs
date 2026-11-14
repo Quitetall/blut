@@ -355,9 +355,27 @@ pub struct StageContext {
     /// appends `--resume <dir>` to its trainer argv. `None` = start fresh (first
     /// attempt, a non-resumable stage, or a fresh decision).
     pub resume_from: Option<PathBuf>,
+    /// The mid-stage checkpoint slot for this attempt (CONTRACT.md §8), set by
+    /// the executor when the stage opts in with [`Stage::checkpoint_slot`].
+    /// The stage forwards it to its trainer with
+    /// [`CheckpointSlot::apply_to`](crate::framework::stage_checkpoint::CheckpointSlot::apply_to).
+    /// `None` for stages that do not opt in, remote attempts, and fused or
+    /// pipelined execution.
+    pub checkpoint: Option<crate::framework::stage_checkpoint::CheckpointSlot>,
 }
 
 impl StageContext {
+    /// The Slurm job name a stage should give the job it starts
+    /// (`srun --job-name`, `sbatch --job-name`): `blut-<job id>-<node index>`.
+    ///
+    /// The executor records this name with the BLUT job whenever it runs a
+    /// stage under `--launcher slurm`, so `blut cancel` can stop, and
+    /// `plan resume` can see, a Slurm job that outlived the BLUT process that
+    /// started it. A stage that names its job otherwise is invisible to both.
+    pub fn slurm_job_name(&self) -> String {
+        crate::jobs::slurm_job_name(&self.job_dir, self.node_idx)
+    }
+
     /// Test-friendly constructor. `node_idx` defaults to 0 since
     /// most unit tests run a single stage at a time.
     pub fn for_test(job_dir: PathBuf, stage_dir: PathBuf) -> Self {
@@ -383,6 +401,7 @@ impl StageContext {
             ),
             attempt: 1,
             resume_from: None,
+            checkpoint: None,
         }
     }
 
@@ -420,6 +439,7 @@ impl StageContext {
             cache_key,
             attempt: 1,
             resume_from: None,
+            checkpoint: None,
         }
     }
 
@@ -555,6 +575,55 @@ pub enum StageExecutionBoundary {
     Subprocess,
 }
 
+/// Whether one stage invocation may run on another machine: a mesh peer under
+/// `--launcher p2p`, or a cloud worker. Declared by the stage itself through
+/// [`Stage::placement`]; the engine never infers it from a stage name.
+///
+/// The default is [`LocalOnly`](Self::LocalOnly). Implementing [`Stage`] says
+/// nothing about where the work may go: a stage can read host-local files, a
+/// local registry or database, or data its owner never meant to leave the
+/// machine. A stage opts in with [`Remote`](Self::Remote) only when it reads
+/// nothing but its typed input and args, and writes nothing but its output under
+/// `StageContext::stage_dir`, so the same invocation computes the same result on
+/// any machine running the same code.
+///
+/// `Remote` carries the class of the data the invocation handles. The dispatch
+/// trust matrix decides which peers may receive it: `Public` may go to any peer,
+/// `Internal` only to a registered or trusted one, and `Restricted` to none, so
+/// a `Remote` declaration with `Restricted` data still runs on this machine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "placement", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StagePlacement {
+    /// Runs only on the machine that runs the plan.
+    #[default]
+    LocalOnly,
+    /// May run on another machine whose trust admits `data_class`.
+    Remote {
+        data_class: crate::framework::execution::DataClassification,
+    },
+}
+
+impl StagePlacement {
+    /// A stage that may run elsewhere, handling data of `data_class`.
+    pub const fn remote(data_class: crate::framework::execution::DataClassification) -> Self {
+        Self::Remote { data_class }
+    }
+
+    /// The data class to dispatch with, or `None` when the invocation must stay
+    /// on this machine (declared local, or restricted data).
+    pub fn remote_class(self) -> Option<crate::framework::execution::DataClassification> {
+        match self {
+            Self::Remote { data_class }
+                if data_class != crate::framework::execution::DataClassification::Restricted =>
+            {
+                Some(data_class)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Typed user-facing trait. Implementors are concrete stages.
 ///
 /// Constants:
@@ -678,7 +747,7 @@ pub trait Stage: Send + Sync + 'static {
     /// args-aware pair rather than widening this const.
     const CPU_CORES: u32 = 1;
 
-    /// Whether this stage is ADVISORY (ADR 0071). An advisory stage's failure is
+    /// Whether this stage is ADVISORY (ADR 0156). An advisory stage's failure is
     /// recorded as a non-fatal warning and PRUNES its descendants, but does NOT
     /// fail the plan / exit non-zero — the canonical case is a `--dry-run` /
     /// verdict gate that runs after training: its verdict is information, not a
@@ -822,6 +891,16 @@ pub trait Stage: Send + Sync + 'static {
         None
     }
 
+    /// Opt in to a mid-stage checkpoint slot (CONTRACT.md §8). Return `true`
+    /// for a long-running stage whose trainer can write step checkpoints and
+    /// resume from them. The executor then gives every local attempt a
+    /// durable slot keyed by this invocation's cache key, decides whether the
+    /// attempt resumes, and sets `StageContext::checkpoint`. Default `false`:
+    /// no slot, and the stage restarts from its beginning as before.
+    fn checkpoint_slot(&self, _args: &Self::Args) -> bool {
+        false
+    }
+
     /// Per-step divergence sentinel (P7). Given one `StageStep` update payload,
     /// return `true` if the run has diverged (loss > k·EMA, grad-norm spike, …)
     /// so the executor can stop it early with a typed `Diverged` error instead
@@ -841,6 +920,18 @@ pub trait Stage: Send + Sync + 'static {
     /// hash catches even an UNCOMMITTED edit (which the git hash misses).
     fn code_fingerprint(&self) -> Option<Vec<u8>> {
         None
+    }
+
+    /// Whether this invocation may run on another machine, and the class of
+    /// the data it handles ([`StagePlacement`]). Default
+    /// [`StagePlacement::LocalOnly`]: under `--launcher p2p` the stage runs on
+    /// the submitting machine as part of the same plan. Override with
+    /// [`StagePlacement::remote`] only for a stage whose result depends on
+    /// nothing but its typed input, its args and the code, and whose output
+    /// lives under `StageContext::stage_dir`. A worker runs it only when its
+    /// own build makes the same declaration for the same args.
+    fn placement(&self, _args: &Self::Args) -> StagePlacement {
+        StagePlacement::LocalOnly
     }
 }
 
@@ -928,7 +1019,7 @@ pub trait StageDyn: Send + Sync + 'static {
     fn cpu_cores(&self) -> u32 {
         1
     }
-    /// Whether this stage is advisory (ADR 0071 · `Stage::ADVISORY`). Defaulted
+    /// Whether this stage is advisory (ADR 0156 · `Stage::ADVISORY`). Defaulted
     /// `false` so manual `StageDyn` impls keep the fatal semantics; the blanket
     /// impl below forwards `S::ADVISORY`.
     fn is_advisory(&self) -> bool {
@@ -1016,6 +1107,14 @@ pub trait StageDyn: Send + Sync + 'static {
         None
     }
     fn args_schema(&self) -> serde_json::Value;
+    /// Validate `args` when a plan is BUILT from erased stages (a `.toml`,
+    /// `.json` or `.star` recipe, `plan check`), so a bad argument to the
+    /// fifth stage is reported before the first four run rather than after.
+    /// Applies the recipe-args preflight (unknown keys, missing required
+    /// fields, scalar types) and the exact decode the executor performs.
+    fn check_args(&self, _args: &serde_json::Value) -> Result<(), StageError> {
+        Ok(())
+    }
     fn retry(&self) -> crate::framework::retry::RetryPolicy;
     fn timeout(&self) -> crate::framework::retry::StageTimeout;
 
@@ -1118,6 +1217,20 @@ pub trait StageDyn: Send + Sync + 'static {
         ctx: &StageContext,
         args: &serde_json::Value,
     ) -> Option<crate::framework::resume::ResumeToken>;
+
+    /// Erased [`Stage::checkpoint_slot`]. A bad-args deserialize is `false`.
+    /// Defaults to `false` so hand-written `StageDyn` implementors keep
+    /// compiling and get no slot.
+    fn checkpoint_slot_erased(&self, _args: &serde_json::Value) -> bool {
+        false
+    }
+
+    /// Erased [`Stage::placement`]. Args that do not deserialize are
+    /// [`StagePlacement::LocalOnly`]. Defaults to `LocalOnly` so hand-written
+    /// `StageDyn` implementors keep compiling and never leave the machine.
+    fn placement_erased(&self, _args: &serde_json::Value) -> StagePlacement {
+        StagePlacement::LocalOnly
+    }
 
     /// Erased [`Stage::divergence_check`] (the step payload is already erased).
     fn divergence_check(&self, step: &serde_json::Value) -> bool;
@@ -1252,10 +1365,24 @@ fn decode_stage_input<S: Stage>(input: ErasedArtifact) -> Result<S::Input, Stage
 }
 
 fn decode_stage_args<S: Stage>(args: serde_json::Value) -> Result<S::Args, StageError> {
-    serde_json::from_value(args).map_err(|source| StageError::ArgsDeserialize {
-        stage: S::NAME,
-        source,
-    })
+    // An erased node with no `args` carries JSON `null`, which an all-defaults
+    // struct does not accept (it wants `{}`), while a unit `Args` wants `null`
+    // and not `{}`. Try the other empty form before failing, as recipe args
+    // already do, so omitting `args` works for either kind of stage.
+    let alternate = match &args {
+        serde_json::Value::Null => Some(serde_json::json!({})),
+        serde_json::Value::Object(map) if map.is_empty() => Some(serde_json::Value::Null),
+        _ => None,
+    };
+    serde_json::from_value(args)
+        .or_else(|error| match alternate {
+            Some(other) => serde_json::from_value(other).map_err(|_| error),
+            None => Err(error),
+        })
+        .map_err(|source| StageError::ArgsDeserialize {
+            stage: S::NAME,
+            source,
+        })
 }
 
 fn encode_stage_output<S: Stage>(output: &S::Output) -> Result<ErasedArtifact, StageError> {
@@ -1435,6 +1562,20 @@ impl<S: Stage> StageDyn for S {
     fn output_portable_identity(&self, art: &ErasedArtifact) -> Option<Vec<u8>> {
         portable_identity_typed::<S::Output>(art)
     }
+    fn check_args(&self, args: &serde_json::Value) -> Result<(), StageError> {
+        crate::recipes::recipe::validate_args_against_schema(S::NAME, &self.args_schema(), args)
+            .map_err(|error| {
+                let message = match error {
+                    crate::framework::RecipeError::InvalidArgs { message, .. } => message,
+                    other => other.to_string(),
+                };
+                StageError::ArgsDeserialize {
+                    stage: S::NAME,
+                    source: <serde_json::Error as serde::de::Error>::custom(message),
+                }
+            })?;
+        decode_stage_args::<S>(args.clone()).map(|_| ())
+    }
     fn args_schema(&self) -> serde_json::Value {
         // schemars 0.8: schema_for! is a proc macro requiring a
         // type literal, so we go through `gen.subschema_for`
@@ -1593,11 +1734,7 @@ impl<S: Stage> StageDyn for S {
     }
 
     async fn preflight_erased(&self, args: &serde_json::Value) -> Result<(), StageError> {
-        let typed: S::Args =
-            serde_json::from_value(args.clone()).map_err(|source| StageError::ArgsDeserialize {
-                stage: S::NAME,
-                source,
-            })?;
+        let typed: S::Args = decode_stage_args::<S>(args.clone())?;
         self.preflight(&typed).await
     }
 
@@ -1608,6 +1745,18 @@ impl<S: Stage> StageDyn for S {
     ) -> Option<crate::framework::resume::ResumeToken> {
         let typed: S::Args = serde_json::from_value(args.clone()).ok()?;
         self.resume_handle(ctx, &typed)
+    }
+
+    fn checkpoint_slot_erased(&self, args: &serde_json::Value) -> bool {
+        serde_json::from_value::<S::Args>(args.clone())
+            .map(|typed| self.checkpoint_slot(&typed))
+            .unwrap_or(false)
+    }
+
+    fn placement_erased(&self, args: &serde_json::Value) -> StagePlacement {
+        serde_json::from_value::<S::Args>(args.clone())
+            .map(|typed| Stage::placement(self, &typed))
+            .unwrap_or(StagePlacement::LocalOnly)
     }
 
     fn divergence_check(&self, step: &serde_json::Value) -> bool {
@@ -2031,15 +2180,35 @@ mod tests {
         }
     }
 
-    fn ctx() -> StageContext {
-        let td = tempfile::tempdir().unwrap();
-        let job = td.path().to_path_buf();
+    /// A stage context whose job directory is a temporary directory removed
+    /// when the test drops it. It used to leak the directory
+    /// (`mem::forget`), one per test per run.
+    struct TestCtx {
+        ctx: StageContext,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestCtx {
+        type Target = StageContext;
+        fn deref(&self) -> &StageContext {
+            &self.ctx
+        }
+    }
+
+    impl std::ops::DerefMut for TestCtx {
+        fn deref_mut(&mut self) -> &mut StageContext {
+            &mut self.ctx
+        }
+    }
+
+    fn ctx() -> TestCtx {
+        let dir = tempfile::tempdir().unwrap();
+        let job = dir.path().to_path_buf();
         let stage = job.join("stages/0-word_count");
-        // Tempdir lives only for the test body; leak the guard so
-        // job_dir paths stay valid for the duration. tests are
-        // throwaway-process so /tmp is cleaned at next reboot.
-        std::mem::forget(td);
-        StageContext::for_test(job, stage)
+        TestCtx {
+            ctx: StageContext::for_test(job, stage),
+            _dir: dir,
+        }
     }
 
     // ── ErasedArtifact round trip ─────────────────────────────────
@@ -2232,6 +2401,64 @@ mod tests {
         assert!(
             matches!(r, Err(StageError::ArgsDeserialize { stage, .. }) if stage == "word_count")
         );
+    }
+
+    /// A stage whose args all have defaults: the shape most cookbook stages
+    /// use, and the one where a typo'd key used to vanish without a trace.
+    struct DefaultedWordCount;
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+    #[serde(default)]
+    struct DefaultedArgs {
+        delimiter: String,
+    }
+
+    #[async_trait]
+    impl Stage for DefaultedWordCount {
+        const NAME: &'static str = "defaulted_word_count";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = Words;
+        type Output = Count;
+        type Args = DefaultedArgs;
+
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            input: Self::Input,
+            _args: &Self::Args,
+        ) -> Result<Self::Output, StageError> {
+            Ok(Count {
+                n: input.text.len(),
+            })
+        }
+    }
+
+    #[test]
+    fn check_args_refuses_unknown_keys_and_bad_types_before_anything_runs() {
+        let s: Box<dyn StageDyn> = Box::new(DefaultedWordCount);
+        let err = s
+            .check_args(&serde_json::json!({"delimitor": " "}))
+            .expect_err("a typo'd key must not be dropped");
+        assert!(err.to_string().contains("'delimitor'"), "{err}");
+        let s: Box<dyn StageDyn> = Box::new(WordCount);
+        assert!(matches!(
+            s.check_args(&serde_json::json!({"delimiter": 42})),
+            Err(StageError::ArgsDeserialize { stage, .. }) if stage == "word_count"
+        ));
+        assert!(s.check_args(&serde_json::json!({"delimiter": " "})).is_ok());
+    }
+
+    /// A `.toml`/`.json` node that omits `args` carries `null`; an
+    /// all-defaults args struct used to fail on it at run time.
+    #[tokio::test]
+    async fn omitted_args_decode_for_an_all_defaults_stage() {
+        let s: Box<dyn StageDyn> = Box::new(DefaultedWordCount);
+        assert!(s.check_args(&serde_json::Value::Null).is_ok());
+        assert!(s.preflight_erased(&serde_json::Value::Null).await.is_ok());
+        // A stage with a required field still refuses `null`.
+        let s: Box<dyn StageDyn> = Box::new(WordCount);
+        assert!(s.check_args(&serde_json::Value::Null).is_err());
     }
 
     #[tokio::test]
@@ -2680,19 +2907,22 @@ mod tests {
     #[test]
     fn rebase_path_strings_exact_and_child_prefix() {
         use serde_json::json;
-        let mut v = json!({
-            "exact": "/a/b",
-            "child": "/a/b/c/d.txt",
-            "sibling": "/a/bc",       // must NOT match
-            "unrelated": "/x/y",
-            "nested": {"p": "/a/b/inner"},
-            "list": ["/a/b/k", "keep"],
-        });
+        // Every path is built with the host separator, because that is the
+        // separator `rebase_path_strings` matches on; on Unix these are the
+        // same "/a/b"-style literals as before.
         let sep = std::path::MAIN_SEPARATOR;
+        let mut v = json!({
+            "exact": format!("{sep}a{sep}b"),
+            "child": format!("{sep}a{sep}b{sep}c{sep}d.txt"),
+            "sibling": format!("{sep}a{sep}bc"),       // must NOT match
+            "unrelated": format!("{sep}x{sep}y"),
+            "nested": {"p": format!("{sep}a{sep}b{sep}inner")},
+            "list": [format!("{sep}a{sep}b{sep}k"), "keep"],
+        });
         let from = format!("{sep}a{sep}b");
         let to = format!("{sep}new{sep}root");
         rebase_path_strings(&mut v, &from, &to);
-        assert_eq!(v["exact"], json!(format!("{to}")));
+        assert_eq!(v["exact"], json!(to));
         assert_eq!(v["child"], json!(format!("{to}{sep}c{sep}d.txt")));
         assert_eq!(
             v["sibling"],

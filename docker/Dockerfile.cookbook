@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# A cookbook image for BlutPlan pods: the standard cookbook's binary built
+# against THIS engine checkout, with the `p2p` and `s3` features, installed as
+# `blut` (the command a BlutPlan runs by default), and `blut-core`, which adds
+# the core cookbook's registry recipes (`recipe list`).
+#
+# Two build contexts: this repository (`engine`) and a checkout of
+# https://github.com/Quitetall/blut-cookbooks (`cookbook`):
+#
+#   docker build -f docker/Dockerfile.cookbook \
+#     --build-context engine=. --build-context cookbook=../blut-cookbooks \
+#     -t blut-cookbook:dev .
+#
+# The cookbook pins an engine release from crates.io. To test the engine under
+# review instead, the build rewrites that pin to this checkout's version and
+# patches it to the local path. A published image would build from the
+# published crates instead and needs neither step.
+
+ARG RUST_IMAGE=rust:1.99-bookworm
+ARG RUNTIME_IMAGE=debian:bookworm-slim
+
+FROM ${RUST_IMAGE} AS builder
+ARG CARGO_BUILD_JOBS=8
+# The cookbook's lockfile has no entries for the `s3` feature's dependencies,
+# so they are resolved here. Prefer versions that support the toolchain over
+# the newest ones (the cookbook workspace pins resolver 2, which would not).
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} CARGO_TARGET_DIR=/target \
+    CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback
+COPY --from=engine Cargo.toml Cargo.lock build.rs README.md API.md /src/engine/
+COPY --from=engine src/ /src/engine/src/
+COPY --from=engine crates/blut-types/ /src/engine/crates/blut-types/
+COPY --from=engine scripts/run_contained.sh /src/engine/scripts/run_contained.sh
+COPY --from=engine benches/ /src/engine/benches/
+COPY --from=cookbook . /src/cookbook/
+WORKDIR /src/cookbook
+RUN set -eu; \
+    version=$(sed -n 's/^version = "\(.*\)"/\1/p' /src/engine/Cargo.toml | head -n1); \
+    for manifest in Cargo.toml crates/*/Cargo.toml; do \
+      sed -i -E "s/^blut = \{ version = \"=[^\"]+\"/blut = { version = \"=${version}\"/" "$manifest"; \
+    done; \
+    printf '\n[patch.crates-io]\nblut = { path = "/src/engine" }\nblut-types = { path = "/src/engine/crates/blut-types" }\n' >> Cargo.toml
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/target,id=blut-cookbook-target \
+    cargo build --release -p blut-cookbook-standard -p blut-cookbook-core --bins \
+      --features blut-cookbook-standard/p2p,blut/s3 \
+ && install -D -m 0755 /target/release/blut-standard /out/blut-standard \
+ && install -D -m 0755 /target/release/blut-core /out/blut-core
+
+FROM ${RUNTIME_IMAGE}
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --uid 65532 --user-group --home-dir /blut/work --no-create-home blut
+COPY --from=builder /out/blut-standard /out/blut-core /usr/local/bin/
+RUN ln -s /usr/local/bin/blut-standard /usr/local/bin/blut
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/blut"]

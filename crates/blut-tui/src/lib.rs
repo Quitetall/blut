@@ -494,7 +494,7 @@ impl App {
         let catalog: Vec<&'static blut::recipes::RecipeDef> = registry.all().collect();
         let ingredients = registry.ingredient_palette();
         Self {
-            console: console::ConsoleModel::demo(),
+            console: console::ConsoleModel::idle(),
             console_tab: console::ConsoleTab::Home,
             builder: builder::DagBuilder::default(),
             ingredients,
@@ -951,7 +951,7 @@ impl App {
     fn recipe_menu(
         catalog: &[&'static blut::recipes::RecipeDef],
     ) -> Vec<(Option<char>, &'static blut::recipes::RecipeDef)> {
-        // Menu order = each course's pipeline position (ADR 0051).
+        // Menu order = each course's pipeline position (ADR 0055).
         // `Course::order()` is a compiler-forced exhaustive match, so a
         // newly-added course can't silently drop to the bottom here.
         let mut sorted: Vec<&'static blut::recipes::RecipeDef> = catalog.to_vec();
@@ -1026,12 +1026,13 @@ impl App {
         }
     }
 
-    /// Rebuild the engine-console model. Starts from the representative demo,
-    /// then overlays the newest RUNNING job's real DAG / cache / phase from its
-    /// `status.jsonl` (the mesh / broker / ε loaders land in the next slice, so
-    /// those panels stay representative until then).
+    /// Rebuild the engine-console model. Starts from the empty idle model, then
+    /// overlays the newest RUNNING job's real DAG / cache / phase from its
+    /// `status.jsonl`, the broker's live memory snapshot, and (with `p2p`) the
+    /// peer registry + ε ledger. A panel with no loader data stays empty rather
+    /// than showing made-up numbers.
     fn refresh_console(&mut self) {
-        let mut m = console::ConsoleModel::demo();
+        let mut m = console::ConsoleModel::idle();
         let job = self
             .jobs
             .iter()
@@ -1041,10 +1042,10 @@ impl App {
             && let Ok(dir) = jobs::job_dir_path(&job.id)
             && m.apply_status_jsonl(&dir.join("status.jsonl"))
         {
-            m.run_id = job.id.chars().take(8).collect();
-            if let Some(name) = &job.output_name {
-                m.plan = name.clone();
-            }
+            // The whole id: its first 8 characters are the launch date, so the
+            // old 8-character cut showed every run of a day as the same id.
+            m.run_id = job.id.clone();
+            m.plan = job.output_name.clone().unwrap_or_else(|| "-".into());
         }
         m.apply_broker();
         // Overlay the real mesh + ε budgets when the p2p plane is compiled in.
@@ -1427,6 +1428,17 @@ async fn run_surface(
     // Detect NO_COLOR / TERM=dumb / locale once before the first draw so
     // every theme getter returns the right style.
     theme::detect("auto", "auto");
+    // Without a terminal, raw mode fails with a bare errno ("No such device or
+    // address"); say what is actually wrong and what to run instead.
+    {
+        use std::io::IsTerminal;
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            anyhow::bail!(
+                "the cockpit needs an interactive terminal (stdin and stdout are not \
+                 both a TTY); for a headless self-check run `blut tui --check`"
+            );
+        }
+    }
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("alt screen")?;

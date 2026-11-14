@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 # Roadmap
 
-What stands between `0.2.0-alpha.1` and a 1.0, stated as evidence that does not
+What stands between `0.2.0-alpha.2` and a 1.0, stated as evidence that does not
 exist yet rather than as features.
 
 The rule this file follows: a capability is only listed as done when something
@@ -16,38 +16,84 @@ page, is the authority.
 The single-node path is exercised: typed DAG compilation, the content-addressed
 cache, memory admission, containment selection on Linux, durable resume, the
 PlanSpec IR, the Starlark front-end and the Python SDK. That is what
-`0.2.0-alpha.1` means and it is why the version says `alpha`.
+`0.2.0-alpha.1` meant. `0.2.0-alpha.2` adds the distributed work below, each
+item with what it still lacks, which is why the version still says `alpha`.
 
 ## Before 1.0
 
-**1. Distributed claims need runs, not command construction.** Multi-node
-Slurm/Ray launchers, `torchrun` rendezvous and the P2P mesh are
-*component-tested*: the commands and parsers have tests, nothing has been
-executed across machines. Closing this means recorded runs with topology,
-versions, global-batch parity, failure recovery and artifact hashes — and until
-those exist the ledger keeps saying so.
+**1. Distributed claims need runs, not command construction.** The Slurm
+launcher has run against a live two-node cluster, a two-node Ray cluster has
+run jobs to completion, and cookbook training has run across two machines over
+NCCL with global-batch parity. A node lost mid-job is detected and the job is
+requeued and completes once the node returns. `plan resume` after a node loss
+picks up from the cache on the same launcher, and DDP replicas are checked to
+be bit-identical across nodes. An interrupted training stage resumes from
+its newest checkpoint rather than step 0: after a Slurm requeue, after `plan
+resume`, and on a retry, each run on two machines with CPU ranks; the steps
+recomputed after each resume reproduced their losses exactly. Still missing: the same on GPUs over NCCL, mid-stage checkpoints for
+FSDP, and a cluster with cgroup enforcement and GPU binding.
 
-**2. P2P across independent hosts, including hostile networks.** Loopback proves
-the protocol, not the mesh. Needs separate machines, NAT, loss and partition.
+**2. P2P across independent hosts, including hostile networks.** Done for
+dispatch. Stage data and results have crossed the internet between continents,
+and a four-continent `p2p node` mesh answered 12 of 12 signed probes. Loss,
+latency, partition, NAT and clock skew have run emulated, and loss and
+partition have run on a real WAN; the real-WAN runs led to the opt-in BBR
+controller. Peers find each other by gossip, and stage data moves over the
+mesh without a shared cache: on four hosts on four continents, each seeded
+with at most one peer, the mesh formed by gossip and 64 MB of stage data
+reached a worker with an empty cache and came back verified. A run's stages now
+reach the mesh: `recipe run --launcher p2p` sends each stage that declares it
+may leave the machine to a peer with the same code identity, and the run fails
+rather than running such a stage at home when no peer can take it. A cookbook
+plan ran that way on three hosts on three continents, with outputs byte-equal
+to a local run. Still missing: BBR measured against competing traffic before it
+can become the default, placement declarations in the published cookbooks, and
+GPU stages on mesh workers.
 
-**3. Network object storage.** The cloud queue proves itself against the local
-filesystem. S3/R2/GCS/MinIO were removed from the preview pending dependency
-advisories, secret handling and TLS. Restoring them means code plus provider
-integration tests, not a feature flag.
+**3. Network object storage.** Done for static credentials. The `s3` feature
+round-trips through Cloudflare R2 over public TLS, which enforces the
+create-only writes BLUT depends on. It also round-trips through MinIO over
+HTTP and over verified TLS. Backblaze B2 lacks conditional writes and is
+refused with an error that says so. Still missing: IAM-role / STS credentials
+and a run against AWS S3 itself.
 
-**4. A benchmark baseline that exists.** `scripts/run_benchmarks.sh compare` is
-in the release gate and cannot pass: only an `opt0` baseline is committed, and
-the gate names `release-0.2`. Either the baseline gets established on the
-designated quiet host, or the gate is honest about naming `opt0`.
+Cloud dispatch runs on it: `recipe run --launcher cloud` and `recipe declare
+--run --launcher cloud` place every stage on `blut cloud worker` processes
+through a durable queue on the bucket, validated on R2 with workers as separate
+processes on one host. `blut cancel` and `plan resume` work with the submitter
+gone. Still missing: workers on separate hosts, a GPU stage, a large artifact,
+`hpo`/`study`/`partition` on the cloud launcher, and retention of finished jobs.
 
-**5. Windows containment.** Bare fallback only; no Job Object implementation.
-Either implemented or stated as unsupported rather than "deferred".
+**4. A benchmark baseline that exists.** The regression gate
+(`scripts/bench_regression_gate.py`) compares confidence bounds rather than
+raw medians, and `scripts/run_benchmarks.sh compare` names the `release-0.2`
+baseline. A shared host drifted −12% to +8% on unchanged code, so the baseline
+is recorded on a whole dedicated machine. Even there, one pass in two failed on
+unchanged code (one benchmark +17%), so the gate now waits for a quiet host
+and fails only on a slowdown that repeats in a second pass. Still missing: the
+two-pass gate run on a quiet host, and the baseline committed at the release
+commit.
 
-**6. The ADR problem.** 805 citations across 208 files name decision records
-this repository does not contain — they live in a private meta-repository.
-Either the engine-facing ADRs are federated into this repo, or the citations
-stop pretending to be references. `book_src/adrs.md` currently discloses the gap
-instead of hiding it.
+**5. Windows containment.** Local stages are contained on Windows.
+`LocalSystemd::spawn_contained` places a stage process in a Job Object: a
+tree-wide commit cap, the peak at exit, and a tree kill on cancel, on a stage
+timeout, or when the driver dies. The standard and LamQuant cookbook runners
+spawn through `spawn_attached`, and a CPU training run through BLUT on
+`windows-latest` is recorded in the
+[validation ledger](docs/DISTRIBUTED_VALIDATION.md). Still open: `mem_high`
+and `swap_max` have no Job Object equivalent; `blut cancel` cannot stop a
+driver from another process on Windows; no GPU or DDP run on Windows has been
+recorded.
+
+**6. The ADR problem.** Federated and reviewed by the owner. The
+engine-facing decision records (41 of them) now live in
+[`docs/adr/`](docs/adr/README.md), redacted where marked, so the engine's
+citations resolve. Citations of product decisions that were not federated were
+rewritten as plain rationale; two citation numbers that predate a renumbering
+now point at the records' current numbers. What is left: plain-text
+"ADR NNNN" mentions are not hyperlinks (the index resolves them), and captured
+data — an SDK test fixture exported from a cookbook, and recorded graph-runtime
+evidence — still carries non-federated numbers verbatim.
 
 ## Explicitly not planned
 

@@ -1,26 +1,31 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 # Architecture decisions (ADRs)
 
-BLUT's design is recorded as Architecture Decision Records. The engine-facing
-ADRs — the scope charter, the interface stack, typed-declaration admission, the
-eventing/SLA system, and the milestone constitution — live in the LamQuant
-meta-repository under `docs/decisions/`, where they are lint-gated and composed
-into a single index.
+BLUT's design is recorded as Architecture Decision Records. They were written in
+the project's decision log, which lives in a private meta-repository; the
+engine-facing records are **federated** into this repository under
+[`docs/adr/`](https://github.com/Quitetall/blut/tree/main/docs/adr), so an
+"ADR NNNN" citation in the code, manifests, CI and changelog resolves to a
+document you can open.
 
-They are **linked, not vendored**, on purpose: an ADR is the meta-repo's source
-of truth, and copying it here would create a second copy that silently drifts.
+- **Index:** [`docs/adr/README.md`](https://github.com/Quitetall/blut/blob/main/docs/adr/README.md)
+  lists every federated record with its number, title and status.
+- **Redaction:** each record is the decision-log text with private material
+  removed (machine paths, private repositories, domain research, hardware,
+  business notes). Every removal is marked inline as `[redacted: <category>]`;
+  the decision, its status, context and consequences are otherwise intact.
+- **Drift:** the source log is frozen, so a federated copy cannot fall behind
+  its original.
+- **Not federated:** decisions about the LamQuant product rather than the engine
+  (codec research, hardware, the ABIR graph program) stay private. Where a
+  federated record mentions one, it reads `ADR NNNN [not federated]`. Two kinds
+  of file still carry such numbers verbatim because they are captured data, not
+  prose: the cookbook registry export used as an SDK test fixture, and recorded
+  graph-runtime evidence with its receipt schema identifiers.
 
-> **That meta-repository is not public.** If you are reading this from outside
-> the project, the ADR numbers cited throughout this codebase currently have no
-> document you can open. There are 766 such citations across 202 files, naming
-> 53 distinct ADRs — mostly Rust source comments, but also crate manifests, CI
-> workflows, scripts, `CHANGELOG.md`, and `RELEASING.md`. The summaries below
-> are the engine-facing extract, and they are all there is until the ADR system
-> is federated so that each repository carries its own decisions.
->
-> This is a known gap, not an oversight: the rationale lives somewhere you
-> cannot reach, so treat an "ADR NNNN" citation as a marker that a decision was
-> recorded and argued, not as a reference you are expected to follow.
+Two numbers moved when the decision log resolved collisions: code written
+earlier cited the experiment-execution UX record as 0071 and the cookbook
+taxonomy record as 0051. Those citations now read 0156 and 0055.
 
 Load-bearing engine ADRs:
 
@@ -37,6 +42,3 @@ Load-bearing engine ADRs:
   admission contract).
 - **0137** — the BLUT-engine M3–M6 milestone constitution and the
   engine-1.0-vs-family-1.0 boundary.
-
-The complete generated index is the meta-repo's `docs/topics/adr-index.md` —
-reachable only from inside the project, for the reason given above.

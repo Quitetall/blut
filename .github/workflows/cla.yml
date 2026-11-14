@@ -53,8 +53,11 @@ jobs:
           path-to-signatures: 'signatures/cla.json'
           path-to-document: 'https://github.com/Quitetall/blut/blob/main/CLA.md'
           branch: 'main'
-          # Enumerate specific bots — no wildcard bypass.
-          allowlist: 'dependabot[bot],renovate[bot]'
+          # Enumerate specific accounts — no wildcard bypass. `Quitetall` is the
+          # repository owner and the licensor the CLA grants rights to, so it has
+          # nothing to sign. Co-Authored-By trailers are not checked by this
+          # action (it reads each commit's author and committer only).
+          allowlist: 'dependabot[bot],renovate[bot],Quitetall'
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
           custom-allsigned-prcomment: '✅ All contributors have signed the CLA — thank you!'
           custom-notsigned-prcomment: |

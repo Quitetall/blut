@@ -342,9 +342,9 @@ impl std::fmt::Debug for InvocationKey {
 ///
 /// Owned by the engine. It previously wrapped `abir::ContentId`, which put a
 /// dependency on a BIOSIGNAL crate ("Atomic Biosignal Intermediate
-/// Representation") into the domain-agnostic engine — the exact edge ADR 0143
-/// says `blut` "MUST NOT" have and retired once already, and ADR 0150 restates
-/// as an invariant. ABIR vocabulary belongs in the `blut-semantic` sidecar or a
+/// Representation") into the domain-agnostic engine — the exact edge the
+/// project's module boundaries say `blut` "MUST NOT" have, retired once already
+/// and restated as an invariant. ABIR vocabulary belongs in the `blut-semantic` sidecar or a
 /// cookbook; the identity itself is a plain 32-byte digest and needs no domain
 /// crate to express.
 ///
@@ -366,7 +366,7 @@ impl ArtifactContentId {
         self.0
     }
 
-    /// Read compatibility for pre-ADR0169 callers that stored identity bytes in
+    /// Read compatibility for callers predating `ArtifactContentHasher` that stored identity bytes in
     /// `ContentHash`. New identity producers must use [`ArtifactContentHasher`].
     pub const fn from_digest(digest: ContentHash) -> Self {
         Self::from_bytes(digest.0)
@@ -698,7 +698,7 @@ pub struct ArtifactMetadata {
     /// canonical `identity_scheme` are exposed as ABIR semantic identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_id: Option<ArtifactContentId>,
-    /// Declares the meaning of `content_id`; absent on pre-ADR0169 sidecars.
+    /// Declares the meaning of `content_id`; absent on sidecars written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_scheme: Option<String>,
     /// Pre-A09 ambiguous hash preserved for audit and legacy display only.

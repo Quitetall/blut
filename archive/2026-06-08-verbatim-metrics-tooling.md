@@ -195,11 +195,11 @@ checkpoint.save(payload, ckpt_path, contract=checkpoint.RESUME_CONTRACT)
 
 ## 6. ADR alignment
 
-- **ADR 0038 (metric discipline)** — this tool IS the mandated mechanical
+- **Metric discipline (project rule)** — this tool IS the mandated mechanical
   defense: verify every metric against the raw source; LLM poller prose is
   liveness-only, never a quantitative trajectory. Codec quality = **fullband
   R/PRD** only (not latent/distill proxies); graded against the LQS floors in
-  `Eagle/lqs/src/levels.rs` (M = R≥0.85, ADR 0043).
+  `Eagle/lqs/src/levels.rs` (a domain quality floor).
 - **ADR 0044 P10 (observability)** — metric/log writes anchor to
   `$BLUT_JOB_DIR` (the per-job dir BLUT `--setenv`s across the systemd unit
   boundary) when run as a stage; `read_metric` + `train_4state_controller`
@@ -209,4 +209,4 @@ checkpoint.save(payload, ckpt_path, contract=checkpoint.RESUME_CONTRACT)
 _Source: `blut/python/blut_core/` (`runctx.py`, `metric_log.py`,
 `read_metric.py`, `status.py`, `run_manifest.py`, `checkpoint.py`,
 `sysgauge.py`; tests in `blut_core/tests/`), `blut/src/protocol.rs`;
-decisions/0037, 0038, 0044._
+ADRs 0037 and 0044 (see `docs/adr/`)._

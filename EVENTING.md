@@ -52,6 +52,10 @@ blut sensord --cli /usr/local/bin/my-cookbook
 blut sensord --cli /usr/local/bin/my-cookbook --once # deterministic smoke
 ```
 
+Sensord refuses to start when `--cli` is neither an executable path nor on
+`PATH`. With `--once` it exits non-zero when any dispatch was refused or a
+poll failed; the daemon loop retries those on the next poll.
+
 Webhook clients send `POST /events/<trigger>` (the `/api/events/<trigger>`
 alias is also supported) with:
 
@@ -76,7 +80,8 @@ web boundary while keeping the event itself Restricted.
 
 Sensord and `blut sla check` call the same evaluator. Rules default to
 `~/.blut/sla.toml` or `$BLUT_SLA_RULES`; breaches append once to
-`$BLUT_SLA_PATH` or `~/.blut/sla.jsonl`.
+`$BLUT_SLA_PATH` or `~/.blut/sla.jsonl`. A rule file named by `--rules` or
+`$BLUT_SLA_RULES` must exist; the default file is optional.
 
 ```toml
 [[rule]]
@@ -88,12 +93,32 @@ max_runtime_secs = 14400
 name = "fresh-output"
 recipe = "evaluate"
 freshness_secs = 3600
+
+[[rule]]
+name = "prod-deploy-runtime"
+recipe = "registry://plan@prod"
+max_runtime_secs = 7200
 ```
 
+`recipe` scopes a rule to the runs recorded under that recipe; without it the
+rule judges every run. It is a recipe name, or a deploy pointer URI: a run
+launched by `recipe declare registry://plan@<name> --run` (or dispatched by
+sensord from that URI) is recorded under the URI itself, whatever the published
+spec is called, and keeps it through `blut lineage reindex`.
+
 `max_runtime_secs`, `deadline_unix`, and `freshness_secs` are positive bounds.
-Freshness uses the newest measured `produced_unix` lineage timestamp and fails
-closed when a matching run has no measurement. `blut sla check` exits nonzero
-while any breach is active, even if its durable row was already written.
+Runtime and freshness judge recent runs, per tenant, so an old breach stops
+counting once a newer run meets the rule:
+
+- `max_runtime_secs`: the newest matching run (by start time), on its runtime
+  so far if it is still running.
+- `freshness_secs`: the matching run with the newest measured `produced_unix`
+  lineage timestamp; one breach when even that is older than the window. It
+  fails closed when none of a tenant's matching runs has a measurement.
+- `deadline_unix`: every matching run still running past the deadline.
+
+`blut sla check` exits nonzero while any breach is active, even if its durable
+row was already written.
 
 ## Notification rules
 

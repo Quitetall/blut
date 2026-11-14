@@ -38,7 +38,9 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// A spawned training child's identity. `pid` is the direct child,
 /// `pgid` its process group (== pid after `setsid`). `start_time` is
@@ -276,6 +278,9 @@ async fn read_capped(
 }
 
 struct BoundedProcessGuard {
+    // Read only by the Unix `killpg` teardown; off Unix `kill_on_drop` on the
+    // direct child is the whole teardown.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pgid: Option<u32>,
 }
 
@@ -326,6 +331,31 @@ pub async fn graceful_kill_pid(pgid: u32, grace: Duration) {
 #[cfg(not(unix))]
 pub async fn graceful_kill_pid(_pgid: u32, _grace: Duration) {
     // No-op on non-Unix; cancel is best-effort.
+}
+
+/// SIGKILL every process in group `pgid` now, without waiting or reaping.
+/// For a synchronous teardown (a `Drop`) of a child that leads its own group
+/// (`pre_exec_setsid`). A `pgid` that names no group is a no-op (ESRCH): a
+/// child that does not lead a group has no group with its pid as the id.
+#[cfg(unix)]
+pub(crate) fn kill_group_now(pgid: u32) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    if pgid > 1 {
+        let _ = killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL);
+    }
+}
+
+/// Non-Unix counterpart of the group kill: there are no process groups to
+/// signal, so this is the same best-effort no-op as [`graceful_kill_pid`]. On
+/// Windows the hard tree teardown is the Job Object backend's
+/// `TerminateJobObject` (`containment::windows`), not a signal.
+#[cfg(not(unix))]
+pub async fn graceful_kill_group(
+    _pgid: u32,
+    _expected_identity: Option<ChildIdentity>,
+    _grace: Duration,
+) {
 }
 
 /// Group-aware kill with an optional identity guard. If
@@ -448,6 +478,94 @@ fn identity_matches(expected: &ChildIdentity) -> IdentityCheck {
         (Some(want), Some(now)) if want != now => IdentityCheck::Reused,
         _ => IdentityCheck::Match,
     }
+}
+
+/// Whether the exact process `identity` names is still running: it exists, it
+/// is not a zombie, and (when a start time was captured) its pid has not been
+/// recycled. Used for the job DRIVER, the blut process executing a job, where
+/// "the pid exists" is not enough to say the job is alive.
+#[cfg(unix)]
+pub(crate) fn identity_alive(identity: &ChildIdentity) -> bool {
+    matches!(identity_matches(identity), IdentityCheck::Match) && !is_zombie(identity.pid)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn identity_alive(_identity: &ChildIdentity) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let state = stat.rsplit_once(')')?.1.split_whitespace().next()?;
+            Some(state == "Z")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_zombie(_pid: u32) -> bool {
+    false
+}
+
+/// Stop ONE process (not a group): SIGTERM, wait up to `grace` for it to
+/// exit, then SIGKILL. This is how `blut cancel` stops a job's driver, whose
+/// own SIGTERM handler cancels the executor and kills its trainer groups.
+/// Refuses to signal a recycled pid. `Err` only when the process cannot be
+/// signalled or outlives SIGKILL.
+#[cfg(unix)]
+pub(crate) async fn terminate_process(
+    identity: &ChildIdentity,
+    grace: Duration,
+) -> std::result::Result<(), String> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    if !identity_alive(identity) {
+        return Ok(());
+    }
+    let pid = Pid::from_raw(identity.pid as i32);
+    match kill(pid, Signal::SIGTERM) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(e) => return Err(format!("cannot signal pid {}: {e}", identity.pid)),
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if !identity_alive(identity) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tracing::warn!(
+        "pid {} ignored SIGTERM for {:?}, escalating to SIGKILL",
+        identity.pid,
+        grace
+    );
+    if identity_alive(identity) {
+        let _ = kill(pid, Signal::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !identity_alive(identity) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!("pid {} survived SIGKILL", identity.pid))
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn terminate_process(
+    identity: &ChildIdentity,
+    _grace: Duration,
+) -> std::result::Result<(), String> {
+    Err(format!(
+        "cannot stop pid {} on this platform; stop it from the terminal that started it",
+        identity.pid
+    ))
 }
 
 #[cfg(unix)]

@@ -114,22 +114,22 @@ async fn require_token(
 
 /// Authorise + audit a bridge mutation (`rbac::enforce`): the audit row is
 /// written for allow AND deny BEFORE anything is dispatched, and an audit
-/// write failure is itself a deny. Every bridge mutation targets the SHARED
-/// tenant — the web surface structurally cannot act on a restricted tenant
-/// (same posture as the read side, ADR 0061/0096).
+/// write failure is itself a deny. Every bridge mutation targets the
+/// `default` tenant, the one the launched `recipe run` runs under — the web
+/// surface structurally cannot act on a restricted tenant (same posture as the
+/// read side, ADR 0061/0096).
 #[allow(clippy::result_large_err)] // an axum Response IS the error surface here
 fn enforce_bridge(
     state: &AppState,
     principal: Option<&blut::rbac::Principal>,
     action: blut::rbac::Action,
 ) -> Result<(), Response> {
-    let shared = blut::tenant::Tenant::parse(blut::model_registry::SHARED_TENANT)
-        .expect("the shared tenant name parses");
+    let target = blut::tenant::Tenant::default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let decision = blut::rbac::enforce(principal, action, &shared, &state.audit_path, now);
+    let decision = blut::rbac::enforce(principal, action, &target, &state.audit_path, now);
     if decision.allowed {
         Ok(())
     } else {
@@ -351,14 +351,36 @@ async fn lineage_diff(
     }
 }
 
-async fn model_pointer(AxPath((name, alias)): AxPath<(String, String)>) -> Response {
-    // The web serves the SHARED tenant only — a restricted tenant's pointers
-    // never leave the box through this surface (ADR 0061/0096).
+#[derive(serde::Deserialize)]
+struct ModelQuery {
+    tenant: Option<String>,
+}
+
+/// `GET /api/models/{name}/{alias}[?tenant=<t>]` — the pointer's hash + audit
+/// trail. The tenant defaults to `default`, the tenant `blut model` writes to;
+/// records from the older `shared` default stay reachable with
+/// `?tenant=shared`. A restricted/clinical tenant is never exported: it gets
+/// the same 404 as an absent pointer (ADR 0061/0096), like the job views.
+async fn model_pointer(
+    AxPath((name, alias)): AxPath<(String, String)>,
+    Query(q): Query<ModelQuery>,
+) -> Response {
+    let tenant = match q.tenant.as_deref() {
+        None => blut::tenant::Tenant::default(),
+        Some(raw) => match blut::tenant::Tenant::parse(raw) {
+            Some(t) => t,
+            None => return err(StatusCode::BAD_REQUEST, "invalid tenant"),
+        },
+    };
+    if tenant.is_restricted() {
+        return err(StatusCode::NOT_FOUND, "no such pointer");
+    }
+    let tenant = tenant.to_string();
+    let tenant = tenant.as_str();
     let conn = match blut::model_registry::open() {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
-    let tenant = blut::model_registry::SHARED_TENANT;
     let resolved = match blut::model_registry::resolve_pointer(&conn, tenant, &name, &alias) {
         Ok(Some(h)) => h,
         Ok(None) => return err(StatusCode::NOT_FOUND, "no such pointer"),
@@ -371,6 +393,7 @@ async fn model_pointer(AxPath((name, alias)): AxPath<(String, String)>) -> Respo
         .collect::<Vec<_>>();
     Json(serde_json::json!({
         "pointer": format!("model://{name}@{alias}"),
+        "tenant": tenant,
         "hash": resolved,
         "history": history,
     }))
