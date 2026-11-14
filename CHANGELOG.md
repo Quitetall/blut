@@ -204,6 +204,9 @@ depend on this crate.
   mapped large files, as OOM bounds. `Containment` gains the defaulted methods
   `parse_oom_kill` and `read_oom_kills`.
 
+- **`plan resume` on Windows after a trainer died.** A checkpoint slot whose
+  trainer had exited was treated as busy until its heartbeat went stale,
+  because the engine could not probe a PID on Windows. It can now.
 - **The benchmark gate no longer fails on one noisy pass.**
   `scripts/run_benchmarks.sh` builds first and waits for the host's load to
   fall to `BLUT_BENCH_MAX_LOAD` before measuring, and `compare` fails only
@@ -216,6 +219,8 @@ depend on this crate.
   stage failed with "Permission denied". Probe names are now unique.
 
 ### Security
+- `quinn-udp` 0.5.16, for RUSTSEC-2026-0538 (a receive loop that can spin on a
+  truncated datagram).
 - `rusqlite` moves from 0.32 to 0.41, whose bundled SQLite fixes
   RUSTSEC-2026-0459 (uninitialized memory read through a crafted write-ahead
   log). A cookbook that depends on `rusqlite` directly must move with it.

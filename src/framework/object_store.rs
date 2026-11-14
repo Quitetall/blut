@@ -1028,7 +1028,7 @@ pub(crate) fn provider_from_url(
 }
 
 /// `a/b` + `c` → `a/b/c`, with either side allowed to be empty.
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 pub(crate) fn join_prefix(outer: &str, inner: &str) -> String {
     match (outer.trim_matches('/'), inner.trim_matches('/')) {
         ("", p) => p.to_string(),

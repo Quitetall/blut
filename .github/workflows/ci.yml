@@ -339,7 +339,7 @@ jobs:
     env:
       # The cookbook the plan pods run. Pinned: the e2e tests the operator and
       # the engine, not whatever the cookbook's branch head is today.
-      COOKBOOK_REF: 6918883b7bea9976e88df51ce306328470b36dbc
+      COOKBOOK_REF: 8213a8bae963916eae14bc3912b9aec10ac972e9
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:

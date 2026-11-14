@@ -655,7 +655,11 @@ pub(crate) fn pid_alive(pid: u32) -> Option<bool> {
             PidStatus::Gone
         ))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        Some(crate::scheduler_lock::pid_alive(pid))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         None

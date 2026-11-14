@@ -302,7 +302,7 @@ fn pid_alive(pid: u32) -> bool {
 /// is gone; any other open failure (e.g. access denied: it exists but belongs
 /// to someone else) counts as alive, so an unknown lock is never clobbered.
 #[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0,
     };
