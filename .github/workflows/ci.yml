@@ -384,6 +384,16 @@ jobs:
           load: true
           cache-from: type=gha,scope=blut-cookbook
           cache-to: type=gha,mode=max,scope=blut-cookbook
+      - name: Build the MinIO image
+        # MinIO withdrew its images; this builds the pinned release from source.
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: docker
+          file: docker/Dockerfile.minio
+          tags: blut-e2e/minio:2025-09-07
+          load: true
+          cache-from: type=gha,scope=blut-minio
+          cache-to: type=gha,mode=max,scope=blut-minio
       - name: kind end-to-end
         env:
           SKIP_BUILD: "1"

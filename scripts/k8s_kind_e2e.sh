@@ -67,9 +67,8 @@ CLUSTER="${KIND_CLUSTER:-blut-e2e}"
 OPERATOR_IMAGE="${OPERATOR_IMAGE:-blut-operator:e2e}"
 COOKBOOK_IMAGE="${COOKBOOK_IMAGE:-blut-cookbook:e2e}"
 HOLD_IMAGE="${COOKBOOK_IMAGE%%:*}-hold:e2e"
-# MinIO no longer publishes tagged images publicly; this digest is
-# RELEASE.2025-09-07T16-13-09Z, which also ships `mc`.
-MINIO_IMAGE_REF="minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+# MinIO no longer publishes images or binaries; docker/Dockerfile.minio
+# builds RELEASE.2025-09-07T16-13-09Z, with `mc`, from source.
 MINIO_IMAGE="blut-e2e/minio:2025-09-07"
 NODE_MEMORY="${NODE_MEMORY:-3g}"
 NS=blut-e2e
@@ -153,10 +152,9 @@ RUN printf '%s\n' '#!/bin/sh' \
 USER 65532:65532
 EOF
 docker buildx build --builder "$BUILDER" --load -q -t "$HOLD_IMAGE" -f "$WORK/Dockerfile.hold" "$WORK" > /dev/null
-docker image inspect "$MINIO_IMAGE" > /dev/null 2>&1 || {
-  docker pull -q "$MINIO_IMAGE_REF" > /dev/null
-  docker tag "$MINIO_IMAGE_REF" "$MINIO_IMAGE"
-}
+docker image inspect "$MINIO_IMAGE" > /dev/null 2>&1 \
+  || docker buildx build --builder "$BUILDER" --load -q -f "$REPO/docker/Dockerfile.minio" \
+    -t "$MINIO_IMAGE" "$REPO/docker" > /dev/null
 
 # ── cluster ─────────────────────────────────────────────────────────────────
 cat > "$WORK/kind.yaml" <<'EOF'

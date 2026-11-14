@@ -74,7 +74,10 @@ fn the_data_dir_isolates_every_store_and_unset_keeps_the_old_paths() {
     set("XDG_DATA_HOME", &home.join(".local/share"));
     set("XDG_CONFIG_HOME", &home.join(".config"));
 
-    // Unset: the historical defaults, byte for byte.
+    // Unset: the historical defaults, byte for byte. Only on Unix: there the
+    // defaults follow `HOME` and the XDG variables, which this test points
+    // into its temp dir. Windows resolves them from the user's known folders,
+    // which no environment variable moves.
     let legacy = stores();
     let expected_legacy: Vec<(&str, PathBuf)> = vec![
         ("jobs", home.join(".local/share/lamu/train-jobs")),
@@ -91,7 +94,9 @@ fn the_data_dir_isolates_every_store_and_unset_keeps_the_old_paths() {
         ("budget", home.join(".blut/budget.toml")),
         ("events", home.join(".blut/events/t")),
     ];
-    assert_eq!(legacy, expected_legacy);
+    if cfg!(unix) {
+        assert_eq!(legacy, expected_legacy);
+    }
 
     // Set: everything under the root, nothing under HOME.
     let root = td.path().join("install-a");
