@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""ADR 0139 P5 runtime fault-containment producer.\n\nEmits ONE fault-injection receipt as deterministic JSON on stdout. The realm\nunder fault is this file's stem; all fault producers are byte-identical. Each\ndrives an always-failing kernel through the real executor and records that\nthe failure was contained: no step completed and nothing was committed, so a\nfault can never leave a half-applied graph behind."""
+"""P5 runtime fault-containment producer (LamQuant graph program).\n\nEmits ONE fault-injection receipt as deterministic JSON on stdout. The realm\nunder fault is this file's stem; all fault producers are byte-identical. Each\ndrives an always-failing kernel through the real executor and records that\nthe failure was contained: no step completed and nothing was committed, so a\nfault can never leave a half-applied graph behind."""
 
 import json
 import subprocess

@@ -1,0 +1,7 @@
+# Accepted, reviewed breaks of the published API. Each line exempts ONE
+# finding of ONE lint against ONE baseline release, so an entry stops applying
+# as soon as that baseline is no longer the one compared against, and any other
+# break still fails the gate. Record why in CHANGELOG.md.
+#
+# crate	baseline	lint	item (as cargo-semver-checks prints it, before " in ")
+blut	0.2.0-alpha.1	enum_marked_non_exhaustive	enum WireMessage

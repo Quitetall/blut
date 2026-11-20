@@ -58,7 +58,7 @@ jobs:
       - name: Install MSRV toolchain (clippy + rustfmt)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
           components: clippy, rustfmt
 
       - name: Cache cargo registry + git + target
@@ -176,7 +176,7 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
-      # ADR 0139 / ADR 0034: the semantic-graph adapter is a SIDECAR (standalone
+      # ADR 0034: the LamQuant semantic-graph adapter is a SIDECAR (standalone
       # workspace) so the domain-agnostic engine carries no ABIR vocabulary and
       # no blut-graph-core code. Gate it or the adapter rots.
       - name: Build + lint + test blut-semantic (standalone workspace)
@@ -304,29 +304,111 @@ jobs:
           test -s "$plan"
           python -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['version']==1; assert len(d['nodes'])==5" "$plan"
 
-  operator-internal:
-    name: unpublished operator · Rust 1.89
+  operator:
+    name: operator · MSRV
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
-      - name: Install operator MSRV
+      - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
-          toolchain: 1.89.0
+          toolchain: 1.99.0
           components: clippy, rustfmt
-      - name: Gate unpublished operator
+      - name: Gate the operator
         working-directory: crates/blut-operator
         run: |
           cargo fmt --all -- --check
           cargo build --locked --all-targets
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+          cargo publish --dry-run --locked
+
+  # The operator on a real cluster: kind (one control plane, two workers),
+  # MinIO in the cluster, the shipped manifests, and the standard cookbook
+  # built against this engine checkout. scripts/k8s_kind_e2e.sh lists the
+  # fifteen checks, the last five driving `--launcher k8s` from the CLI.
+  operator-kind-e2e:
+    name: operator · kind end-to-end
+    needs: operator
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # The cookbook the plan pods run. Pinned: the e2e tests the operator and
+      # the engine, not whatever the cookbook's branch head is today.
+      COOKBOOK_REF: 8213a8bae963916eae14bc3912b9aec10ac972e9
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          repository: Quitetall/blut-cookbooks
+          ref: ${{ env.COOKBOOK_REF }}
+          path: cookbooks
+          persist-credentials: false
+      - name: Install pinned kind + kubectl
+        run: |
+          curl -fsSLo /tmp/kind https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
+          echo "eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  /tmp/kind" | sha256sum -c -
+          curl -fsSLo /tmp/kubectl https://dl.k8s.io/release/v1.36.2/bin/linux/amd64/kubectl
+          echo "1e9045ec32bea85da43de85f0065358529ea7c7a152eca78154fba5b58c27d82  /tmp/kubectl" | sha256sum -c -
+          sudo install /tmp/kind /usr/local/bin/kind
+          sudo install /tmp/kubectl /usr/local/bin/kubectl
+      # The two image builds dominate the job. Their layers are cached in the
+      # GitHub Actions cache, so a run whose engine, operator and cookbook
+      # inputs did not change reuses them; a change to one rebuilds only the
+      # image whose layers it touches.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build the operator image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/Dockerfile.operator
+          tags: blut-operator:e2e
+          load: true
+          cache-from: type=gha,scope=blut-operator
+          cache-to: type=gha,mode=max,scope=blut-operator
+      - name: Build the cookbook image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/Dockerfile.cookbook
+          build-contexts: |
+            engine=.
+            cookbook=cookbooks
+          tags: blut-cookbook:e2e
+          load: true
+          cache-from: type=gha,scope=blut-cookbook
+          cache-to: type=gha,mode=max,scope=blut-cookbook
+      - name: Build the MinIO image
+        # MinIO withdrew its images; this builds the pinned release from source.
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: docker
+          file: docker/Dockerfile.minio
+          tags: blut-e2e/minio:2025-09-07
+          load: true
+          cache-from: type=gha,scope=blut-minio
+          cache-to: type=gha,mode=max,scope=blut-minio
+      - name: kind end-to-end
+        env:
+          SKIP_BUILD: "1"
+          EVIDENCE_DIR: ${{ runner.temp }}/k8s-e2e
+        run: bash scripts/k8s_kind_e2e.sh
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: k8s-e2e-evidence
+          path: ${{ runner.temp }}/k8s-e2e
+          if-no-files-found: ignore
 
   macos-build:
-    name: macOS compile-check (containment degrades)
+    name: macOS · compile-check (containment RLIMIT_AS)
     # WEEKLY, not per-commit. macOS bills at 10x, and this job ran on every
     # push to main AND every pull request -- the single most expensive lane in
     # the fleet, for a check that only proves the crate still COMPILES on a
@@ -337,10 +419,10 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     timeout-minutes: 60
-    # blut is a Linux-first engine: the never-OOM cgroup containment needs
-    # Linux + systemd, and off-systemd it degrades to a bare spawn. This job
-    # only proves the crate COMPILES on a non-Linux Unix host (the realistic
-    # `cargo add blut` target) — it does not run the systemd-dependent tests.
+    # blut is a Linux-first engine: the cgroup containment needs Linux, and on
+    # macOS the `containment_for()` factory selects the RLIMIT_AS backend. This
+    # job only proves the crate COMPILES on a non-Linux Unix host (the
+    # realistic `cargo add blut` target) — it runs no containment tests.
     # Build-only (no `-D warnings`) so a macOS-specific lint can't mask the
     # compile signal.
     env:
@@ -352,7 +434,7 @@ jobs:
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
       - name: Cache cargo registry + git + target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -365,6 +447,53 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
       - name: Build (lib + all targets)
         run: cargo build --locked --workspace --all-targets
+
+  windows-build:
+    name: Windows · build · Job Object containment tests
+    # Per push and pull request, unlike the weekly macOS lane: this job is the
+    # only thing that EXECUTES the Windows Job Object backend, and a runtime
+    # containment guarantee that is checked weekly can sit broken on main for
+    # a week. Windows bills at 2x (macOS 10x). To demote it to the weekly
+    # sweep, copy the macOS job's `if:`.
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+      # The containment tests run real `python` children (allocation past the
+      # cap, a child that spawns a grandchild). Pinned, not "whatever the image
+      # ships", so a runner-image change cannot silently change the subject.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install MSRV toolchain (clippy)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      - name: Cache cargo registry + git + target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build (lib + all targets)
+        run: cargo build --locked --workspace --all-targets
+      - name: Clippy (deny warnings)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # The proof the Windows backend works: a 512 MiB allocation fails under a
+      # 128 MiB job cap and succeeds under a 2 GiB one, the peak covers what was
+      # committed, and both TerminateJobObject and closing the job kill a
+      # grandchild that was alive a moment before.
+      - name: Job Object containment tests
+        run: cargo test --locked --test windows_job_object -- --nocapture
+      - name: Test
+        run: cargo test --locked --workspace --no-fail-fast
 
   wasm32-keystone:
     name: blut-types wasm32 keystone (ADR 0083)
@@ -383,7 +512,7 @@ jobs:
       - name: Install MSRV toolchain + wasm32 target
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
           targets: wasm32-unknown-unknown
       - name: Cache cargo registry + git + target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -409,10 +538,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install Rust 1.88
+      - name: Install Rust 1.99
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Dependency policy
@@ -511,7 +640,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
           components: llvm-tools-preview
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -581,9 +710,9 @@ jobs:
         # library, and the runner image ships no pytest -- so `python -m pytest`
         # failed with "No module named pytest" on every run since the job
         # arrived, and the suites it names never executed in CI at all.
-        # `-m unittest` runs the same 27 tests with nothing to install.
+        # `-m unittest` runs the same tests with nothing to install.
         working-directory: tools
-        run: python -m unittest -v test_check_blut_release_state test_check_blut_i4_evidence
+        run: python -m unittest -v test_check_blut_release_state test_check_blut_i4_evidence test_bench_regression_gate
       - name: The release-state checker still runs and still reports
         # NOT a pass/fail gate on the release itself -- see above. It asserts
         # that the command executes against the committed catalog and produces

@@ -144,25 +144,57 @@ pub fn job_failure(job_id: &str) -> Result<JobFailureLookup> {
                 continue;
             }
         };
-        if let StageEvent::StageFailed {
-            node_idx,
-            stage_name,
-            error,
-            failure,
-        } = ev
-        {
-            last = Some(JobFailure {
+        match ev {
+            StageEvent::StageFailed {
                 node_idx,
-                stage: stage_name,
+                stage_name,
                 error,
                 failure,
-            });
+            } => {
+                last = Some(JobFailure {
+                    node_idx,
+                    stage: stage_name,
+                    error,
+                    failure,
+                });
+            }
+            // `plan resume` appends a new attempt to the same log. A failure
+            // whose node later completes (re-run or cache hit) was recovered
+            // from, so it is not the job's terminal failure.
+            StageEvent::StageEnd { node_idx, .. } | StageEvent::StageSkipped { node_idx, .. }
+                if last.as_ref().is_some_and(|f| f.node_idx == node_idx) =>
+            {
+                last = None;
+            }
+            _ => {}
         }
     }
     Ok(JobFailureLookup {
         failure: last,
         parse_errors,
     })
+}
+
+/// Nodes whose artifact this job served from cache without producing it: a
+/// `stage_skipped` and no `stage_end` for the node anywhere in the job's log
+/// (a node that ran in an earlier attempt of the same job and was a cache hit
+/// on `plan resume` was still produced by this job).
+pub(crate) fn reused_nodes(job_id: &str) -> Result<std::collections::BTreeSet<u32>> {
+    let id = jobs::resolve_job_id(job_id)?;
+    let mut skipped = std::collections::BTreeSet::new();
+    let mut ended = std::collections::BTreeSet::new();
+    for line in jobs::read_status_lines(&id)? {
+        match serde_json::from_str::<StageEvent>(&line) {
+            Ok(StageEvent::StageSkipped { node_idx, .. }) => {
+                skipped.insert(node_idx);
+            }
+            Ok(StageEvent::StageEnd { node_idx, .. }) => {
+                ended.insert(node_idx);
+            }
+            _ => {}
+        }
+    }
+    Ok(skipped.difference(&ended).copied().collect())
 }
 
 /// Fold a job's `status.jsonl` `StageStep` events into metric rows for the
@@ -511,6 +543,98 @@ mod tests {
                 None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
             }
         }
+    }
+
+    /// The index tells a job that produced an artifact from one that served
+    /// it from cache; a node produced in an earlier attempt of the same job
+    /// and skipped on resume was still produced by this job.
+    #[test]
+    fn reused_nodes_are_skipped_and_never_ended_in_the_job() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path());
+        }
+        let job = "20261030-000000-000000001";
+        let jdir = td.path().join(job);
+        std::fs::create_dir_all(&jdir).unwrap();
+        let lines = [
+            // node 0: a cache hit; node 1: produced, then a cache hit on resume
+            r#"{"kind":"stage_skipped","node_idx":0,"stage_name":"a","invocation_key":"HASH"}"#,
+            r#"{"kind":"stage_end","node_idx":1,"stage_name":"b","content_id":"HASH","elapsed":{"secs":1,"nanos":0}}"#,
+            r#"{"kind":"stage_skipped","node_idx":1,"stage_name":"b","invocation_key":"HASH"}"#,
+            r#"{"kind":"stage_end","node_idx":2,"stage_name":"c","content_id":"HASH","elapsed":{"secs":1,"nanos":0}}"#,
+        ]
+        .map(|l| l.replace("HASH", "abababababababababababababababababababababababababababababababab"));
+        std::fs::write(jdir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
+        let reused = reused_nodes(job);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+        assert_eq!(reused.unwrap().into_iter().collect::<Vec<_>>(), [0]);
+    }
+
+    /// `blut errors show` on a job that failed and was then resumed to
+    /// completion reported the first attempt's failure as the terminal one,
+    /// next to `outcome : done`.
+    #[test]
+    fn a_failure_recovered_by_a_resume_is_not_terminal() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path());
+        }
+        let write = |job: &str, lines: &[&str]| {
+            let jdir = td.path().join(job);
+            std::fs::create_dir_all(&jdir).unwrap();
+            std::fs::write(jdir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
+        };
+        let failed = r#"{"kind":"stage_failed","node_idx":1,"stage_name":"b","error":"boom"}"#;
+        write(
+            "20261023-000000-000000001",
+            &[
+                failed,
+                r#"{"kind":"stage_begin","node_idx":1,"stage_name":"b","input_hash":"abababababababababababababababababababababababababababababababab"}"#,
+                r#"{"kind":"stage_end","node_idx":1,"stage_name":"b","content_id":"abababababababababababababababababababababababababababababababab","elapsed":{"secs":1,"nanos":0}}"#,
+            ],
+        );
+        write(
+            "20261023-000000-000000002",
+            &[
+                failed,
+                r#"{"kind":"stage_skipped","node_idx":1,"stage_name":"b","invocation_key":"abababababababababababababababababababababababababababababababab"}"#,
+            ],
+        );
+        // A different node completing does not clear the failure.
+        write(
+            "20261023-000000-000000003",
+            &[
+                failed,
+                r#"{"kind":"stage_skipped","node_idx":0,"stage_name":"a","invocation_key":"abababababababababababababababababababababababababababababababab"}"#,
+            ],
+        );
+        let recovered = job_failure("20261023-000000-000000001").unwrap();
+        let cached = job_failure("20261023-000000-000000002").unwrap();
+        let still_failed = job_failure("20261023-000000-000000003").unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+        assert_eq!(recovered.parse_errors + cached.parse_errors, 0);
+        assert!(recovered.failure.is_none());
+        assert!(cached.failure.is_none());
+        assert_eq!(still_failed.failure.map(|f| f.node_idx), Some(1));
     }
 
     /// `blut errors show` (ADR 0072 A4) reads exactly this: a terminal

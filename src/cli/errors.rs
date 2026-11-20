@@ -11,11 +11,10 @@ use super::*;
 
 #[derive(Subcommand, Debug)]
 pub(super) enum ErrorsCommand {
-    /// List every registered `ErrorDomain` catalog (ADR 0072 A4). A
-    /// cookbook registers one via `register_error_domain!`; none does
-    /// today (a later cookbook-side workflow adds the first), so this
-    /// prints "no error domains registered" instead of assuming a
-    /// catalog exists.
+    /// List every registered `ErrorDomain` catalog (ADR 0072 A4): the
+    /// engine's built-in `checks` domain plus any a cookbook registers via
+    /// `register_error_domain!`. Prints "no error domains registered" when
+    /// there are none.
     List {
         /// Emit the catalog as JSON (for scripts/agents).
         #[arg(long)]

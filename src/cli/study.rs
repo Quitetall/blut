@@ -9,8 +9,8 @@
 //! [`StudySpec`] into the HPO command that already exists, then reads the trial
 //! stream back with every declared objective instead of one.
 //!
-//! Reusing the execution path rather than cloning it is the point: ADR 0092
-//! invariant 4 is that CLI, TUI, local and remote resolve operations through
+//! Reusing the execution path rather than cloning it is the point: the module-ownership
+//! invariant is that CLI, TUI, local and remote resolve operations through
 //! ONE application module, and a second launcher here would drift from
 //! `blut hpo run` on retries, admission and cancellation semantics — the exact
 //! failure that invariant exists to prevent.

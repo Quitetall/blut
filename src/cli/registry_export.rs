@@ -27,7 +27,7 @@
 //!
 //! The args schema is the recipe's OWN `args_schema_fn`, not a re-description
 //! of it. A second hand-written description of the same arguments is exactly
-//! the drift ADR 0092 invariant 2 forbids — one canonical owner per contract.
+//! the drift the module-ownership rule forbids — one canonical owner per contract.
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -41,6 +41,11 @@ pub(super) enum RegistryCommand {
         /// Pretty-print instead of one dense line.
         #[arg(long, default_value_t = false)]
         pretty: bool,
+        /// Accepted for consistency with the other `--json` commands (and
+        /// ADR 0111, which documents `blut registry export --json`). The
+        /// output is always JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -169,7 +174,7 @@ pub fn build_manifest(reg: &crate::framework::Registry) -> RegistryManifest {
 
 pub(super) fn run_registry(reg: &crate::framework::Registry, cmd: RegistryCommand) -> Result<()> {
     match cmd {
-        RegistryCommand::Export { pretty } => {
+        RegistryCommand::Export { pretty, json: _ } => {
             let manifest = build_manifest(reg);
             let body = if pretty {
                 serde_json::to_string_pretty(&manifest)?
@@ -193,7 +198,7 @@ mod tests {
         let cli = Cli::try_parse_from(["blut", "registry", "export"]).expect("parse");
         match cli.command {
             Some(Command::Registry {
-                cmd: RegistryCommand::Export { pretty },
+                cmd: RegistryCommand::Export { pretty, .. },
             }) => assert!(!pretty, "dense by default — it is machine input"),
             other => panic!("expected registry export, got {other:?}"),
         }
@@ -201,7 +206,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Registry {
-                cmd: RegistryCommand::Export { pretty: true }
+                cmd: RegistryCommand::Export { pretty: true, .. }
             })
         ));
     }
@@ -294,5 +299,12 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn registry_export_accepts_json() {
+        // E2E regression: `blut registry export --json` (the spelling ADR 0111
+        // documents) was rejected as an unexpected argument.
+        assert!(Cli::try_parse_from(["blut", "registry", "export", "--json"]).is_ok());
     }
 }

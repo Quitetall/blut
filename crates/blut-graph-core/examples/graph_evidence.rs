@@ -275,7 +275,7 @@ fn main() {
         );
     }
 
-    // ADR 0139/0142 blocker #1: drive the authorized MCU plan through the
+    // Graph-program blocker #1: drive the authorized MCU plan through the
     // distinct, allocation-free `StaticExecutor` over caller-owned arenas. This
     // is the firmware-realm counterpart to the host `PlanExecutor`; both execute
     // the identical canonical plan to the same terminal value.
@@ -351,7 +351,7 @@ fn main() {
         },
         // What the P1 graph-core stage certifies: blut-graph-core is the
         // domain-neutral compiler + canonical plan + reference/static executors
-        // (ADR 0139 module ownership). Every item below is exercised above.
+        // (module ownership: graph-core owns no domain). Every item below is exercised above.
         "graph_core_scope_resolved": [
             "deterministic-canonical-compilation",
             "cross-realm-plan-identity",
@@ -362,7 +362,7 @@ fn main() {
             "identity-bound-hierarchical-composition"
         ],
         // Real per-realm RUNTIME execution is owned by lamquant-runtime and
-        // certified by the P5 runtime gate (ADR 0139 P5), not by the P1
+        // certified by that runtime's own P5 gate, not by the P1
         // graph-core artifact. These are not gaps in the compiler.
         "deferred_to_runtime_stage_p5": [
             "real-host-io-execution",

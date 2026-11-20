@@ -10,7 +10,7 @@ name = "blut-types"
 version = "0.2.0-alpha.2"
 edition = "2024"
 # Keep one tested MSRV across the public 0.2 preview crates.
-rust-version = "1.88"
+rust-version = "1.99"
 publish = ["crates-io"]
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"

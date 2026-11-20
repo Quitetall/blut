@@ -50,6 +50,8 @@ pub struct Coordinator {
     /// Strictly increasing fence for every assignment, including re-use of one
     /// peer after a prior lease or connection is abandoned.
     generation: Arc<AtomicU64>,
+    /// The accept loop, so a shutdown can confirm it stopped.
+    accept_task: tokio::task::JoinHandle<()>,
 }
 
 impl Coordinator {
@@ -66,7 +68,7 @@ impl Coordinator {
         // Spawn the accept loop.
         let server_c = server.clone();
         let connections_c = connections.clone();
-        tokio::spawn(async move {
+        let accept_task = tokio::spawn(async move {
             Self::accept_loop(server_c, connections_c).await;
         });
 
@@ -76,6 +78,7 @@ impl Coordinator {
             keypair,
             connections,
             generation: Arc::new(AtomicU64::new(0)),
+            accept_task,
         })
     }
 
@@ -141,11 +144,24 @@ impl Coordinator {
                         }
                     });
                 }
+                // A closed endpoint is terminal: `accept_peer` then fails at
+                // once without yielding, so continuing here spun a worker
+                // thread forever, flooded the log, and kept the process from
+                // exiting after Ctrl-C.
+                Err(e) if server.is_endpoint_closed() => {
+                    tracing::debug!("P2P accept loop stopped: {e}");
+                    return;
+                }
                 Err(e) => {
                     tracing::warn!("P2P accept error: {e}");
                 }
             }
         }
+    }
+
+    /// Whether the accept loop has stopped (it stops once the endpoint closes).
+    pub fn accept_loop_stopped(&self) -> bool {
+        self.accept_task.is_finished()
     }
 
     /// Shut down the coordinator.
@@ -158,6 +174,31 @@ impl Coordinator {
             tracing::warn!("P2P coordinator shutdown could not immediately lock peer sessions");
         }
         self.server.shutdown();
+    }
+
+    /// Shut down in order: send every connected peer `Goodbye` (concurrently,
+    /// each bounded by [`CLOSE_DRAIN_TIMEOUT`](crate::p2p::transport::CLOSE_DRAIN_TIMEOUT)),
+    /// close, and wait (bounded) for the close frames to go out. Without this a
+    /// process that exits right after [`shutdown`](Self::shutdown) can lose the
+    /// CONNECTION_CLOSE, and its workers then wait out the idle timeout.
+    pub async fn shutdown_gracefully(&self) {
+        let conns: Vec<quinn::Connection> = self
+            .connections
+            .read()
+            .await
+            .values()
+            .map(|session| session.conn.clone())
+            .collect();
+        futures::future::join_all(
+            conns
+                .iter()
+                .map(|conn| crate::p2p::transport::end_session(conn, "coordinator shutdown")),
+        )
+        .await;
+        self.shutdown();
+        self.server
+            .drain(crate::p2p::transport::CLOSE_DRAIN_TIMEOUT)
+            .await;
     }
 
     /// Apply a reputation update in memory and try to persist the peer
@@ -578,6 +619,39 @@ impl ExecutionAdapter for Coordinator {
 mod tests {
     use super::*;
     use crate::p2p::crypto::KeyPair;
+
+    /// Regression: after shutdown the accept loop spun on "QUIC endpoint
+    /// closed" without yielding, so `blut p2p serve` never exited on Ctrl-C.
+    /// Multi-thread so a spinning loop cannot also starve this test's timer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_loop_stops_after_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
+        let dispatch: Arc<dyn DispatchPolicy> =
+            Arc::new(crate::p2p::dispatch::DefaultDispatchPolicy::new(
+                crate::p2p::trust::DispatchMatrix::default(),
+            ));
+        let coordinator = Coordinator::start(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(KeyPair::generate()),
+            dispatch,
+            peers,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(crate::TEST_HANG_GUARD, coordinator.shutdown_gracefully())
+            .await
+            .expect("graceful shutdown is bounded");
+        let mut stopped = false;
+        for _ in 0..100 {
+            if coordinator.accept_loop_stopped() {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(stopped, "accept loop must stop once the endpoint is closed");
+    }
     use crate::p2p::peer::PeerCapabilities;
     use crate::p2p::trust::TrustLevel;
 

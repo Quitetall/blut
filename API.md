@@ -44,17 +44,55 @@ BLUT-owned widgets.
 | Item | Role |
 |---|---|
 | `framework::stage::{Stage, StageContext, StageExecutionBoundary, StageError, StageEvent}` | a typed `Input → Output` unit of work + its run context |
+| `framework::stage::StagePlacement`, `Stage::placement` | whether an invocation may run on another machine (`LocalOnly` by default, or `remote(DataClassification)`); the only thing that sends a stage to a peer |
 | `framework::compat::Compatible<B>` | compile-time gate: a stage may only join a `Plan<_, B>` it is `Compatible` with |
 | `framework::artifact::{Artifact, ArtifactMetadata, ContentHash}` | typed handle to on-disk bytes, content-hashed |
 | `framework::plan::{Plan, CompiledPlan, NodeId, PlanError}` | the typed DAG builder (`.start().then().finish().into_compiled()`) |
 | `framework::executor::{ExecCtx, SequentialExecutor, ParallelExecutor, PlanResult, execute_plan}` | run a `CompiledPlan` with per-`Resource` + memory-admission semaphores |
 | `framework::async_io::{TrainingIoCandidate, TrainingIoHints, TrainingIoProfile, IoMode}` | checked, execution-only retained-I/O admission selected once before execution |
-| `framework::cache::{CacheHandle, CacheHit, lru_prune}` | `(stage, schema, input_hash, args_hash)` → output |
+| `framework::cache::{CacheHandle, CacheHit, lru_prune}` | `(stage, schema, input_hash, args_hash, code identity)` → output |
+| `framework::code_identity::{BuildIdentity, CodeIdentity, install, current}`, `cookbook_identity!` | the engine and cookbook builds every cache key folds |
+| `framework::stage_checkpoint::{CheckpointSlot, collect_slots, …}` | mid-stage checkpoint slots (CONTRACT.md §8) and their collection |
 | `framework::resource::Resource` | `Gpu \| Cpu \| Network \| Disk` capacity declarations |
 | `framework::retry::{RetryPolicy, Backoff, RetryOn, StageTimeout, RetryHook}` | per-stage retry / timeout / backoff |
 | `framework::status::{StatusHub, StageEvent, make_broadcast, spawn_status_writer, spawn_status_writer_checked}` | the `status.jsonl` event stream; the checked writer surfaces flush failures |
 | `framework::cookbook::{Cookbook, Registry, StageDescriptor, ArtifactDescriptor}` | the domain-pack seam |
 | `framework::graph::{PlanGraph, GraphSnapshot, NodeStatus, graph_snapshot}` | DAG inspection |
+
+### Cache identity
+
+A stage's cache key is `(stage name, SCHEMA, input content, canonical args,
+code identity, optional code_fingerprint, optional partition)`. The code
+identity is the engine build (name, version, git commit, digest of uncommitted
+changes) plus the build of every cookbook the binary registered, so a cookbook
+change re-runs its stages even when no `SCHEMA` moved. A cookbook supplies its
+build from `Cookbook::identity`:
+
+```rust
+fn identity(&self) -> Option<blut::framework::code_identity::BuildIdentity> {
+    Some(blut::cookbook_identity!())
+}
+```
+
+`cookbook_identity!` reads the cookbook crate's `CARGO_PKG_NAME` and
+`CARGO_PKG_VERSION` and two variables its `build.rs` sets with
+`cargo:rustc-env`:
+
+| Variable | Value |
+|---|---|
+| `BLUT_COOKBOOK_COMMIT` | the last git commit that touched the cookbook's source; empty without git |
+| `BLUT_COOKBOOK_DIRTY` | a digest of the uncommitted changes (tracked diff and untracked files) in that source; empty when clean |
+
+Without git (a crates.io build) the identity is the name and version. A build
+from a dirty tree keys differently from the clean build and from every other
+dirty state, and the same as a rebuild of the same changes. The standard
+cookbooks' `build.rs` shows the whole recipe. The identity is per binary:
+every stage key folds every registered cookbook, so a change to any of them
+re-runs every stage of that binary. `cli::run` installs the identity before
+it computes any key and warns about a registered cookbook that supplies none;
+a program that executes plans without `cli::run` keys on the engine alone
+unless it calls `code_identity::install` first. Checkpoint slots are keyed by
+the cache key, so they follow.
 
 `StageExecutionBoundary` is fail-closed optimizer metadata. Its default is
 `Opaque`, so an existing or third-party cookbook stage continues to run as an
@@ -131,6 +169,44 @@ result, including when it must be aggregated with an existing stage failure.
 A `RecipeDef` carries `name`, `description`, `backend_id`, `category`,
 `input_kinds`, `output_kind`, an args JSON-schema fn, and a compile fn that
 parses args → a backend-erased `CompiledPlan`.
+
+## Built-in checks (`checks/`, ADR 0091)
+
+Every registry gets two passthrough guard stages: `check_jsonl` (row-count
+bounds, and optionally a per-row schema and required fields) and `assert` (a
+literal scalar predicate). Both take and return
+`checks::JsonlArtifact`, kind `checks.jsonl`, and edges kind-check by exact
+kind, so a check cannot follow a stage that emits a cookbook's own JSONL kind
+(the standard cookbook's `dataset.jsonl`, for example). Emit `JsonlArtifact`
+from the producing stage, or add an adapter stage whose `run` returns
+`JsonlArtifact::from_file(&input.path)`; the module docs carry a compiled
+example. `assert` compares the `actual` value in its args; the engine does not
+feed a stage's emitted metrics into it.
+
+`check_jsonl` args (`checks::CheckJsonlLinesArgs`, the args of the registered
+stage `checks::CheckJsonlLines`), all optional:
+
+| Arg | Meaning |
+|---|---|
+| `min_rows`, `max_rows` | inclusive bounds on the count of non-blank lines |
+| `schema` | field name → rule: a type name (`string`, `number`, `integer`, `boolean`, `object`, `array`, `null`) or `{"type", "nullable", "optional"}` (`checks::{FieldSpec, FieldType}`); set, even to `{}`, every row must be a JSON object |
+| `required_fields` | keys every row must carry, non-null unless `schema` allows null for that field |
+| `max_reported` | rows each breach code names in its message (default 10, at most 1000; every breaching row is counted) |
+| `on_breach` | `block` (default, fail-closed) or `warn` (record and pass through) |
+
+A breach names the 1-based physical line and the field, never row contents.
+Codes: `DATA_QUALITY_MIN_ROWS`, `DATA_QUALITY_MAX_ROWS`,
+`DATA_QUALITY_INVALID_JSON` (not JSON, or not UTF-8),
+`DATA_QUALITY_MISSING_FIELD` (absent, or null where null is not allowed),
+`DATA_QUALITY_SCHEMA` (not an object, or a wrong type); `blut errors list`
+shows them and `blut checks report <job>` lists each breach. Without
+`schema` and `required_fields` no line is parsed, so row-count-only args
+behave as they always have. Bad line-check args (an unknown type, an empty or
+repeated field name, an unknown rule key) are refused when the plan is built.
+The `checks` module docs give the full rules. `checks::CheckJsonl` and
+`checks::CheckJsonlArgs` remain as the published row-count form for Rust
+callers. ADR 0091's `check_tensor_stats` is not shipped: the engine has no
+tensor artifact type for it to check.
 
 ## Declared recipes: `.toml` / `.json` / `.star` (ADR 0078)
 
@@ -239,7 +315,56 @@ Native, in-tree **Hydra-style config compose** (`config::hydra` —
 freezes a composed tree to JSON + a content fingerprint; `config::sweep` expands
 + fingerprints each combo. The `Launcher` trait (`LocalSystemd` now; `Slurm` /
 `RayJobSubmit` are present but deferred) builds the OS command, optionally inside
-a resource-capped systemd unit.
+a resource-capped systemd unit. `LaunchTarget::P2P` and `LaunchTarget::Cloud`
+have no `Launcher`: stages reach peers or the cloud queue only through an
+`ExecutionAdapter` installed with `ExecCtx::with_execution_adapter` (feature
+`p2p`), and the executor refuses either target without one. `recipe run` and
+`recipe declare --run` install the mesh adapter for `--launcher p2p` (below);
+`recipe run`, `recipe declare --run` and `plan resume` install the cloud
+adapter (see [Cloud dispatch](#cloud-dispatch)). `hpo`, `study` and `partition`
+refuse both launchers, and `plan resume` refuses `--launcher p2p`.
+
+### Mesh dispatch (`p2p::mesh_exec`, feature `p2p`)
+
+`recipe run <name> --launcher p2p --p2p-seed <addr@pubkey>` joins the `p2p
+node` mesh with this machine's identity (`<data_dir>/p2p/identity.key`, or
+`--p2p-key`), lets gossip find the rest, and installs
+`MeshExecutionAdapter` on the plan. Which stages leave is the stage's own
+declaration, `Stage::placement(&args)`; the executor asks
+`DispatchPolicy::remote_class`, whose default returns that declaration's data
+class, or `None` for a local-only stage or restricted data. A stage that does
+not leave runs on the submitting machine in the same plan, and the decision is
+logged. A stage that leaves goes to a connected peer that answers on the stage
+plane, runs the same `CodeIdentity`, accepts work from the submitter
+(`p2p node --coordinator-pubkey`), holds the trust its data class needs under
+the `DispatchMatrix` (`blut p2p peers trust`), and has the declared cores and
+memory; among those the fewest in flight, then the least used. A stage that
+needs a GPU is not placed: workers have no GPU admission yet. If none
+appears within `--p2p-peer-wait` seconds (default 60) the attempt fails as
+`EXECUTION_UNAVAILABLE` and, under `--launcher p2p`, so does the run: an
+eligible stage is never run on the submitting machine instead. Inputs and
+outputs move over the object plane (`MeshObjects`), granted per peer and
+verified chunk by chunk and as a whole; the executor restores and re-verifies
+the output before anything downstream reads it.
+
+`MeshStageWorker` is the worker side, attached with
+`MeshNode::set_stage_worker` (`blut p2p node` does this). It refuses a
+submitter it was not told to accept, a dispatch whose signature does not
+verify, a submitter whose code identity digest differs from its own, an
+unknown stage, a stage its own build declares local-only, and work beyond its
+slots (`--max-tasks`) or memory admission. It runs the stage with a
+local-placement `StageContext`, so processes a stage starts are contained as on
+the submitting machine. The submitter keeps the stage's stream open while it
+runs; a cancel message, a closed connection, or the QUIC idle timeout on a
+silent one cancels the stage on the worker. `blut cancel <job>` reaches it
+that way.
+
+Outcomes count in the submitter's peer registry (`MeshNode::record_peer_outcome`:
+completed and failed tasks, local reputation), which is saved off the async
+path. Library callers build the same thing from a `MeshNode`, its
+`MeshObjects`, a `KeyPair` and a `DispatchPolicy`:
+`MeshExecutionAdapter::new(..).with_peer_wait(..)`, then
+`ExecCtx::with_launch_target(LaunchTarget::P2P).with_execution_adapter(..)`.
 
 `config::tenants::TenantQuotaPolicy` loads `$BLUT_TENANTS_CONFIG` or
 `~/.config/blut/tenants.toml`. One file chooses either static equal shares:
@@ -264,7 +389,10 @@ fractions, mixed modes, and unknown launch tenants.
 
 `broker::{decide, Footprint, FootprintStore}` size a per-stage RAM footprint,
 gate admission against the box-fit budget (`MemTotal − floor`), and calibrate
-the estimate from measured peaks (with an OOM-aware self-heal). This is the
+the estimate from measured peaks (with an OOM-aware self-heal). The engine
+reads the measured-peak store at admission; a cookbook runner that measures
+its child's peak writes it (`FootprintStore::record`), so an engine-only
+cookbook is billed its declared estimate. This is the
 engine behind the containment guarantee: a job that wouldn't fit is refused,
 not admitted-then-killed. The declarative surface is
 `Stage::resource_envelope` → `blut_types::envelope::ResourceEnvelope`
@@ -323,7 +451,8 @@ names resolved only at send time.
 
 ## CLI (`cli`)
 
-`blut::cli::run(registry: Registry).await` — the public entry point. A
+`blut::cli::run(registry: Registry).await` — the public entry point
+(`blut::cli::run_from(registry, args)` takes the command line explicitly). A
 cookbook binary supplies its `Registry` and delegates the whole CLI to it
 (`recipe`, `jobs`, `log`, `cancel`, `plan`, `cache`, `footprint`, `partition`,
 `schedule`, `sensor`, `policy`, …). The cockpit lives in the `crates/blut-tui`
@@ -348,9 +477,27 @@ recursively before cookbook-defined typed args are deserialized. Dataset
 handles become a live hash-verified local path, model handles become the
 immutable checkpoint hash, and experiment handles become the tenant-scoped run
 id. Restricted dataset/model handles refuse every non-local launcher. Model
-commands default to the same `default` tenant as recipe launches; records made
-under the older `shared` default remain reachable with explicit `--tenant
-shared`.
+and plan commands default to the same `default` tenant as recipe launches;
+records made under the older `shared` default remain reachable with explicit
+`--tenant shared`.
+
+State locations: with `$LAMU_TRAIN_DATA_DIR` set, every store of user state
+(jobs, stage cache, registries, dataset and catalog databases, policy,
+footprints, partitions, tenant and recipe config, and the `~/.blut` files)
+lives under that one directory, so two values are two independent installs.
+A store's own variable (`LAMU_TRAIN_JOBS_DIR`, `BLUT_REGISTRY_DB`, …) takes
+precedence; unset, every path is the historical default. `blut::paths` lists
+each store, its variable and its location. When the variable is set, a store
+whose own variable is unset, that is empty under the root, and whose old
+default location holds data is stranded: `blut` warns once per invocation and
+names the variable to set (`BLUT_REGISTRY_DB=~/.blut/registry.db`, …);
+`paths::stranded_stores` returns the same list to a cookbook.
+
+`blut hpo run` and `blut study run` isolate trial failures: a failed trial is
+recorded with its error and the search continues; the job fails only when no
+trial completes with the objective. Trials a policy spawns while the search
+runs (TPE and surrogate suggestions, PBT clones) are written to `hpo.json` as
+they start and are ranked with the initial population.
 
 `blut partition define` persists a finite set from repeatable `--dim
 axis=v1,v2` flags or a WASM-safe `PartitionSpec` JSON (`time`, `categorical`,
@@ -367,14 +514,110 @@ without blocking unrelated safe selector targets.
 
 Containment (per-stage systemd-cgroup `MemoryMax`) requires **Linux + systemd**.
 Off-systemd, `LocalSystemd::wrap` degrades to a bare spawn with a warning;
-`BLUT_NO_CONTAIN=1` forces it. The crate compiles on macOS (containment off);
-Windows is unsupported.
+`BLUT_NO_CONTAIN=1` forces it. The crate compiles on macOS (containment off).
+On Windows the `containment_for()` factory selects the Job Object backend
+(`containment::windows`), which caps the tree's committed memory and kills the
+tree on cancel; a caller must spawn through `containment::spawn_attached` (or
+call `Containment::after_spawn`). A local stage is contained on any host by
+`LocalSystemd::spawn_contained`, which applies the launcher's caps through
+`containment_for()` and returns a `containment::ContainedChild` (peak after
+exit, `kill_tree`, `wait_or_cancel`; the tree never outlives it). On Linux
+that is a transient `systemd-run --user` service with `MemoryMax` (systemd 250
+or later; the stage keeps the caller's environment), else a delegated cgroup-v2
+leaf, else `rlimit` with no cap; one log line names the backend.
+`LocalSystemd::wrap` and `launch` stay bare on Windows: a Job Object is not a
+wrapper command.
+
+A systemd unit is stopped with SIGTERM and, 10 s later, SIGKILL
+(`TimeoutStopSec=10s`, the same grace as `rlimit`/`bare` and `blut cancel`).
+It is also the one placement that survives a SIGKILL of the BLUT process that
+started it (its direct child is only the `systemd-run` client). So, like a
+Slurm job name, the unit is recorded with the job: `spawn_contained` called
+inside a job (`jobs::in_job`; the executor runs every local stage attempt in
+one) appends the unit name to `<job dir>/systemd_units` before the process
+starts and sets its description to `blut job <job id>`. `blut cancel <job>`
+stops every recorded unit still running for the job (`jobs::cancel_systemd_units`),
+also after its BLUT process died, and prints what it stopped; `plan resume`
+refuses while one runs (`jobs::resume_blocker`). Units that have stopped, or
+whose description names another job, are ignored. A stage that spawns from a
+task of its own wraps that task in `jobs::in_job` too: a task-local does not
+reach a spawned task. Recording is best-effort (a failed write is logged).
 
 ---
 
+### Cloud dispatch
+
+`recipe run <name> --launcher cloud` and `recipe declare <file> --run
+--launcher cloud` run a recipe's stages on `blut cloud worker` processes that
+poll a durable queue (feature `cloud`, plus `s3` for a bucket).
+
+```sh
+# on each worker, in any binary with the same cookbooks at the same build
+AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=auto AWS_ENDPOINT=https://… \
+  blut cloud worker --queue s3://bucket/prefix
+# on the submitter, with the same AWS_* variables
+BLUT_CLOUD_QUEUE=s3://bucket/prefix blut recipe run my_recipe --launcher cloud
+```
+
+- **Location.** `BLUT_CLOUD_QUEUE` / `--queue`: `s3://bucket[/prefix]`,
+  `file:///dir` or a directory. Credentials and the endpoint come from the
+  `AWS_*` environment only, never a flag, the URL, a job record or a queue
+  object. The endpoint must support conditional writes (AWS S3, Cloudflare R2
+  and MinIO do; Backblaze B2 does not and is refused). A stage runs in the
+  worker's process tree, so it can read the worker's environment: give workers
+  a token scoped to the queue's bucket.
+- **Queue.** `cloud::object_queue::ObjectQueue` keeps each job as an append-only
+  log, `<prefix>/cloud/queue/v1/jobs/<id>/log/<seq>`. Every transition is a
+  create-only write of the next slot, so whoever fills it first decides: a
+  claim, a completion, a cancellation. The slot of a claim is the assignment
+  generation. Leases are renewed by the holder at a third of their length and
+  need no writer to expire; a late completion finds its slot taken and is
+  refused. Input and output bundles are content-addressed objects beside it.
+  Host clocks must agree to well within a lease; a clock error moves when a dead
+  worker's stage is requeued, and cannot let two completions land.
+- **Every stage is dispatched.** Nothing runs on the submitting machine, and a
+  stage the adapter cannot take fails the run naming the reason: its input has
+  a file outside the job directory, or it was admitted with a training I/O
+  profile. A cache hit runs nothing. A restricted tenant is refused before
+  anything is submitted. Every other stage is classified `Internal`, which a
+  worker (`Registered` trust) may run. `cloud::policy::CloudDispatchPolicy` is
+  this rule.
+- **Workers** claim in priority, then enqueue, order, run the stage contained
+  like a local stage, and upload the output. They only claim jobs of their own
+  code identity (the one cache keys fold: engine and every cookbook), and skip
+  GPU stages unless started with `--gpu`; a job left alone records why, and the
+  submitter reports it. Arguments are paths on the worker, so a stage that
+  reads a path needs that path there. SIGTERM stops the running stage and
+  releases it for another worker at once; a killed worker's stage is requeued
+  when its lease runs out (`--lease-secs`, default 60).
+- **Pickup window.** A stage no worker claims within `BLUT_CLOUD_PICKUP_SECS`
+  (default 300, counted again if the stage is requeued) is withdrawn and fails
+  the run (`CLOUD_NO_WORKER`, not retried). An `Unavailable` result is a failure
+  here, never a local retry.
+- **Cancel and resume.** The job directory records the queue (`cloud_queue`) and
+  each cloud job id before its enqueue (`cloud_jobs`). `blut cancel <job>`
+  cancels what is still queued or running, also after the submitting process is
+  gone, and a worker running one stops it within seconds; an `s3://` queue needs
+  the run's `AWS_*` variables, and without them the command fails saying so. A
+  run withdraws its leftover work when it ends. `plan resume` refuses while a
+  stage it submitted still runs, refuses another queue than the job ran on, and
+  otherwise finishes the job: finished stages are cache hits, the rest are
+  submitted again.
+- **Polling cost.** An idle worker lists the queue every `--poll-ms` (default
+  5 s, backing off from 0.5 s); a running stage costs one state read every few
+  seconds on the worker and about one a second on the submitter.
+- **Retention.** Finished jobs' logs and bundles stay in the store. Nothing
+  deletes them; expire them with a bucket lifecycle rule longer than any run.
+
+`blut cloud queue` lists what a queue holds. Library surface: `cloud::location`,
+`cloud::object_queue`, `cloud::policy`, `cloud::records`, `cloud::worker::serve`,
+the defaulted `CloudQueue::{renew, release, refusals}`, and
+`CloudSubmitter::{with_pickup_timeout, with_job_record}`. `cli::run_from` runs
+the CLI on an explicit argument list.
+
 ## Preview surface (targeted for the 1.0 contract)
 
-The current `0.2.0-alpha.1` line is a development preview, not a semver-stable
+The current `0.2.0-alpha.2` line is a development preview, not a semver-stable
 1.0 release. The following surface is the intended 1.0 contract, but it may
 still change before the M6 release gate. Cookbooks should pin the exact preview
 version while the campaign is in progress.

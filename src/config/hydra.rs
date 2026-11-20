@@ -417,16 +417,23 @@ impl ConfigLoader {
     /// Compose `<config_name>` with `overrides` applied, returning the merged
     /// tree as a [`ConfigValue::Dict`].
     ///
-    /// Overrides split into *defaults-list selections* (dot-less `group=opt`,
-    /// applied to the `defaults:` list) and *value overrides* (everything
-    /// else: `a.b=v`, `+a=v`, `~a`), applied after the merge.
+    /// Overrides split into *defaults-list selections* (dot-less `group=opt`
+    /// where `group` is a config group directory, applied to the `defaults:`
+    /// list) and *value overrides* (everything else: `a=v`, `a.b=v`, `+a=v`,
+    /// `~a`), applied after the merge.
+    ///
+    /// As in Hydra, a dot-less key is a group selection only when it names a
+    /// config group. Treating every dot-less key as one made `--set lr=1e-3`
+    /// (the CLI's own documented example) and `--sweep seed=1,2` silently
+    /// change nothing: a sweep ran N identical combos.
     pub fn load_config(
         &self,
         config_name: Option<&str>,
         overrides: &[String],
     ) -> Result<ConfigValue, HydraError> {
-        let (default_overrides, value_overrides): (Vec<&String>, Vec<&String>) =
-            overrides.iter().partition(|o| is_default_override(o));
+        let (default_overrides, value_overrides): (Vec<&String>, Vec<&String>) = overrides
+            .iter()
+            .partition(|o| is_default_override(o) && self.is_group_override(o));
         let default_map = build_default_override_map(&default_overrides);
 
         let mut merged = ConfigDict::new();
@@ -458,6 +465,13 @@ impl ConfigLoader {
         }
 
         Ok(ConfigValue::Dict(merged))
+    }
+
+    /// `true` when a dot-less `key=option` names a config group directory.
+    fn is_group_override(&self, override_str: &str) -> bool {
+        override_str
+            .split_once('=')
+            .is_some_and(|(key, _)| !key.is_empty() && self.config_dir.join(key).is_dir())
     }
 
     /// `true` if `config_name` (or `group/option`) resolves to a file.
@@ -1099,6 +1113,40 @@ mod tests {
         let db = cfg.as_dict().unwrap().get("db").unwrap().as_dict().unwrap();
         assert_eq!(db.get("host").unwrap().as_str(), Some("remote"));
         assert_eq!(db.get("port").unwrap().as_int(), Some(5432));
+    }
+
+    /// `--set lr=0.5` on a flat config left `lr` unchanged: every dot-less
+    /// key was taken as a defaults-list group selection.
+    #[test]
+    fn a_dotless_key_that_is_not_a_group_overrides_the_value() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "db/mysql.yaml", "host: local\n");
+        write_config(dir.path(), "db/postgres.yaml", "host: remote\n");
+        write_config(
+            dir.path(),
+            "config.yaml",
+            "defaults:\n  - db: mysql\nlr: 0.1\nseed: 0\n",
+        );
+        let loader = ConfigLoader::from_config_dir(dir.path().to_str().unwrap());
+        let cfg = loader
+            .load_config(
+                Some("config"),
+                &[
+                    "lr=0.5".to_string(),
+                    "seed=3".to_string(),
+                    "db=postgres".to_string(),
+                ],
+            )
+            .unwrap();
+        let d = cfg.as_dict().unwrap();
+        assert_eq!(d.get("lr").unwrap().as_float(), Some(0.5));
+        assert_eq!(d.get("seed").unwrap().as_int(), Some(3));
+        let db = d.get("db").unwrap().as_dict().unwrap();
+        assert_eq!(
+            db.get("host").unwrap().as_str(),
+            Some("remote"),
+            "group still selects"
+        );
     }
 
     #[test]

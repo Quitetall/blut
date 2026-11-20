@@ -79,8 +79,9 @@ pub struct TrialOutcome {
     /// Best objective seen (per the manifest's direction); None if the trial
     /// never reported the metric.
     pub objective: Option<f64>,
-    /// pending | running | done | killed | failed. "killed" = stopped by the
-    /// HPO scheduler (or a plan cancel); "failed" = a genuine crash.
+    /// pending | running | done | stopped | cancelled | failed. "stopped" =
+    /// early-stopped by the HPO scheduler (a branch prune); "cancelled" = the
+    /// plan was cancelled while the trial ran; "failed" = a genuine crash.
     pub status: &'static str,
 }
 
@@ -92,7 +93,8 @@ pub fn reconstruct(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Trial
     let mut best: Vec<Option<f64>> = vec![None; n];
     let mut finished: Vec<u32> = vec![0; n]; // successful output/cache/control terminals
     let mut began: Vec<bool> = vec![false; n];
-    let mut killed: Vec<bool> = vec![false; n]; // scheduler/control kill or plan cancel
+    let mut stopped: Vec<bool> = vec![false; n]; // scheduler early stop (branch prune)
+    let mut cancelled: Vec<bool> = vec![false; n]; // plan cancel
     let mut failed: Vec<bool> = vec![false; n]; // genuine crash (OOM/code/timeout)
 
     let trial_of = |topo: u32| -> Option<usize> {
@@ -144,10 +146,10 @@ pub fn reconstruct(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Trial
                 // OOM killer's "Killed process …" / "Out of memory: Killed" (a
                 // real failure) as a scheduler kill.
                 let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
-                if err.to_ascii_lowercase().contains("cancel") {
-                    killed[t] = true;
-                } else {
-                    failed[t] = true;
+                match classify_stage_failure(err) {
+                    FailureKind::Stopped => stopped[t] = true,
+                    FailureKind::Cancelled => cancelled[t] = true,
+                    FailureKind::Failed => failed[t] = true,
                 }
             }
             _ => {}
@@ -163,8 +165,10 @@ pub fn reconstruct(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Trial
             // emit `stage_skipped` (counted in `finished`), so a killed trial can
             // satisfy `finished >= n_nodes` — checking `killed`/`failed` FIRST
             // keeps it labelled correctly rather than "done".
-            let status = if killed[t] {
-                "killed"
+            let status = if stopped[t] {
+                "stopped"
+            } else if cancelled[t] {
+                "cancelled"
             } else if failed[t] {
                 "failed"
             } else if finished[t] >= rec.n_nodes {
@@ -182,6 +186,103 @@ pub fn reconstruct(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Trial
             }
         })
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureKind {
+    Stopped,
+    Cancelled,
+    Failed,
+}
+
+/// Classify a terminal `stage_failed` error string. The executor writes
+/// "cancelled by the control policy …" for a scheduler prune, a "cancelled…"
+/// string for a plan cancel, and the stage's own error otherwise.
+fn classify_stage_failure(err: &str) -> FailureKind {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("by the control policy") {
+        FailureKind::Stopped
+    } else if lower.contains("cancel") {
+        FailureKind::Cancelled
+    } else {
+        FailureKind::Failed
+    }
+}
+
+/// The error of every trial that genuinely failed, by trial position in
+/// `manifest.trials` (`None` for a trial that did not fail). The first
+/// failing node of a trial wins.
+pub(crate) fn trial_errors(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Option<String>> {
+    let mut errors: Vec<Option<String>> = vec![None; manifest.trials.len()];
+    for line in status_lines {
+        let Ok(ev) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if ev.get("kind").and_then(|k| k.as_str()) != Some("stage_failed") {
+            continue;
+        }
+        let Some(topo) = ev.get("node_idx").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(t) = manifest
+            .trial_of_topo
+            .get(topo as usize)
+            .copied()
+            .flatten()
+            .map(|t| t as usize)
+        else {
+            continue;
+        };
+        let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
+        if classify_stage_failure(err) == FailureKind::Failed
+            && let Some(slot) = errors.get_mut(t)
+            && slot.is_none()
+        {
+            *slot = Some(err.to_string());
+        }
+    }
+    errors
+}
+
+/// The trial an HPO job's headline numbers should come from, and the topo
+/// positions of its nodes: the best COMPLETED trial, else (nothing completed
+/// yet) the best trial that reported the objective at all. `None` when no
+/// trial reported it. A job-level "final value" over every node would mix
+/// trials — the max of a loss across trials, the last step of whichever trial
+/// finished last — so per-run comparisons read this trial instead.
+pub(crate) fn headline_trial(
+    manifest: &HpoManifest,
+    status_lines: &[String],
+) -> Option<(u32, Vec<u32>)> {
+    let board = leaderboard(manifest, status_lines);
+    let best = board
+        .iter()
+        .find(|o| o.objective.is_some() && o.status == "done")
+        .or_else(|| board.iter().find(|o| o.objective.is_some()))?;
+    let position = manifest
+        .trials
+        .iter()
+        .position(|t| t.trial_id == best.trial_id)? as u32;
+    let nodes = manifest
+        .trial_of_topo
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t == Some(position))
+        .map(|(idx, _)| idx as u32)
+        .collect();
+    Some((best.trial_id, nodes))
+}
+
+/// [`headline_trial`] for the HPO job `job_id`, read from its job directory.
+/// `None` for a job that is not an HPO search.
+pub(crate) fn job_headline_trial(job_id: &str) -> Option<(u32, Vec<u32>)> {
+    let dir = crate::paths::jobs_dir().ok()?.join(job_id);
+    if !dir.join("hpo.json").is_file() {
+        return None;
+    }
+    let manifest = HpoManifest::read_from(&dir)?;
+    let lines = crate::jobs::read_status_lines(job_id).ok()?;
+    headline_trial(&manifest, &lines)
 }
 
 /// Leaderboard: outcomes sorted best-objective-first (per direction); trials
@@ -242,27 +343,27 @@ mod tests {
             json!({"kind":"stage_end","node_idx":0,"stage_name":"t","output_hash":"h","elapsed":1}),
             json!({"kind":"stage_begin","node_idx":1,"stage_name":"t","input_hash":"x"}),
             json!({"kind":"stage_step","node_idx":1,"stage_name":"t","update":{"val_r":0.2,"epoch":1}}),
-            json!({"kind":"stage_failed","node_idx":1,"stage_name":"t","error":"<cancelled by control>"}),
+            json!({"kind":"stage_failed","node_idx":1,"stage_name":"t","error":crate::framework::executor::CONTROL_PRUNE_MESSAGE}),
         ]
         .iter()
         .map(|v| v.to_string())
         .collect();
 
         let board = leaderboard(&m, &lines);
-        // trial0 best=0.7 done; trial1 best=0.2 killed. Leaderboard: trial0 first.
+        // trial0 best=0.7 done; trial1 best=0.2 stopped. Leaderboard: trial0 first.
         assert_eq!(board[0].trial_id, 0);
         assert_eq!(board[0].objective, Some(0.7));
         assert_eq!(board[0].status, "done");
         assert_eq!(board[1].trial_id, 1);
         assert_eq!(board[1].objective, Some(0.2));
-        assert_eq!(board[1].status, "killed");
+        assert_eq!(board[1].status, "stopped");
     }
 
     #[test]
-    fn cancel_is_killed_genuine_error_is_failed() {
+    fn cancel_is_cancelled_genuine_error_is_failed() {
         let m = manifest();
         let lines: Vec<String> = [
-            // trial0: scheduler/control kill (cancel-flavored error) → killed.
+            // trial0: a plan cancel → cancelled.
             json!({"kind":"stage_begin","node_idx":0,"stage_name":"t","input_hash":"x"}),
             json!({"kind":"stage_failed","node_idx":0,"stage_name":"t","error":"cancelled during stage"}),
             // trial1: a genuine crash whose message contains "kill" (the Linux
@@ -275,7 +376,7 @@ mod tests {
         .map(|v| v.to_string())
         .collect();
         let out = reconstruct(&m, &lines);
-        assert_eq!(out[0].status, "killed");
+        assert_eq!(out[0].status, "cancelled");
         assert_eq!(
             out[1].status, "failed",
             "OOM-killer 'Killed process' is a crash, not a scheduler kill"
@@ -306,7 +407,7 @@ mod tests {
         let m = manifest();
         let lines = [
             json!({"kind":"stage_pruned","node_idx":0,"stage_name":"a","reason":"condition false"}),
-            json!({"kind":"stage_failed","node_idx":0,"stage_name":"a","error":"cancelled by control"}),
+            json!({"kind":"stage_failed","node_idx":0,"stage_name":"a","error":crate::framework::executor::CONTROL_PRUNE_MESSAGE}),
             json!({"kind":"stage_pruned","node_idx":1,"stage_name":"b","reason":"condition false"}),
             json!({"kind":"stage_failed","node_idx":1,"stage_name":"b","error":"boom"}),
         ]
@@ -315,8 +416,13 @@ mod tests {
         .collect::<Vec<_>>();
 
         let out = reconstruct(&m, &lines);
-        assert_eq!(out[0].status, "killed");
+        assert_eq!(out[0].status, "stopped");
         assert_eq!(out[1].status, "failed");
+        assert_eq!(
+            trial_errors(&m, &lines),
+            vec![None, Some("boom".to_string())],
+            "a prune is not an error; the crash keeps its message"
+        );
     }
 
     #[test]
@@ -334,5 +440,23 @@ mod tests {
         let board = leaderboard(&m, &lines);
         assert_eq!(board[0].objective, Some(0.4), "min mode keeps the minimum");
         assert_eq!(board[0].trial_id, 0);
+    }
+
+    #[test]
+    fn the_headline_trial_is_the_best_completed_one_with_its_nodes() {
+        let mut m = manifest();
+        m.trial_of_topo = vec![Some(0), Some(1)];
+        let lines: Vec<String> = [
+            // trial 0 completes at 0.5; trial 1 reads 0.9 but is stopped early.
+            json!({"kind":"stage_step","node_idx":0,"stage_name":"t","update":{"val_r":0.5}}),
+            json!({"kind":"stage_end","node_idx":0,"stage_name":"t","output_hash":"h","elapsed":1}),
+            json!({"kind":"stage_step","node_idx":1,"stage_name":"t","update":{"val_r":0.9}}),
+            json!({"kind":"stage_failed","node_idx":1,"stage_name":"t","error":crate::framework::executor::CONTROL_PRUNE_MESSAGE}),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
+        assert_eq!(headline_trial(&m, &lines), Some((0, vec![0])));
+        assert_eq!(headline_trial(&m, &[]), None);
     }
 }

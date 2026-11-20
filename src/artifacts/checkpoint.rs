@@ -24,14 +24,15 @@ pub struct HfCheckpoint {
     /// Computed at production time and stored here so consumers
     /// don't re-walk the dir on every cache lookup.
     pub content_hash: ContentHash,
-    /// Final training loss reported by the trainer. Diagnostic;
-    /// not part of content_hash.
-    pub final_loss: f32,
+    /// Final training loss reported by the trainer, `None` when it reported
+    /// none. Diagnostic; not part of content_hash.
+    pub final_loss: Option<f32>,
 }
 
 impl Artifact for HfCheckpoint {
     const KIND: &'static str = "checkpoint.hf";
-    const SCHEMA: u32 = 1;
+    // 2: `final_loss` became optional, which changes the erased bincode payload.
+    const SCHEMA: u32 = 2;
     const ALLOW_EXTERNAL_PATHS: bool = true;
     fn content_hash(&self) -> ContentHash {
         self.content_hash
@@ -98,7 +99,7 @@ mod tests {
             base_model: "Qwen/Qwen3-7B".into(),
             method_tag: "qlora".into(),
             content_hash: ContentHash::of_bytes(b"ckpt"),
-            final_loss: 0.42,
+            final_loss: Some(0.42),
         };
         let json = serde_json::to_string(&h).unwrap();
         let back: HfCheckpoint = serde_json::from_str(&json).unwrap();

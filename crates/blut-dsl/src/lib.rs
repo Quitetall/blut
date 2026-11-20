@@ -120,7 +120,20 @@ pub fn evaluate_script(
             ),
         });
     }
-    Ok(drafts.remove(0).into_spec(name))
+    let spec = drafts.remove(0).into_spec(name);
+    // A `build(args)` that never calls `add()` (a forgotten call, or every
+    // `add()` behind a condition the args turned off) emitted an empty
+    // PlanSpec and exited 0; the engine refused it only at compile time, far
+    // from the script. Refuse it here, naming the cause.
+    if spec.nodes.is_empty() {
+        return Err(DslError::Eval {
+            path: path_label.to_string(),
+            msg: "build(args) added no stages; a plan needs at least one add() call \
+                  (the script would emit an empty PlanSpec)"
+                .to_string(),
+        });
+    }
+    Ok(spec)
 }
 
 /// Plan name from a script path: the file stem (`recipes/train.star` →
@@ -307,6 +320,31 @@ def build(args):
             evaluate_script(src, "bad.star", &json!({})),
             Err(DslError::Parse { .. })
         ));
+    }
+
+    /// E2E follow-up: a script that never calls `add()` emitted an empty
+    /// PlanSpec and exited 0.
+    #[test]
+    fn a_build_that_adds_no_stage_is_an_error() {
+        for src in [
+            "def build(args):\n    pass\n",
+            "def build(args):\n    if args.get(\"on\"):\n        add(\"a\")\n",
+        ] {
+            let err = evaluate_script(src, "empty.star", &json!({})).unwrap_err();
+            assert!(
+                matches!(&err, DslError::Eval { msg, .. } if msg.contains("added no stages")),
+                "{err}"
+            );
+        }
+        // The same conditional script with the stage switched on builds.
+        let src = "def build(args):\n    if args.get(\"on\"):\n        add(\"a\")\n";
+        assert_eq!(
+            evaluate_script(src, "empty.star", &json!({"on": true}))
+                .unwrap()
+                .nodes
+                .len(),
+            1
+        );
     }
 
     #[test]

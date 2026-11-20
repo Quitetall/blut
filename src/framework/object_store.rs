@@ -174,6 +174,38 @@ pub enum StoreError {
     Unsupported { operation: &'static str },
 }
 
+/// Refuse a plain-HTTP S3 endpoint up front unless `AWS_ALLOW_HTTP` is true.
+/// The provider refuses it too, but only on the first request and as "URL
+/// scheme is not allowed" at the end of a long chain, which does not say what
+/// to set. Only the endpoint's scheme and host are echoed.
+#[cfg(feature = "s3")]
+fn check_plain_http_endpoint(
+    endpoint: Option<&str>,
+    allow_http: Option<&str>,
+) -> Result<(), StoreError> {
+    let Some(endpoint) = endpoint.map(str::trim) else {
+        return Ok(());
+    };
+    if !endpoint.to_ascii_lowercase().starts_with("http://") {
+        return Ok(());
+    }
+    if allow_http.is_some_and(|v| v.trim().eq_ignore_ascii_case("true")) {
+        return Ok(());
+    }
+    let host = url::Url::parse(endpoint)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| u.port().map_or(h.to_string(), |p| format!("{h}:{p}")))
+        })
+        .unwrap_or_else(|| "the endpoint".to_string());
+    Err(StoreError::InvalidAddress(format!(
+        "the S3 endpoint http://{host} is plain HTTP, which is refused unless \
+         AWS_ALLOW_HTTP=true is set (credentials and data then travel unencrypted; \
+         use an https:// endpoint where you can)"
+    )))
+}
+
 impl StoreError {
     #[cfg(feature = "cloud")]
     fn initialization(
@@ -197,6 +229,43 @@ impl StoreError {
             source: Box::new(source),
         }
     }
+}
+
+/// The endpoint refused a create-only write (`If-None-Match: *`). Every
+/// object is published that way so a concurrent writer can never replace it;
+/// without that guarantee two workers finishing the same invocation could
+/// silently overwrite each other's cached result, so there is no fallback.
+#[cfg(feature = "cloud")]
+#[derive(Debug)]
+pub(crate) struct ConditionalPutUnsupported(pub(crate) String);
+
+#[cfg(feature = "cloud")]
+impl std::fmt::Display for ConditionalPutUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this S3 endpoint does not support conditional writes (`If-None-Match: *`), \
+             which BLUT needs to publish immutable objects safely. AWS S3, Cloudflare R2 \
+             and MinIO support them; Backblaze B2 does not. Provider response: {}",
+            self.0
+        )
+    }
+}
+
+#[cfg(feature = "cloud")]
+impl std::error::Error for ConditionalPutUnsupported {}
+
+/// Whether a failed create-only PUT means the provider does not implement
+/// conditional writes, as opposed to a transient or permission failure.
+/// Recognises the S3 `NotImplemented` error code that Backblaze B2 returns
+/// with HTTP 501.
+#[cfg(feature = "cloud")]
+pub(crate) fn rejects_conditional_put(error: &object_store::Error) -> bool {
+    if matches!(error, object_store::Error::NotImplemented { .. }) {
+        return true;
+    }
+    let text = error.to_string();
+    text.contains("501 Not Implemented") || text.contains("<Code>NotImplemented</Code>")
 }
 
 /// Outcome of an immutable create operation.
@@ -319,55 +388,11 @@ impl ObjectStore {
     /// is wrapped, never trusted.
     #[cfg(feature = "s3")]
     pub fn from_url(url: &str, prefix: impl AsRef<str>) -> Result<Self, StoreError> {
-        // The raw string is not echoed on a parse failure: it may carry
-        // credentials that were never meant to be printed.
-        let parsed = url::Url::parse(url)
-            .map_err(|error| StoreError::InvalidAddress(format!("object-store URL: {error}")))?;
-        match parsed.scheme() {
-            "s3" => {
-                // Credentials and the endpoint come from the environment only.
-                // A URL that carries userinfo, a port or a query would be
-                // silently half-ignored (and later echoed), so refuse it
-                // without repeating it.
-                if !parsed.username().is_empty()
-                    || parsed.password().is_some()
-                    || parsed.port().is_some()
-                    || parsed.query().is_some()
-                    || parsed.fragment().is_some()
-                {
-                    return Err(StoreError::InvalidAddress(
-                        "s3 URL must be s3://bucket[/prefix]: credentials, port and \
-                         endpoint come from AWS_* environment variables, not the URL"
-                            .to_string(),
-                    ));
-                }
-                let bucket = parsed.host_str().ok_or_else(|| {
-                    StoreError::InvalidAddress(format!("{url}: no bucket in s3 URL"))
-                })?;
-                let inner = object_store::aws::AmazonS3Builder::from_env()
-                    .with_bucket_name(bucket)
-                    .build()
-                    .map_err(|error| StoreError::initialization("s3", error))?;
-                // A path inside the URL prefixes the caller's prefix, so
-                // `s3://bucket/runs` + "cloud" addresses `runs/cloud/…`.
-                let url_prefix = parsed.path().trim_matches('/');
-                let prefix = match (url_prefix, prefix.as_ref().trim_matches('/')) {
-                    ("", p) => p.to_string(),
-                    (u, "") => u.to_string(),
-                    (u, p) => format!("{u}/{p}"),
-                };
-                Self::provider(Arc::new(inner), prefix)
-            }
-            "file" => {
-                let path = parsed.to_file_path().map_err(|()| {
-                    StoreError::InvalidAddress(format!("{url}: not a valid file path"))
-                })?;
-                Self::local_provider(path, prefix)
-            }
-            other => Err(StoreError::InvalidAddress(format!(
-                "unsupported object-store scheme {other:?} in {url}"
-            ))),
-        }
+        let (inner, url_prefix) = provider_from_url(url)?;
+        // A path inside the URL prefixes the caller's prefix, so
+        // `s3://bucket/runs` + "cloud" addresses `runs/cloud/…`.
+        let prefix = join_prefix(&url_prefix, prefix.as_ref());
+        Self::provider(inner, prefix)
     }
 
     /// Local `object_store` provider adapter for development and conformance
@@ -497,6 +522,11 @@ impl ObjectStore {
                 match inner.put_opts(&path, payload, options).await {
                     Ok(_) => Ok(RawCreate::Created),
                     Err(object_store::Error::AlreadyExists { .. }) => Ok(RawCreate::AlreadyExists),
+                    Err(error) if rejects_conditional_put(&error) => Err(StoreError::backend(
+                        "put",
+                        key,
+                        ConditionalPutUnsupported(error.to_string()),
+                    )),
                     Err(error) => Err(StoreError::backend("put", key, error)),
                 }
             }
@@ -932,6 +962,81 @@ fn create_file_atomic(
     write_result
 }
 
+/// Build the provider a URL names, and the path the URL carries after its
+/// bucket (or `""`). Shared by [`ObjectStore::from_url`] and the cloud queue,
+/// which must address the same bucket the same way.
+///
+/// | scheme | provider |
+/// |---|---|
+/// | `s3://bucket/prefix` | S3, and any S3-compatible endpoint |
+/// | `file:///abs/path` | local filesystem provider (the directory must exist) |
+///
+/// Credentials and the endpoint come from the environment only (the variables
+/// the AWS CLI reads). The raw URL is never echoed on a parse failure: it may
+/// carry credentials that were never meant to be printed.
+#[cfg(feature = "s3")]
+pub(crate) fn provider_from_url(
+    url: &str,
+) -> Result<(Arc<dyn object_store::ObjectStore>, String), StoreError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|error| StoreError::InvalidAddress(format!("object-store URL: {error}")))?;
+    match parsed.scheme() {
+        "s3" => {
+            // A URL that carries userinfo, a port or a query would be
+            // silently half-ignored (and later echoed), so refuse it
+            // without repeating it.
+            if !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.port().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err(StoreError::InvalidAddress(
+                    "s3 URL must be s3://bucket[/prefix]: credentials, port and \
+                     endpoint come from AWS_* environment variables, not the URL"
+                        .to_string(),
+                ));
+            }
+            let bucket = parsed
+                .host_str()
+                .ok_or_else(|| StoreError::InvalidAddress("no bucket in the s3 URL".to_string()))?;
+            check_plain_http_endpoint(
+                std::env::var("AWS_ENDPOINT")
+                    .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+                    .ok()
+                    .as_deref(),
+                std::env::var("AWS_ALLOW_HTTP").ok().as_deref(),
+            )?;
+            let inner = object_store::aws::AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|error| StoreError::initialization("s3", error))?;
+            Ok((Arc::new(inner), parsed.path().trim_matches('/').to_string()))
+        }
+        "file" => {
+            let path = parsed.to_file_path().map_err(|()| {
+                StoreError::InvalidAddress(format!("{url}: not a valid file path"))
+            })?;
+            let inner = object_store::local::LocalFileSystem::new_with_prefix(path)
+                .map_err(|error| StoreError::initialization("local-provider", error))?;
+            Ok((Arc::new(inner), String::new()))
+        }
+        other => Err(StoreError::InvalidAddress(format!(
+            "unsupported object-store scheme {other:?}"
+        ))),
+    }
+}
+
+/// `a/b` + `c` → `a/b/c`, with either side allowed to be empty.
+#[cfg(feature = "s3")]
+pub(crate) fn join_prefix(outer: &str, inner: &str) -> String {
+    match (outer.trim_matches('/'), inner.trim_matches('/')) {
+        ("", p) => p.to_string(),
+        (u, "") => u.to_string(),
+        (u, p) => format!("{u}/{p}"),
+    }
+}
+
 #[cfg(feature = "cloud")]
 fn provider_path(prefix: &str, key: ObjectKey) -> object_store::path::Path {
     let relative = key.relative_path();
@@ -1007,6 +1112,35 @@ fn block_on_isolated<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cloud")]
+    #[test]
+    fn a_provider_without_conditional_writes_is_named_not_retried_into_a_generic_error() {
+        // Backblaze B2's response to `PUT` with `If-None-Match: *`, captured
+        // 2026-10-20 (bucket and key elided).
+        let b2 = "Error performing PUT https://s3.us-east-005.backblazeb2.com/b/k in 1.2s, \
+                  after 10 retries: Server returned non-2xx status code: 501 Not Implemented: \
+                  <?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Error>\n    \
+                  <Code>NotImplemented</Code>\n    <Message>A header you provided implies \
+                  functionality that is not implemented</Message>\n</Error>";
+        let generic = |msg: &str| object_store::Error::Generic {
+            store: "S3",
+            source: msg.to_string().into(),
+        };
+        assert!(rejects_conditional_put(&generic(b2)));
+        // Transient and permission failures keep their own error.
+        assert!(!rejects_conditional_put(&generic(
+            "Server returned non-2xx status code: 503 Service Unavailable: SlowDown"
+        )));
+        assert!(!rejects_conditional_put(&generic(
+            "Server returned non-2xx status code: 403 Forbidden: AccessDenied"
+        )));
+        let shown = ConditionalPutUnsupported(b2.into()).to_string();
+        assert!(
+            shown.contains("If-None-Match") && shown.contains("Backblaze B2"),
+            "{shown}"
+        );
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn an_s3_url_carrying_credentials_port_or_query_is_refused_without_echo() {
@@ -1091,5 +1225,26 @@ mod tests {
         let decoded = decode_object(key, stored).unwrap();
         assert_eq!(decoded, payload);
         assert_eq!(decoded.as_ptr(), allocation);
+    }
+}
+
+#[cfg(all(test, feature = "s3"))]
+mod plain_http_tests {
+    use super::check_plain_http_endpoint;
+
+    #[test]
+    fn a_plain_http_endpoint_needs_allow_http_and_says_so() {
+        // E2E follow-up: the only hint was "URL scheme is not allowed" at the
+        // end of a five-level chain.
+        let err = check_plain_http_endpoint(Some("http://127.0.0.1:9000"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("AWS_ALLOW_HTTP=true") && err.contains("127.0.0.1:9000"),
+            "{err}"
+        );
+        assert!(check_plain_http_endpoint(Some("http://minio:9000"), Some("true")).is_ok());
+        assert!(check_plain_http_endpoint(Some("https://s3.example"), None).is_ok());
+        assert!(check_plain_http_endpoint(None, None).is_ok());
     }
 }

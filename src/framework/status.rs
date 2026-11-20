@@ -157,6 +157,23 @@ pub enum StageEvent {
         error: String,
         backoff_ms: u64,
     },
+    /// What happened to a stage attempt's mid-stage checkpoint slot
+    /// (CONTRACT.md §8): it started fresh, was offered a checkpoint, resumed
+    /// from one, or had its slot cleaned up or kept after the stage finished.
+    StageCheckpoint {
+        node_idx: u32,
+        stage_name: String,
+        /// The attempt (1-based) this record belongs to.
+        attempt: u32,
+        action: crate::framework::stage_checkpoint::CheckpointAction,
+        /// For `resume_offered`, the step the marker recorded; for `resumed`,
+        /// the step the trainer loaded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<u64>,
+        /// The slot directory, or why the slot was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
 }
 
 impl StageEvent {

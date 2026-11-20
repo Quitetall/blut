@@ -90,6 +90,17 @@ fn load_provenance(job_id: &str) -> Result<Provenance> {
     })
 }
 
+/// [`outcome_line`] without the column padding, for `--json`: it emitted
+/// `"done       -"`.
+fn outcome_json(job_id: &str) -> String {
+    let line = outcome_line(job_id);
+    let mut words: Vec<&str> = line.split_whitespace().collect();
+    if words.len() > 1 && words.last() == Some(&"-") {
+        words.pop();
+    }
+    words.join(" ")
+}
+
 fn outcome_line(job_id: &str) -> String {
     // Find the summary among all jobs (single-box scale: cheap scan).
     let summary = jobs::list_jobs()
@@ -145,8 +156,8 @@ pub fn diff(id1_query: &str, id2_query: &str, all: bool, json: bool) -> Result<(
 
     if json {
         let payload = serde_json::json!({
-            "left":  { "job": id1, "source": p1.source, "recipe": p1.recipe, "outcome": outcome_line(&id1) },
-            "right": { "job": id2, "source": p2.source, "recipe": p2.recipe, "outcome": outcome_line(&id2) },
+            "left":  { "job": id1, "source": p1.source, "recipe": p1.recipe, "outcome": outcome_json(&id1) },
+            "right": { "job": id2, "source": p2.source, "recipe": p2.recipe, "outcome": outcome_json(&id2) },
             "diff": diffs.iter().filter(|d| all || d.changed).collect::<Vec<_>>(),
         });
         println!(

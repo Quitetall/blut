@@ -92,7 +92,9 @@ struct PbtState {
 
 /// The PBT control policy.
 pub struct PbtPolicy {
-    trial_of_topo: Vec<Option<u32>>,
+    /// Topo → trial and per-trial overlays, initial and spawned clones.
+    book: Arc<super::book::TrialBook>,
+    /// The initial population's overlays and resume dirs.
     trials: Vec<PbtTrial>,
     space: SearchSpace,
     cfg: PbtConfig,
@@ -111,8 +113,9 @@ impl PbtPolicy {
         factory: TrialFactory,
         seed: u64,
     ) -> Self {
+        let overlays = trials.iter().map(|t| t.overlay.clone()).collect();
         Self {
-            trial_of_topo,
+            book: Arc::new(super::book::TrialBook::from_parts(trial_of_topo, overlays)),
             trials,
             space,
             cfg,
@@ -126,6 +129,27 @@ impl PbtPolicy {
                 spawns_done: 0,
             }),
         }
+    }
+
+    /// Share `book` (the HPO job's, bound to its `hpo.json`) instead of the
+    /// private one built from the constructor's initial population. The book
+    /// must already hold that population.
+    pub fn with_trial_book(mut self, book: Arc<super::book::TrialBook>) -> Self {
+        self.book = book;
+        self
+    }
+
+    /// A trial's overlay and the directory a clone of it resumes from: the
+    /// constructor's for the initial population, the book's for a clone (so a
+    /// clone that wins a later rung can itself be exploited).
+    fn trial_info(&self, trial: u32) -> Option<(Overlay, PathBuf)> {
+        if let Some(t) = self.trials.get(trial as usize) {
+            return Some((t.overlay.clone(), t.resume_dir.clone()));
+        }
+        Some((
+            self.book.overlay(trial)?,
+            self.book.spawned_stage_dir(trial)?,
+        ))
     }
 
     fn score(&self, obj: f64) -> f64 {
@@ -201,14 +225,13 @@ impl PbtPolicy {
         let Some(wt) = winner else {
             return PbtDecision::Continue; // no eligible winner yet — let it run
         };
-        let Some(w) = self.trials.get(wt as usize) else {
+        let Some((woverlay, resume_dir)) = self.trial_info(wt) else {
             return PbtDecision::Continue;
         };
         let resume = PbtResume {
             winner_trial: wt,
-            resume_dir: w.resume_dir.clone(),
+            resume_dir,
         };
-        let woverlay = w.overlay.clone();
         // Drop the lock before perturbing (perturb takes the rng lock; no nested
         // state lock needed and keeps the two locks from ever ordering).
         st.killed.insert(trial);
@@ -229,12 +252,7 @@ impl PbtPolicy {
 
 impl ControlPolicy for PbtPolicy {
     fn on_step(&self, m: &StepMetrics) -> Control {
-        let Some(trial) = self
-            .trial_of_topo
-            .get(m.node_idx as usize)
-            .copied()
-            .flatten()
-        else {
+        let Some(trial) = self.book.trial_of(m.node_idx) else {
             return Control::Continue;
         };
         let Some(obj) = dotted_f64(m.update, &self.cfg.metric_key) else {
@@ -247,13 +265,19 @@ impl ControlPolicy for PbtPolicy {
             PbtDecision::Spawn { overlay, resume } => match (self.factory)(&overlay, &resume) {
                 Ok(subplan) => Control::Spawn(Box::new(SpawnDelta::new(
                     subplan,
-                    Some(format!("pbt-clone<-t{}", resume.winner_trial)),
+                    Some(self.book.reserve(overlay)),
                 ))),
                 Err(e) => {
                     tracing::warn!("pbt clone factory failed: {e}");
                     Control::Continue
                 }
             },
+        }
+    }
+
+    fn on_spawned(&self, label: Option<&str>, nodes: &[(u32, &str)]) {
+        if let Some(label) = label {
+            self.book.bind(label, nodes);
         }
     }
 }

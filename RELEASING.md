@@ -1,12 +1,14 @@
 # BLUT Release Procedure
 
-Public preview train: `blut-types` → `blut` → `blut-dsl` → `blut-notify`.
+Public preview train: `blut-types` → `blut` → `blut-dsl` → `blut-notify`, then
+`blut-operator`, which depends on none of them and is published last only so
+it never holds up the engine chain.
 `blut-types` is the single chain ROOT (no in-repo path deps); `blut` depends on
 it, so it must be indexed on crates.io before `blut` will package — otherwise
 `no matching package named 'blut-types' found`. Members share the exact preview
 version.
 
-`blut-graph-core` is NOT part of this train. The ADR 0139 adapter that used it
+`blut-graph-core` is NOT part of this train. The LamQuant semantic-graph adapter that used it
 moved out of the engine into the unpublished `crates/blut-semantic` sidecar
 (ADR 0034 — graph-core carries ABIR domain vocabulary and the engine is
 domain-agnostic), so nothing in the chain depends on it. Publish it on its own
@@ -14,10 +16,12 @@ schedule once its surface settles; it is the newest and fastest-moving crate in
 the repo.
 
 `blut-tui` IS published (0.2.0-alpha.1 is on crates.io) and its manifest now
-says so. The standalone-workspace sidecars `blut-web` and `blut-operator` are
-`publish = false`. The `release.yml` `binaries` job
-attaches those three plus the runnable `blut-notify` member binary to the GitHub
-Release. (`blut-worker` was deleted at ADR 0083 M3 — superseded by `src/cloud`
+says so. The standalone-workspace sidecar `blut-web` is `publish = false`.
+`blut-operator` is publishable (`publish = ["crates-io"]`, first version
+0.2.0-alpha.2) and has never been published. The `release.yml` `binaries` job
+attaches `blut-tui`, `blut-web`, `blut-operator` and the runnable `blut-notify`
+member binary to the GitHub Release. No container images are published: the
+operator and cookbook images are built from `docker/` by whoever deploys them. (`blut-worker` was deleted at ADR 0083 M3 — superseded by `src/cloud`
 and the `blut-web` sidecar.)
 
 ## Automation (ADR 0083 M6)
@@ -35,11 +39,15 @@ Two workflows carry the release; both are reviewable in `.github/workflows/`:
 - **`docs.yml`** — builds the mdBook site (`book.toml` / `book_src`, which
   `{{#include}}`s the top-level docs so there is no drift) and deploys it to
   GitHub Pages on every `main` push that touches a doc.
-- **`scripts/k8s_kind_smoke.sh`** — the operator gate, run by `release.yml` and
-  available locally: installs the
-  `blut-operator` CRDs on an ephemeral `kind` cluster and asserts a `BlutPlan`
-  CR is accepted by the API server (schema valid); reconcile-to-Job is a
-  best-effort extra when the operator image is loaded.
+- **`scripts/k8s_kind_smoke.sh`** — the cheap operator gate, run by
+  `release.yml` and available locally: installs the shipped CRDs on an
+  ephemeral `kind` cluster, asserts a `BlutPlan` is accepted, and that a
+  `Restricted` ceiling and a spec edit are refused.
+- **`scripts/k8s_kind_e2e.sh`** — the operator end to end, run by `ci.yml`
+  (`operator · kind end-to-end`): builds the operator and cookbook images, runs
+  real plans on a three-node kind cluster with MinIO, and checks status, store
+  outputs, cache reuse, bad-spec refusals, deletion, retries, a node drain, an
+  operator restart and RBAC. See [docs/OPERATOR.md](docs/OPERATOR.md).
 
 The step-by-step below is the AUTHORITATIVE manual procedure the automation
 mirrors — run it (or the `release.yml` publish job) at the reviewed tag SHA.
@@ -50,27 +58,28 @@ Run from a clean checkout at the proposed tag SHA:
 
 ```bash
 bash scripts/scope_guard.sh
-cargo +1.88 fmt --all -- --check
-cargo +1.88 check --locked --workspace --all-targets --all-features
-cargo +1.88 clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo +1.88 test --locked --workspace --all-targets --all-features
-RUSTDOCFLAGS="-D warnings" cargo +1.88 doc --locked --workspace --all-features --no-deps
-cargo +1.88 check --locked -p blut-types --target wasm32-unknown-unknown
+cargo +1.99.0 fmt --all -- --check
+cargo +1.99.0 check --locked --workspace --all-targets --all-features
+cargo +1.99.0 clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo +1.99.0 test --locked --workspace --all-targets --all-features
+RUSTDOCFLAGS="-D warnings" cargo +1.99.0 doc --locked --workspace --all-features --no-deps
+cargo +1.99.0 check --locked -p blut-types --target wasm32-unknown-unknown
 cargo deny --locked check
 cargo deny --locked --manifest-path crates/blut-dsl/Cargo.toml --config deny.toml check
 cargo deny --locked --manifest-path crates/blut-operator/Cargo.toml --config deny.toml check
 gitleaks git --log-opts="--all"
-cargo +1.88 run --locked --example first_cookbook
+cargo +1.99.0 run --locked --example first_cookbook
 bash scripts/run_benchmarks.sh compare
 ```
 
 Also gate detached workspaces:
 
 ```bash
-(cd crates/blut-dsl && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked && RUSTDOCFLAGS="-D warnings" cargo +1.88 doc --locked --no-deps)
-(cd crates/blut-web && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked)
-(cd crates/blut-tui && cargo +1.88 fmt --all -- --check && cargo +1.88 build --locked --all-targets && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked && ./target/debug/blut-tui --check)
-(cd crates/blut-operator && cargo +1.89 fmt --all -- --check && cargo +1.89 clippy --locked --all-targets -- -D warnings && cargo +1.89 test --locked)
+(cd crates/blut-dsl && cargo +1.99.0 fmt --all -- --check && cargo +1.99.0 clippy --locked --all-targets -- -D warnings && cargo +1.99.0 test --locked && RUSTDOCFLAGS="-D warnings" cargo +1.99.0 doc --locked --no-deps)
+(cd crates/blut-web && cargo +1.99.0 fmt --all -- --check && cargo +1.99.0 clippy --locked --all-targets -- -D warnings && cargo +1.99.0 test --locked)
+(cd crates/blut-tui && cargo +1.99.0 fmt --all -- --check && cargo +1.99.0 build --locked --all-targets && cargo +1.99.0 clippy --locked --all-targets -- -D warnings && cargo +1.99.0 test --locked && ./target/debug/blut-tui --check)
+(cd crates/blut-operator && cargo +1.99.0 fmt --all -- --check && cargo +1.99.0 clippy --locked --all-targets -- -D warnings && cargo +1.99.0 test --locked && RUSTDOCFLAGS="-D warnings" cargo +1.99.0 doc --locked --no-deps && cargo +1.99.0 publish --dry-run --locked)
+BLUT_COOKBOOK_DIR=<blut-cookbooks checkout> bash scripts/k8s_kind_e2e.sh
 ```
 
 Required GitHub checks must be green at this exact SHA. Do not infer release
@@ -126,13 +135,19 @@ cargo publish --locked
 
 cargo publish --dry-run --locked -p blut-notify
 cargo publish --locked -p blut-notify
+
+# Independent of the chain; publish only with the owner's go-ahead for this
+# release (its first publish reserves the name):
+(cd crates/blut-operator && cargo publish --dry-run --locked)
+(cd crates/blut-operator && cargo publish --locked)
 ```
 
-Run the kind smoke before tagging (the operator's CRD schemas are part of the
-public contract):
+Run the kind smoke and the operator end to end before tagging (the operator's
+CRD schemas are part of the public contract):
 
 ```bash
 bash scripts/k8s_kind_smoke.sh   # needs kind + kubectl
+BLUT_COOKBOOK_DIR=<blut-cookbooks checkout> bash scripts/k8s_kind_e2e.sh   # also docker
 ```
 
 Then verify from an empty directory and clean Cargo home:
@@ -140,9 +155,9 @@ Then verify from an empty directory and clean Cargo home:
 ```bash
 cargo new --lib blut-consumer
 cd blut-consumer
-cargo add blut@=0.2.0-alpha.1
+cargo add blut@=0.2.0-alpha.2
 cargo check
-cargo install blut-dsl --version =0.2.0-alpha.1
+cargo install blut-dsl --version =0.2.0-alpha.2
 ```
 
 ## Tagging
@@ -179,12 +194,35 @@ advertise one as "Latest".
 
 Both are recorded here rather than quietly worked around.
 
-**`scripts/run_benchmarks.sh compare` cannot pass.** It defaults to the baseline
-name `release-0.2`, and the only baseline committed under `bench-baselines/` is
-`opt0`, so it exits 2 with `missing committed benchmark baseline 'release-0.2'`.
-Either establish the baseline on the designated quiet host
-(`bash scripts/run_benchmarks.sh --save`) or run the comparison against the
-baseline that exists (`BLUT_BENCH_BASELINE=opt0`). Do not delete the check.
+**`scripts/run_benchmarks.sh compare` cannot pass yet.** It defaults to the
+baseline name `release-0.2`, and the only baseline committed under
+`bench-baselines/` is `opt0`, so it exits 2 with `missing committed benchmark
+baseline 'release-0.2'`. Establish the baseline on the designated quiet host
+(`bash scripts/run_benchmarks.sh --save`), at the release candidate's SHA. Do
+not delete the check.
+
+Until 2026-10-20 the comparison could not fail either. Criterion prints
+"Performance has regressed" and still exits 0. `compare` now ends with
+`scripts/bench_regression_gate.py`. It fails when any benchmark's median is
+slower than the baseline by more than `BLUT_BENCH_MAX_REGRESSION` (default
+`0.10`), even at the lower bound of its confidence interval. A planted +40%
+regression fails it.
+
+Since 2026-11-13 a slowdown has to show twice. On a whole idle 16-core machine
+(load 0.01 to 0.05 before the runs), unchanged code compared against its own
+baseline failed one pass and passed the next: one benchmark sat 17.3% over in
+the first and level in the second, and others moved 5% to 9%. `compare` now
+waits for the host's load to fall to `BLUT_BENCH_MAX_LOAD` (default `1.0`),
+runs a pass, and when that pass flags a benchmark, waits again and runs a
+second pass. Only a benchmark over the limit in both fails the gate.
+
+**What "quiet host" has to mean.** A trial on a rented, shared 8-core
+instance compared unchanged code against its own baseline. The medians moved
+between −11.8% and +7.7%, with tight confidence intervals: other tenants'
+load, not sampling noise. A 10% limit is not safe on such a host. The
+designated host must be a whole machine nobody else is using: owned
+hardware, or a rented machine taken in full. Record its CPU model, core count
+and kernel with the baseline.
 
 **`release.yml`'s `gate` job ends BLOCKED by design.** Its last step runs
 `tools/check_blut_release_state.py`, which reports BLOCKED whenever the two

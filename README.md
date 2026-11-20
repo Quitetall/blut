@@ -155,7 +155,7 @@ let result = ParallelExecutor::execute(plan.into_compiled(), ctx).await?;
 
 ## Key features
 
-### v0.2.0-alpha.1 — current development preview ([CHANGELOG](CHANGELOG.md))
+### v0.2.0-alpha.2 — current development preview ([CHANGELOG](CHANGELOG.md))
 
 | Feature | What |
 |---------|------|
@@ -174,14 +174,15 @@ let result = ParallelExecutor::execute(plan.into_compiled(), ctx).await?;
 
 Registry handles are resolved before typed cookbook/declarative args compile,
 and resumable jobs retain the original handles so datasets are hash-revalidated
-on resume. Model and recipe commands both default to tenant `default`; use
-`--tenant shared` to address model records created under the former default.
+on resume. Model, plan and recipe commands all default to tenant `default`;
+use `--tenant shared` to address model and plan records created under the
+former default.
 
 ### Experimental development surface
 
 Landed in the development tree, but not yet cut as a release. Validation status
 per capability is tracked in the
-[distributed-validation ledger](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md):
+[distributed-validation ledger](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.2/docs/DISTRIBUTED_VALIDATION.md):
 
 | Feature | What |
 |---------|------|
@@ -189,7 +190,7 @@ per capability is tracked in the
 | **P2P module** | Trust model, Ed25519, AES-256-GCM, QUIC transport, dispatch policy |
 | **RemoteJob trait** | Slurm + Ray launchers |
 | **DDP single-node** | `torchrun --nproc_per_node=N`, auto-detect from `WORLD_SIZE` |
-| **DDP multi-node** | `MASTER_ADDR`/`MASTER_PORT`/`NODE_RANK` → torchrun rendezvous (multi-node NCCL run still pending hardware) |
+| **DDP multi-node** | `MASTER_ADDR`/`MASTER_PORT`/`NODE_RANK` → torchrun rendezvous; real two-machine NCCL run recorded (cookbook training through Slurm) |
 | **Multi-GPU discovery** | Per-GPU VRAM via nvidia-smi + rocm-smi |
 | **DAG optimizer** | Dead code elimination, critical path scheduling, cache/memory-aware ordering |
 | **Event daemon** | `blut sensord`: file-drop, spool-threshold, and cron triggers → durable dedupe → exact recipe admission acknowledgement |
@@ -205,8 +206,8 @@ webhook signing contract, SLA rules, notification sinks, and restart semantics.
 |------|-------|-----------------|--------|
 | **1 GPU** | 1 machine | Typed orchestration and resource admission | Locally exercised; cookbook runtime evidence is separate |
 | **Multi-GPU** | 1 machine, N GPUs | `torchrun` argument construction | Component-tested; real training parity is cookbook-owned |
-| **Multi-Node** | 1 cluster, N machines | Slurm/torchrun rendezvous wiring | Component-tested; NCCL run pending |
-| **Cluster** | 1 datacenter | Ray `RemoteJob` command construction | Component-tested; at-scale run pending |
+| **Multi-Node** | 1 cluster, N machines | Slurm submit/track/cancel; torchrun rendezvous | Validated on a two-node Slurm cluster and a two-machine NCCL run ([Slurm guide](docs/SLURM.md)) |
+| **Cluster** | 1 datacenter | Ray `RemoteJob` submit/stream/poll | Two-node Ray cluster validated; at-scale run pending |
 | **P2P Mesh** | N machines, async | Trust-based dispatch and transport | Loopback/component-tested; independent-host run pending |
 
 ## Platform support
@@ -216,19 +217,22 @@ webhook signing contract, SLA rules, notification sinks, and restart semantics.
 | **Linux x86_64 (NVIDIA)** | Primary | Local systemd/cgroup2/rlimit tests and `nvidia-smi` discovery |
 | **Linux x86_64 (AMD)** | Component-tested | `rocm-smi` discovery path; no release-scale training claim |
 | **macOS ARM64** | Compile-gated | CI compile-check is specified; containment degrades off-systemd |
-| **Windows** | Deferred | Bare fallback only; Job Object containment is absent |
+| **Windows** | CI-gated | Job Object containment (tree-wide commit cap, tree kill, peak) tested on `windows-latest`, including local stages through `LocalSystemd::spawn_contained`; a CPU training run through BLUT on `windows-latest` is recorded in the validation ledger |
 
 ## Build your own cookbook
 
 ### Declare your resources — one method, the whole stack
 
 Implement `Stage::resource_envelope` and your stage gets BLUT's entire
-resource machinery: the launch gate admits it against real memory, the
-measured-peak store calibrates the estimate run over run (with an OOM-aware
-self-heal), and the engine auto-tunes any dimension you declare a cost term
-for — you enumerate the coefficients and ceilings, the engine owns the
-search. Skip it and your stage still runs, billed a loud 2 GiB
-compatibility floor.
+resource machinery: the launch gate admits it against real memory, and the
+engine auto-tunes any dimension you declare a cost term for — you enumerate
+the coefficients and ceilings, the engine owns the search. The calibration
+dimensions key the measured-peak store: a launch resolves the estimate
+against a peak recorded under the same key (with an OOM-aware self-heal).
+The engine reads that store; a cookbook runner that measures its child's
+peak fills it (`FootprintStore::record`), and without one the declared
+estimate is what is billed. Skip it and your stage still runs, billed a loud
+2 GiB compatibility floor.
 
 ```rust
 fn resource_envelope(&self, args: &Self::Args) -> ResourceEnvelope {
@@ -287,7 +291,7 @@ as an optional fallback.
 
 ## Status
 
-**Source version: 0.2.0-alpha.1**, published on crates.io and tagged here. Each
+**Source version: 0.2.0-alpha.2**, published on crates.io and tagged here. Each
 published crate has a `<crate>-v<version>` tag and a GitHub release pointing at
 the exact commit it was built from, recovered from the published tarball's own
 `.cargo_vcs_info.json`.
@@ -298,25 +302,30 @@ records what they were.
 
 **Experimental:** P2P module, DDP launch wiring, and DAG optimizer remain under
 active validation; per-rung status lives in the
-[distributed-validation ledger](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md).
+[distributed-validation ledger](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.2/docs/DISTRIBUTED_VALIDATION.md).
 
 Engine integration and property tests run in CI; exact counts live in CI, not
-this README. The standalone fuzz workspace is not yet CI-gated. Deprecated
-worker and experimental operator prototypes are not part of the public preview
-or published packages.
+this README. The standalone fuzz workspace is not yet CI-gated. The deprecated
+worker prototype is not part of the public preview.
+
+**Kubernetes:** `blut-operator` runs `BlutPlan` resources as Jobs and keeps
+`BlutWorkerPool` StatefulSets alive. It is validated on a three-node kind
+cluster with MinIO, including retries, a node drain and an operator restart;
+not on managed Kubernetes or with GPUs. Install, CRD reference and limits:
+[docs/OPERATOR.md](docs/OPERATOR.md).
 
 ## Minimum supported Rust version
 
-**1.88.0.** Every published crate declares `rust-version = "1.88"` and CI builds,
+**1.99.0.** Every published crate declares `rust-version = "1.99"` and CI builds,
 clippies and tests them on exactly that toolchain — the floor is measured, not
 asserted.
 
 - An MSRV increase is a **minor** version bump while the crates are `0.x`, and
   will be called out in [CHANGELOG.md](CHANGELOG.md).
-- The unpublished `blut-operator` deliberately requires **1.89** and runs in its
-  own CI lane; it is not part of the published chain.
+- `blut-operator` is a standalone workspace on the same 1.99 floor, gated in
+  its own CI lane.
 - Newer toolchains are not assumed to be supersets. A lint that fires only on a
-  newer clippy is not a release blocker, and one that fires on 1.88 is.
+  newer clippy is not a release blocker, and one that fires on 1.99 is.
 
 ## License
 
@@ -332,7 +341,7 @@ A **commercial license** is available from the maintainer on request.
 
 - [API reference](API.md)
 - [Roadmap](ROADMAP.md) — what 1.0 needs, stated as missing evidence
-- [Validation status](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md)
+- [Validation status](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.2/docs/DISTRIBUTED_VALIDATION.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Release procedure](RELEASING.md)

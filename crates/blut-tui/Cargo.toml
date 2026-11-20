@@ -17,7 +17,7 @@ version = "0.2.0-alpha.2"
 edition = "2024"
 # 1.88, not 1.85. The 1.85 claim was never true and never tested: cargo
 # +1.85 refuses this manifest outright because its `blut` and `ratatui` dependencies both require 1.88.
-rust-version = "1.88"
+rust-version = "1.99"
 # Explicit, because two documents used to claim the opposite while this manifest
 # carried no `publish` key at all -- and blut-tui 0.2.0-alpha.1 is on crates.io.
 publish = ["crates-io"]

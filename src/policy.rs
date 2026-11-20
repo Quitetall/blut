@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! Auto-trigger heuristic for `lamu-train auto`.
+//! Auto-trigger policy, evaluated by the `auto-train-policy` sensor.
 //!
 //! Goal: keep a personal model fresh against accumulated
-//! conversation history without the user having to manually fire
-//! `lamu-train`. A cron entry runs `lamu-train auto` every ~30 min;
-//! `auto` reads `train-policy.toml` + the conversation DB + the
-//! scheduler lockfile and decides whether to spawn a training run.
+//! conversation history without the user having to start training by
+//! hand. `blut policy enable` prints a cron line that runs
+//! `blut sensor eval auto-train-policy` every ~30 min; the sensor reads
+//! `train-policy.toml` + the conversation DB + the scheduler lockfile and
+//! exits 0 only when a training run should start.
 //!
 //! Decision logic (in order):
 //!
@@ -41,7 +42,7 @@ const MAX_SINCE_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrainPolicy {
-    /// Off by default. User opts in via `lamu-train policy enable`.
+    /// Off by default. User opts in via `blut policy enable`.
     #[serde(default)]
     pub enabled: bool,
 
@@ -157,8 +158,11 @@ pub enum Decision {
 /// Path to the policy file. Override via `$LAMU_TRAIN_POLICY` for
 /// hermetic tests + bespoke installs.
 pub fn policy_path() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("LAMU_TRAIN_POLICY") {
+    if let Some(p) = std::env::var_os("LAMU_TRAIN_POLICY") {
         return Ok(PathBuf::from(p));
+    }
+    if let Some(p) = crate::paths::under_state_root("train-policy.toml") {
+        return Ok(p);
     }
     let dir = dirs::config_dir()
         .ok_or_else(|| TrainError::other("config_dir() unavailable; set $LAMU_TRAIN_POLICY"))?
@@ -182,6 +186,30 @@ pub fn load_at(path: &Path) -> Result<TrainPolicy> {
         source: e,
     })?;
     toml::from_str(&body).map_err(|e| TrainError::other(format!("parse {}: {e}", path.display())))
+}
+
+/// Top-level keys in the policy file at `path` that [`TrainPolicy`] does not
+/// know, sorted. Serde ignores them, so a typo (`cooldown_day = 3`) silently
+/// keeps the default, and `blut policy enable|disable` rewrites the file
+/// without them. Empty when the file is absent or not a TOML table.
+pub(crate) fn unknown_keys_at(path: &Path) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(table) = body.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let known: toml::Table = toml::to_string(&TrainPolicy::default())
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+    let mut unknown: Vec<String> = table
+        .keys()
+        .filter(|k| !known.contains_key(k.as_str()))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
 }
 
 /// Atomically write the policy. Tmp + rename — the standard
@@ -237,9 +265,7 @@ pub fn decide(
     inference_lock_held: bool,
 ) -> Decision {
     if !policy.enabled {
-        return Decision::Skip(
-            "auto-trigger disabled (run `lamu-train policy enable` to opt in)".into(),
-        );
+        return Decision::Skip("auto-trigger disabled (run `blut policy enable` to opt in)".into());
     }
     let (start, end) = match parse_quiet_hours(&policy.quiet_hours) {
         Ok(p) => p,
@@ -689,5 +715,18 @@ mod tests {
             decide(&p, p.last_attempt_ts + 1, at_3am(), 10_000, false),
             Decision::Run { .. }
         ));
+    }
+
+    #[test]
+    fn unknown_policy_keys_are_reported() {
+        // E2E regression: a typo'd key was silently ignored and then dropped by
+        // the next `blut policy enable`.
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("p.toml");
+        assert!(unknown_keys_at(&path).is_empty());
+        std::fs::write(&path, "enabled = true\ncooldown_day = 3\nmy_note = \"x\"\n").unwrap();
+        assert_eq!(unknown_keys_at(&path), vec!["cooldown_day", "my_note"]);
+        std::fs::write(&path, "enabled = true\ncooldown_days = 3\n").unwrap();
+        assert!(unknown_keys_at(&path).is_empty());
     }
 }

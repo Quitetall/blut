@@ -257,6 +257,13 @@ fn resolve_string(
     Ok(serde_json::Value::String(value))
 }
 
+/// True when `raw` names any registry handle (`dataset://`, a model
+/// registry pin, an experiment reference) that would resolve against this
+/// machine's registries. A run submitted elsewhere cannot see them.
+pub(crate) fn names_registry_handles(raw: &serde_json::Value) -> bool {
+    Needed::scan(raw).any()
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Needed {
     dataset: bool,

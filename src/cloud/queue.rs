@@ -5,10 +5,10 @@
 //! not strand it — `reclaim_expired` returns the job to the pending set once its
 //! lease elapses, so another worker picks it up.
 //!
-//! [`MemQueue`] is the in-process implementation used by the loopback proof and
-//! single-box runs. A real cross-process deployment (submitter local, worker on a
-//! cloud GPU box) swaps in an object-store / REST-backed `CloudQueue` with the same
-//! trait — the dispatch path above it is unchanged.
+//! [`MemQueue`] is the in-process implementation used by the loopback proof.
+//! A cross-process deployment (submitter local, worker on a cloud GPU box) uses
+//! [`ObjectQueue`](super::object_queue::ObjectQueue) behind the same trait: the
+//! dispatch path above it is unchanged.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -75,6 +75,41 @@ pub trait CloudQueue: Send + Sync {
     /// Return every job whose lease has expired to the pending set; returns how
     /// many were requeued.
     async fn reclaim_expired(&self) -> Result<usize, CloudError>;
+    /// Extend the lease `assignment` holds on `job_id` to `lease_secs` from
+    /// now. `Ok(false)`: the assignment is no longer current (the job was
+    /// cancelled, finished, or re-leased), so the holder should stop. A queue
+    /// that cannot renew says so with an error; the default is that error.
+    async fn renew(
+        &self,
+        job_id: &str,
+        assignment: &Assignment,
+        lease_secs: u64,
+    ) -> Result<bool, CloudError> {
+        let _ = (job_id, assignment, lease_secs);
+        Err(CloudError::Dispatch(
+            "this cloud queue cannot renew leases".into(),
+        ))
+    }
+    /// Give the job back without a result, so another worker can claim it at
+    /// once instead of after the lease runs out (a worker shutting down).
+    /// `Ok(false)`: the assignment was no longer current.
+    async fn release(
+        &self,
+        job_id: &str,
+        assignment: &Assignment,
+        reason: &str,
+    ) -> Result<bool, CloudError> {
+        let _ = (job_id, assignment, reason);
+        Err(CloudError::Dispatch(
+            "this cloud queue cannot release leases".into(),
+        ))
+    }
+    /// Why workers left `job_id` unclaimed (one line per worker), for the
+    /// submitter to report when nobody picks a job up. Empty by default.
+    async fn refusals(&self, job_id: &str) -> Result<Vec<String>, CloudError> {
+        let _ = job_id;
+        Ok(Vec::new())
+    }
 }
 
 struct Leased {
@@ -246,6 +281,42 @@ impl CloudQueue for MemQueue {
 
     async fn reclaim_expired(&self) -> Result<usize, CloudError> {
         Ok(self.inner.lock().reclaim(Instant::now()))
+    }
+
+    async fn renew(
+        &self,
+        job_id: &str,
+        assignment: &Assignment,
+        lease_secs: u64,
+    ) -> Result<bool, CloudError> {
+        let now = Instant::now();
+        let mut g = self.inner.lock();
+        g.reclaim(now);
+        match g.leased.get_mut(job_id) {
+            Some(leased) if &leased.assignment == assignment => {
+                leased.until = now + Duration::from_secs(lease_secs);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn release(
+        &self,
+        job_id: &str,
+        assignment: &Assignment,
+        _reason: &str,
+    ) -> Result<bool, CloudError> {
+        let mut g = self.inner.lock();
+        g.reclaim(Instant::now());
+        match g.leased.get(job_id) {
+            Some(leased) if &leased.assignment == assignment => {
+                let leased = g.leased.remove(job_id).expect("checked above");
+                g.pending.push(leased.job);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 }
 

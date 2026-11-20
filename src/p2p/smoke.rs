@@ -6,7 +6,8 @@
 //! `blut p2p serve --smoke-stage` can prove the **full data plane** end-to-end
 //! between two real machines (bundle → QUIC blob → remote execute → bundle back
 //! → content-hash verify) without a heavyweight cookbook stage or real data.
-//! It is always-dispatchable (added to `DefaultDispatchPolicy`'s default set).
+//! It declares it may run anywhere with public data ([`Stage::placement`]), and
+//! is the one name in `DefaultDispatchPolicy`'s list for the name-based paths.
 //!
 //! The dispatch half ([`smoke_dispatch_once`]) mirrors the proven loopback path
 //! in `tests/p2p_integration.rs::peer_runs_real_stage_end_to_end`, but with the
@@ -89,6 +90,13 @@ impl Stage for SmokeEcho {
             content_hash,
             path: out,
         })
+    }
+
+    /// The probe's payload is synthetic, so it may go to any peer.
+    fn placement(&self, _args: &Self::Args) -> crate::framework::stage::StagePlacement {
+        crate::framework::stage::StagePlacement::remote(
+            crate::framework::execution::DataClassification::Public,
+        )
     }
 }
 

@@ -8,15 +8,23 @@
 //! only the blob transport changes — `crate::p2p::transport::{send_blob,recv_blob}`
 //! over QUIC becomes the canonical [`crate::framework::object_store::ObjectStore`].
 //!
-//! The public preview builds on `object_store`'s local-filesystem backend only.
-//! Network providers are deferred until their dependency, TLS, secret-handling,
-//! and provider-integration gates pass. Clinical/PHI EEG remains hard-blocked:
-//! cloud workers are capped at `Registered` trust, so the reused `DispatchMatrix`
-//! refuses `DataClass::Restricted` to every cloud worker.
+//! `recipe run --launcher cloud` puts these together: a [`crate::cloud::submitter::CloudSubmitter`]
+//! over the durable [`crate::cloud::object_queue::ObjectQueue`] on a [`crate::cloud::location::CloudLocation`]
+//! (a bucket, with the `s3` feature, or a directory), and `blut cloud worker`
+//! ([`crate::cloud::worker::serve`]) on any machine that can reach it, running the same code.
+//! [`crate::cloud::queue::MemQueue`] remains the in-process queue of the loopback proofs.
+//! Clinical/PHI EEG remains hard-blocked: cloud workers are capped at `Registered`
+//! trust, so the reused `DispatchMatrix` refuses `DataClass::Restricted` to every
+//! cloud worker, and a restricted tenant's run is refused before anything is
+//! submitted.
 
 pub mod cost;
 pub mod job;
+pub mod location;
+pub mod object_queue;
+pub mod policy;
 pub mod queue;
+pub mod records;
 pub mod submitter;
 pub mod worker;
 

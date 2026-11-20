@@ -16,6 +16,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::{Connection as QuinnConnection, Endpoint, ServerConfig};
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,12 @@ use crate::p2p::task::{TaskManifest, TaskResult};
 use crate::p2p::trust::TrustLevel;
 
 /// Messages exchanged between coordinator and peer over QUIC streams.
+///
+/// Non-exhaustive: the protocol gains messages over time (`Goodbye` arrived in
+/// 0.2.0-alpha.2), and a peer must already treat an unknown message as an
+/// error, so code outside this crate should too.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum WireMessage {
     /// Peer → Coordinator: initial handshake with identity.
     Handshake {
@@ -82,6 +88,141 @@ pub enum WireMessage {
         task_id: String,
         dir: crate::p2p::bundle::BlobDir,
     },
+    /// Coordinator → Peer: the session is over and the peer should close and
+    /// exit. Sent on a reliable stream before the QUIC close, because the
+    /// CONNECTION_CLOSE frame itself is not retransmitted: if it is lost and the
+    /// coordinator process has exited, the peer would otherwise wait out the
+    /// idle timeout. A peer that predates this variant fails to decode it and
+    /// ends its loop, which is also an exit.
+    Goodbye { reason: String },
+}
+
+/// What a worker can receive between tasks.
+#[derive(Clone, Debug)]
+pub enum PeerInbound {
+    /// A task to execute.
+    Task(Box<TaskManifest>),
+    /// The coordinator ended the session in order.
+    Goodbye(String),
+    /// A cancel for a task that is not running here (late or duplicate).
+    StrayCancel(String),
+}
+
+/// QUIC idle timeout for every P2P connection: a connection that hears nothing
+/// from its peer for this long is closed with `timed out`. This is also the
+/// bound on an unanswered dial (no QUIC response at all).
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Keep-alive PING interval. Without it an idle session (a worker waiting for
+/// tasks) is torn down after [`IDLE_TIMEOUT`] even though both ends are alive,
+/// and a session that loses connectivity mid-transfer does not send anything
+/// for long stretches (PTO backoff) once the path heals, so the idle timer
+/// fires first. A PING every few seconds both keeps the session up and probes
+/// a healed path promptly.
+pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Bound on the application-level handshake (`Handshake` / `HandshakeAck`)
+/// after QUIC connects, so a client that completes QUIC but never speaks cannot
+/// hold an accept loop (keep-alives would otherwise keep it from idling out).
+pub const HANDSHAKE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on an orderly close: how long [`end_session`] waits for the peer to
+/// acknowledge `Goodbye`, and how long [`P2pServer::drain`] waits for closes
+/// to be sent before the process may exit.
+pub const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// QUIC application close code for an orderly end of session.
+pub const SESSION_DONE: u32 = 0x5d;
+
+/// Environment variable that selects the QUIC congestion controller.
+pub const CONGESTION_ENV: &str = "BLUT_P2P_CONGESTION";
+
+/// The QUIC congestion controller P2P endpoints use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Congestion {
+    /// quinn's default, loss-based. Collapses on lossy long paths: on a real
+    /// Australia-to-Germany path, 1 MiB each way took 12 s clean, 87-145 s
+    /// at 1% random loss, and did not finish in 300 s at 5%.
+    Cubic,
+    /// Model-based, so random loss is not read as congestion: the same path
+    /// took 10.4 s clean, 11.3 s at 1% and 14.2 s at 5%. quinn marks its BBR
+    /// experimental, which is why it is opt-in.
+    Bbr,
+}
+
+/// The controller selected by [`CONGESTION_ENV`]: unset or `cubic` is
+/// [`Congestion::Cubic`], `bbr` is [`Congestion::Bbr`]; anything else is an
+/// error, so a typo never silently runs the default.
+pub fn congestion_from_env() -> Result<Congestion, TrainError> {
+    match std::env::var(CONGESTION_ENV) {
+        Err(_) => Ok(Congestion::Cubic),
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "cubic" => Ok(Congestion::Cubic),
+            "bbr" => Ok(Congestion::Bbr),
+            other => Err(TrainError::other(format!(
+                "{CONGESTION_ENV}={other:?}: expected `cubic` (default) or `bbr`"
+            ))),
+        },
+    }
+}
+
+/// The transport parameters every P2P endpoint uses (server and client).
+fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut t = quinn::TransportConfig::default();
+    // 30 s is well inside the QUIC varint range, so this cannot fail.
+    t.max_idle_timeout(quinn::IdleTimeout::try_from(IDLE_TIMEOUT).ok());
+    t.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    // The CLI validates the variable before any endpoint exists; a library
+    // caller that skipped that gets the default rather than a panic here.
+    if matches!(congestion_from_env(), Ok(Congestion::Bbr)) {
+        t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
+    Arc::new(t)
+}
+
+/// Why a connection ended, in words an operator can act on. `None` while the
+/// connection is still open.
+pub fn connection_end_reason(conn: &QuinnConnection) -> Option<String> {
+    conn.close_reason().map(|e| connection_end_reason_of(&e))
+}
+
+/// [`connection_end_reason`] for an already-extracted close reason.
+pub fn connection_end_reason_of(e: &quinn::ConnectionError) -> String {
+    match e {
+        quinn::ConnectionError::TimedOut => format!(
+            "timed out: nothing heard from the other side for {}s (QUIC idle \
+             timeout) — a network partition, a crashed process, or UDP blocked",
+            IDLE_TIMEOUT.as_secs()
+        ),
+        quinn::ConnectionError::ApplicationClosed(c) => format!(
+            "closed by the other side (code {}, reason {:?})",
+            c.error_code,
+            String::from_utf8_lossy(&c.reason)
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// End a session in order from the coordinator side: send `Goodbye` on a
+/// reliable stream, wait (at most [`CLOSE_DRAIN_TIMEOUT`]) until the peer has
+/// received it, then close with [`SESSION_DONE`]. Best-effort and bounded: a
+/// peer that is already gone costs at most the drain timeout.
+pub async fn end_session(conn: &QuinnConnection, reason: &str) {
+    let goodbye = async {
+        let mut stream = conn.open_uni().await.ok()?;
+        send_message(
+            &mut stream,
+            &WireMessage::Goodbye {
+                reason: reason.to_string(),
+            },
+        )
+        .await
+        .ok()?;
+        // Resolves once the peer has acknowledged every byte of the stream.
+        stream.stopped().await.ok()
+    };
+    let _ = tokio::time::timeout(CLOSE_DRAIN_TIMEOUT, goodbye).await;
+    conn.close(SESSION_DONE.into(), reason.as_bytes());
 }
 
 /// Terminal reply for one dispatched P2P task. The coordinator adapter maps
@@ -180,12 +321,22 @@ pub async fn send_blob(
     for (seq, chunk) in pack.chunks(CHUNK_MAX).enumerate() {
         let seq = u32::try_from(seq)
             .map_err(|_| TrainError::other("blob has too many chunks (seq overflow)"))?;
-        let mut s = conn
+        let s = conn
             .open_uni()
             .await
             .map_err(|e| TrainError::other(format!("open blob-chunk stream: {e}")))?;
+        // Held until the peer has acknowledged the chunk: if this transfer is
+        // abandoned (the caller's deadline fires), the guard resets the stream
+        // so the unsent megabytes are dropped instead of being transmitted for
+        // nobody — a backlog that also held the connection's CLOSE frame behind
+        // congestion control, leaving the worker to wait out the idle timeout.
+        let mut guard = ResetOnDrop(Some(s));
+        let stream = guard
+            .0
+            .as_mut()
+            .expect("guard holds the stream until acked");
         send_message(
-            &mut s,
+            stream,
             &WireMessage::BundleBlobChunk {
                 task_id: task_id.to_string(),
                 dir,
@@ -194,6 +345,14 @@ pub async fn send_blob(
             },
         )
         .await?;
+        // `Some(code)`: the receiver stopped the stream. quinn does that when a
+        // receiver drops a stream it has read the whole message from but not
+        // yet seen FIN on, so it is not a failure; the receiver's own reply
+        // says whether the blob was accepted. Only a lost connection is.
+        if let Err(e) = stream.stopped().await {
+            return Err(TrainError::other(format!("blob chunk {seq}: {e}")));
+        }
+        guard.0 = None;
     }
     {
         let mut s = conn
@@ -210,6 +369,19 @@ pub async fn send_blob(
         .await?;
     }
     Ok(())
+}
+
+/// A send stream that is reset when dropped while still holding it (see the
+/// chunk loop in [`send_blob`]). Resetting discards data quinn has buffered
+/// but not yet sent, even after `finish`.
+struct ResetOnDrop(Option<quinn::SendStream>);
+
+impl Drop for ResetOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut stream) = self.0.take() {
+            let _ = stream.reset(SESSION_DONE.into());
+        }
+    }
 }
 
 /// Receive a bundle blob sent by `send_blob`: accept uni streams, expect a
@@ -348,13 +520,40 @@ async fn write_lp(stream: &mut quinn::SendStream, bytes: &[u8]) -> Result<(), Tr
         .map_err(|e| TrainError::other(format!("write lp body: {e}")))
 }
 
-/// Length-prefixed read, capped before allocation.
-async fn read_lp(stream: &mut quinn::RecvStream, cap: usize) -> Result<Vec<u8>, TrainError> {
+/// Bound one read by `stall` (None = unbounded, the caller's own deadline
+/// applies). A peer that goes quiet mid-transfer fails here instead of holding
+/// the transfer open until an outer deadline that may be hours away.
+async fn within_stall<T>(
+    stall: Option<Duration>,
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T, TrainError>>,
+) -> Result<T, TrainError> {
+    match stall {
+        None => fut.await,
+        Some(limit) => tokio::time::timeout(limit, fut).await.map_err(|_| {
+            TrainError::other(format!(
+                "peer stalled: nothing received for {}s while reading {what}",
+                limit.as_secs()
+            ))
+        })?,
+    }
+}
+
+/// Length-prefixed read, capped before allocation, each read bounded by
+/// `stall` when given.
+async fn read_lp_stalled(
+    stream: &mut quinn::RecvStream,
+    cap: usize,
+    stall: Option<Duration>,
+) -> Result<Vec<u8>, TrainError> {
     let mut len = [0u8; 4];
-    stream
-        .read_exact(&mut len)
-        .await
-        .map_err(|e| TrainError::other(format!("read lp len: {e}")))?;
+    within_stall(stall, "a frame length", async {
+        stream
+            .read_exact(&mut len)
+            .await
+            .map_err(|e| TrainError::other(format!("read lp len: {e}")))
+    })
+    .await?;
     let n = u32::from_le_bytes(len) as usize;
     if n > cap {
         return Err(TrainError::other(format!(
@@ -362,10 +561,13 @@ async fn read_lp(stream: &mut quinn::RecvStream, cap: usize) -> Result<Vec<u8>, 
         )));
     }
     let mut buf = vec![0u8; n];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| TrainError::other(format!("read lp body: {e}")))?;
+    within_stall(stall, "a frame body", async {
+        stream
+            .read_exact(&mut buf)
+            .await
+            .map_err(|e| TrainError::other(format!("read lp body: {e}")))
+    })
+    .await?;
     Ok(buf)
 }
 
@@ -379,21 +581,34 @@ pub async fn send_blob_deduped(
     store: &crate::p2p::chunkstore::ChunkStore,
     blob: &[u8],
 ) -> Result<(), TrainError> {
-    let index = store
-        .put_blob(blob)
-        .map_err(|e| TrainError::other(format!("chunk blob: {e}")))?;
     let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|e| TrainError::other(format!("open blob bi-stream: {e}")))?;
+    send_blob_deduped_on(&mut send, &mut recv, store, blob, None).await
+}
+
+/// The sender half of the deduped transfer over an already-open bi-stream.
+/// Shared by [`send_blob_deduped`] and the mesh object plane
+/// ([`crate::p2p::objects`]), which runs it after its own request header.
+pub(crate) async fn send_blob_deduped_on(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    store: &crate::p2p::chunkstore::ChunkStore,
+    blob: &[u8],
+    stall: Option<Duration>,
+) -> Result<(), TrainError> {
+    let index = store
+        .put_blob(blob)
+        .map_err(|e| TrainError::other(format!("chunk blob: {e}")))?;
 
     // 1. Offer the index.
     let idx_bytes = bincode::serialize(&index)
         .map_err(|e| TrainError::other(format!("serialize chunk index: {e}")))?;
-    write_lp(&mut send, &idx_bytes).await?;
+    write_lp(send, &idx_bytes).await?;
 
     // 2. Learn the receiver's missing set.
-    let needed_bytes = read_lp(&mut recv, MAX_CONTROL_FRAME).await?;
+    let needed_bytes = read_lp_stalled(recv, MAX_CONTROL_FRAME, stall).await?;
     let needed: Vec<u32> = bincode::deserialize(&needed_bytes)
         .map_err(|e| TrainError::other(format!("decode needed set: {e}")))?;
     // Fail fast on an implausible request: a receiver can't need more chunks
@@ -418,7 +633,7 @@ pub async fn send_blob_deduped(
         send.write_all(&seq.to_le_bytes())
             .await
             .map_err(|e| TrainError::other(format!("write chunk seq: {e}")))?;
-        write_lp(&mut send, &bytes).await?;
+        write_lp(send, &bytes).await?;
     }
     send.finish()
         .map_err(|e| TrainError::other(format!("finish blob stream: {e}")))?;
@@ -428,9 +643,12 @@ pub async fn send_blob_deduped(
     //    connection down while stream data is still in flight (esp. the 0-chunk
     //    resend, where the receiver never reads our send half to EOF).
     let mut ack = [0u8; 1];
-    recv.read_exact(&mut ack)
-        .await
-        .map_err(|e| TrainError::other(format!("read completion ack: {e}")))?;
+    within_stall(stall, "the completion ack", async {
+        recv.read_exact(&mut ack)
+            .await
+            .map_err(|e| TrainError::other(format!("read completion ack: {e}")))
+    })
+    .await?;
     Ok(())
 }
 
@@ -450,9 +668,21 @@ pub async fn recv_blob_deduped(
         .accept_bi()
         .await
         .map_err(|e| TrainError::other(format!("accept blob bi-stream: {e}")))?;
+    recv_blob_deduped_on(&mut send, &mut recv, store, max_blob_size, None).await
+}
 
+/// The receiver half of the deduped transfer over an already-open bi-stream.
+/// With `stall`, every read is bounded: a sender that goes quiet mid-transfer
+/// fails the receive instead of holding it open.
+pub(crate) async fn recv_blob_deduped_on(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    store: &crate::p2p::chunkstore::ChunkStore,
+    max_blob_size: u64,
+    stall: Option<Duration>,
+) -> Result<Vec<u8>, TrainError> {
     // 1. Read + validate the offered index.
-    let idx_bytes = read_lp(&mut recv, MAX_CONTROL_FRAME).await?;
+    let idx_bytes = read_lp_stalled(recv, MAX_CONTROL_FRAME, stall).await?;
     let index: crate::p2p::chunkstore::ChunkIndex = bincode::deserialize(&idx_bytes)
         .map_err(|e| TrainError::other(format!("decode chunk index: {e}")))?;
     index
@@ -472,7 +702,7 @@ pub async fn recv_blob_deduped(
     let needed: Vec<u32> = missing.iter().map(|&i| i as u32).collect();
     // Keep our send half OPEN (don't finish here) — the completion ack rides it.
     write_lp(
-        &mut send,
+        send,
         &bincode::serialize(&needed)
             .map_err(|e| TrainError::other(format!("serialize needed: {e}")))?,
     )
@@ -486,16 +716,19 @@ pub async fn recv_blob_deduped(
     let mut outstanding: std::collections::HashSet<usize> = missing.iter().copied().collect();
     while !outstanding.is_empty() {
         let mut seqb = [0u8; 4];
-        recv.read_exact(&mut seqb)
-            .await
-            .map_err(|e| TrainError::other(format!("read chunk seq: {e}")))?;
+        within_stall(stall, "a chunk header", async {
+            recv.read_exact(&mut seqb)
+                .await
+                .map_err(|e| TrainError::other(format!("read chunk seq: {e}")))
+        })
+        .await?;
         let seq = u32::from_le_bytes(seqb) as usize;
         if !outstanding.remove(&seq) {
             return Err(TrainError::other(format!(
                 "sender sent chunk {seq} that was not outstanding (unrequested or duplicate)"
             )));
         }
-        let bytes = read_lp(&mut recv, CHUNK_MAX).await?;
+        let bytes = read_lp_stalled(recv, CHUNK_MAX, stall).await?;
         // `seq` came from `outstanding` ⊆ the index range, so this is in range.
         store
             .store_chunk(index.chunk_hashes[seq], &bytes)
@@ -530,6 +763,46 @@ pub struct P2pServer {
     /// terminal close from a transient per-connection error and stop cleanly
     /// instead of spinning.
     closing: Arc<std::sync::atomic::AtomicBool>,
+    /// Writes the registry off the async path ([`RegistrySaver`]).
+    saver: RegistrySaver,
+}
+
+/// Persists a [`PeerRegistry`] without blocking the task that changed it.
+///
+/// `PeerRegistry::save` fsyncs and renames. Called from an inbound handshake
+/// while holding the registry lock, it stalled every handshake behind the
+/// disk: on a loaded disk a single save took seconds and dials hit their 10 s
+/// timeout. A change now marks the registry dirty and returns; one background
+/// task snapshots it and saves on a blocking thread, one save at a time, and
+/// marks that arrive during a save collapse into one more save. Durability is
+/// unchanged (the same fsync and rename); the save just happens after the
+/// handshake instead of inside it. The last mark is saved when the server is
+/// dropped.
+#[derive(Clone)]
+pub(crate) struct RegistrySaver {
+    dirty: tokio::sync::mpsc::Sender<()>,
+}
+
+impl RegistrySaver {
+    fn spawn(peers: Arc<RwLock<PeerRegistry>>) -> Self {
+        let (dirty, mut marks) = tokio::sync::mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            while marks.recv().await.is_some() {
+                let snapshot = peers.read().await.clone();
+                match tokio::task::spawn_blocking(move || snapshot.write_atomic()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("p2p: failed to persist the peer registry: {e}"),
+                    Err(e) => tracing::warn!("p2p: peer registry save task failed: {e}"),
+                }
+            }
+        });
+        Self { dirty }
+    }
+
+    /// Mark the registry changed. Never blocks.
+    pub(crate) fn mark_dirty(&self) {
+        let _ = self.dirty.try_send(());
+    }
 }
 
 impl P2pServer {
@@ -557,12 +830,35 @@ impl P2pServer {
         let server_config = Self::make_server_config(&keypair, allow_legacy)?;
         let endpoint = Endpoint::server(server_config, addr)
             .map_err(|e| TrainError::other(format!("bind QUIC endpoint: {e}")))?;
+        // Background saves expect the directory; see `write_atomic`.
+        if let Err(e) = peers.ensure_dir() {
+            tracing::warn!("p2p: peer registry directory: {e}");
+        }
+        let peers = Arc::new(RwLock::new(peers));
         Ok(Self {
             endpoint,
-            peers: Arc::new(RwLock::new(peers)),
+            saver: RegistrySaver::spawn(peers.clone()),
+            peers,
             allow_legacy,
             closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Persist the peer registry after a change, off the caller's task
+    /// ([`RegistrySaver`]).
+    pub(crate) fn persist_peers(&self) {
+        self.saver.mark_dirty();
+    }
+
+    /// Save the peer registry now, on a blocking thread, and wait for it: for
+    /// a process about to exit, whose background save might not get to run.
+    pub(crate) async fn flush_peers(&self) {
+        let snapshot = self.peers.read().await.clone();
+        match tokio::task::spawn_blocking(move || snapshot.write_atomic()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("p2p: failed to persist the peer registry: {e}"),
+            Err(e) => tracing::warn!("p2p: peer registry save task failed: {e}"),
+        }
     }
 
     /// Whether [`shutdown`](Self::shutdown) has been called — a terminal signal
@@ -574,11 +870,33 @@ impl P2pServer {
     /// Accept the next incoming peer connection. Returns the peer's ID
     /// and the connection handle after a successful handshake.
     pub async fn accept_peer(&self) -> Result<(PeerId, QuinnConnection), TrainError> {
-        let conn = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or_else(|| TrainError::other("QUIC endpoint closed"))?
+        let incoming = self.accept_incoming().await?;
+        self.complete_incoming(incoming).await
+    }
+
+    /// The first half of [`accept_peer`](Self::accept_peer): wait for the next
+    /// connection attempt, without doing its handshake. A server that accepts
+    /// many peers hands each attempt to [`complete_incoming`] in its own task,
+    /// so one slow or stalled handshake does not hold up the others.
+    ///
+    /// [`complete_incoming`]: Self::complete_incoming
+    pub(crate) async fn accept_incoming(&self) -> Result<quinn::Incoming, TrainError> {
+        self.endpoint.accept().await.ok_or_else(|| {
+            // `accept()` yields None only once the endpoint is closed, which
+            // is terminal: record it so accept loops stop.
+            self.closing
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            TrainError::other("QUIC endpoint closed")
+        })
+    }
+
+    /// The second half of [`accept_peer`](Self::accept_peer): the QUIC and
+    /// mutual-TLS handshake, then the bounded handshake message.
+    pub(crate) async fn complete_incoming(
+        &self,
+        incoming: quinn::Incoming,
+    ) -> Result<(PeerId, QuinnConnection), TrainError> {
+        let conn = incoming
             .await
             .map_err(|e| TrainError::other(format!("accept connection: {e}")))?;
 
@@ -592,12 +910,23 @@ impl P2pServer {
             ));
         }
 
-        // Read the handshake message.
-        let mut stream = conn
-            .accept_uni()
-            .await
-            .map_err(|e| TrainError::other(format!("accept stream: {e}")))?;
-        let msg = recv_message(&mut stream).await?;
+        // Read the handshake message, bounded (see HANDSHAKE_MESSAGE_TIMEOUT).
+        let msg = tokio::time::timeout(HANDSHAKE_MESSAGE_TIMEOUT, async {
+            let mut stream = conn
+                .accept_uni()
+                .await
+                .map_err(|e| TrainError::other(format!("accept stream: {e}")))?;
+            recv_message(&mut stream).await
+        })
+        .await
+        .map_err(|_| {
+            conn.close(0u32.into(), b"handshake timeout");
+            TrainError::other(format!(
+                "peer {} sent no handshake within {}s",
+                conn.remote_address(),
+                HANDSHAKE_MESSAGE_TIMEOUT.as_secs()
+            ))
+        })??;
 
         let (peer_id, trust) = match msg {
             WireMessage::Handshake {
@@ -633,11 +962,10 @@ impl P2pServer {
                     registry.upsert(info);
                     TrustLevel::Anonymous
                 };
-                if let Err(e) = registry.save() {
-                    tracing::warn!(
-                        "p2p: failed to persist peer registry after registering {peer_id}: {e}"
-                    );
-                }
+                drop(registry);
+                // Saved off this task: an fsync here held the handshake (and
+                // the registry lock) behind the disk.
+                self.persist_peers();
 
                 // Send ack.
                 let ack = WireMessage::HandshakeAck {
@@ -731,6 +1059,13 @@ impl P2pServer {
         self.endpoint.close(0u32.into(), b"shutdown");
     }
 
+    /// Wait (at most `max`) until every connection on this endpoint has
+    /// finished closing, so the close frames are on the wire before the process
+    /// exits. Call after [`end_session`] / [`shutdown`](Self::shutdown).
+    pub async fn drain(&self, max: Duration) {
+        let _ = tokio::time::timeout(max, self.endpoint.wait_idle()).await;
+    }
+
     fn make_server_config(
         keypair: &KeyPair,
         allow_legacy: bool,
@@ -759,10 +1094,12 @@ impl P2pServer {
         .map_err(|e| TrainError::other(format!("TLS config: {e}")))?;
         server_crypto.alpn_protocols = vec![b"blut-p2p".to_vec()];
 
-        Ok(ServerConfig::with_crypto(Arc::new(
+        let mut config = ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
                 .map_err(|e| TrainError::other(format!("QUIC server config: {e}")))?,
-        )))
+        ));
+        config.transport_config(transport_config());
+        Ok(config)
     }
 }
 
@@ -791,7 +1128,11 @@ fn identity_cert(
         &rcgen::PKCS_ED25519,
     )
     .map_err(|e| TrainError::other(format!("derive TLS keypair from identity: {e}")))?;
-    let rcgen_cert = rcgen::CertificateParams::new(vec!["blut-p2p".into()])
+    let names = vec![
+        "blut-p2p".to_string(),
+        x25519_dns_name(&keypair.x25519_public.to_bytes()),
+    ];
+    let rcgen_cert = rcgen::CertificateParams::new(names)
         .map_err(|e| TrainError::other(format!("cert params: {e}")))?
         .self_signed(&cert_key_pair)
         .map_err(|e| TrainError::other(format!("generate cert: {e}")))?;
@@ -862,13 +1203,40 @@ fn ed25519_pubkey_from_spki(spki: &[u8]) -> Option<[u8; 32]> {
     Some(key)
 }
 
+/// The DNS name an identity cert carries to publish its holder's X25519
+/// (sealing) key: `x25519-<first 16 bytes>.<last 16 bytes>.blut-p2p.invalid`,
+/// hex, split so no label exceeds 63 characters. Only the holder of the cert's
+/// Ed25519 key can complete a TLS handshake with it, so a peer that pinned
+/// that key can trust the value. `.invalid` can never resolve.
+fn x25519_dns_name(x25519_pub: &[u8; 32]) -> String {
+    let hex = faster_hex::hex_string(x25519_pub);
+    format!("x25519-{}.{}.blut-p2p.invalid", &hex[..32], &hex[32..])
+}
+
+/// The X25519 key published by [`x25519_dns_name`], if a cert carries one.
+/// Certs from releases before this name existed carry none.
+fn x25519_from_dns_names<'a>(names: impl Iterator<Item = &'a str>) -> Option<[u8; 32]> {
+    names.into_iter().find_map(|name| {
+        let rest = name
+            .strip_prefix("x25519-")?
+            .strip_suffix(".blut-p2p.invalid")?;
+        let (first, second) = rest.split_once('.')?;
+        if first.len() != 32 || second.len() != 32 {
+            return None;
+        }
+        let mut key = [0u8; 32];
+        faster_hex::hex_decode(format!("{first}{second}").as_bytes(), &mut key).ok()?;
+        Some(key)
+    })
+}
+
 /// Extract the Ed25519 identity that TLS mutually authenticated for `conn` —
 /// i.e. the public key the peer PROVED it holds the private half of during the
 /// handshake (via its client cert + `CertificateVerify`). `None` if the peer
 /// presented no cert (legacy peer) or a non-Ed25519 cert. This is the value
 /// `accept_peer` binds the handshake-asserted `PeerId` against, closing the
 /// self-asserted-identity hole.
-fn tls_authenticated_pubkey(conn: &QuinnConnection) -> Option<[u8; 32]> {
+pub(crate) fn tls_authenticated_pubkey(conn: &QuinnConnection) -> Option<[u8; 32]> {
     let identity = conn.peer_identity()?;
     let certs = identity
         .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
@@ -883,6 +1251,10 @@ pub struct P2pClient {
     keypair: Arc<KeyPair>,
     /// Expected Ed25519 public key of the coordinator (for TLS cert pinning).
     coordinator_pubkey: Option<[u8; 32]>,
+    /// Expected X25519 key of the coordinator, checked against the one its
+    /// pinned cert publishes. Results are sealed to this key, so a wrong one
+    /// means work whose output nobody can open.
+    coordinator_x25519: Option<[u8; 32]>,
 }
 
 impl P2pClient {
@@ -891,6 +1263,7 @@ impl P2pClient {
         Self {
             keypair,
             coordinator_pubkey: None,
+            coordinator_x25519: None,
         }
     }
 
@@ -901,6 +1274,23 @@ impl P2pClient {
         Self {
             keypair,
             coordinator_pubkey: Some(coordinator_pubkey),
+            coordinator_x25519: None,
+        }
+    }
+
+    /// Pin both halves of the coordinator's public key: the Ed25519 identity
+    /// (checked against its TLS cert) and the X25519 key results are sealed
+    /// to (checked against the key that cert publishes, when it publishes
+    /// one). A mismatch in either refuses the connection before any work.
+    pub fn with_coordinator_keys(
+        keypair: Arc<KeyPair>,
+        coordinator_pubkey: [u8; 32],
+        coordinator_x25519: [u8; 32],
+    ) -> Self {
+        Self {
+            keypair,
+            coordinator_pubkey: Some(coordinator_pubkey),
+            coordinator_x25519: Some(coordinator_x25519),
         }
     }
 
@@ -910,8 +1300,20 @@ impl P2pClient {
         &self,
         coordinator_addr: SocketAddr,
     ) -> Result<(QuinnConnection, PeerId), TrainError> {
-        let client_config = Self::make_client_config(&self.keypair, self.coordinator_pubkey)?;
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+        let pin_mismatch = Arc::new(std::sync::Mutex::new(None));
+        let advertised_x25519: AdvertisedX25519 = Arc::new(std::sync::Mutex::new(None));
+        let client_config = Self::make_client_config(
+            &self.keypair,
+            self.coordinator_pubkey,
+            pin_mismatch.clone(),
+            advertised_x25519.clone(),
+        )?;
+        let bind: SocketAddr = if coordinator_addr.is_ipv6() {
+            (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+        } else {
+            (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+        };
+        let mut endpoint = Endpoint::client(bind)
             .map_err(|e| TrainError::other(format!("create client endpoint: {e}")))?;
         endpoint.set_default_client_config(client_config);
 
@@ -919,30 +1321,62 @@ impl P2pClient {
             .connect(coordinator_addr, "blut-p2p")
             .map_err(|e| TrainError::other(format!("connect: {e}")))?
             .await
-            .map_err(|e| TrainError::other(format!("QUIC handshake: {e}")))?;
+            .map_err(|e| {
+                let presented = *pin_mismatch.lock().unwrap_or_else(|p| p.into_inner());
+                TrainError::other(describe_dial_error(
+                    coordinator_addr,
+                    &e,
+                    self.coordinator_pubkey,
+                    presented,
+                ))
+            })?;
 
-        // Send handshake.
+        let advertised = *advertised_x25519.lock().unwrap_or_else(|p| p.into_inner());
+        if let (Some(expected), Some(advertised)) = (self.coordinator_x25519, advertised)
+            && expected != advertised
+        {
+            conn.close(0u32.into(), b"x25519 pin mismatch");
+            return Err(TrainError::other(format!(
+                "coordinator {coordinator_addr} proved the pinned identity, but its sealing \
+                 (X25519) key is {} while the second half of --coordinator-pubkey is {}. \
+                 Results would be sealed to a key the coordinator cannot open; copy the whole \
+                 `pubkey` line from `blut p2p keys show` on the coordinator",
+                faster_hex::hex_string(&advertised),
+                faster_hex::hex_string(&expected),
+            )));
+        }
+
+        // Send handshake, read ack — bounded (HANDSHAKE_MESSAGE_TIMEOUT).
         let handshake = WireMessage::Handshake {
             pubkey: self.keypair.verifying.to_bytes(),
             x25519_pub: self.keypair.x25519_public.to_bytes(),
             capabilities: PeerCapabilities::default(),
         };
-        let mut stream = conn
-            .open_uni()
-            .await
-            .map_err(|e| TrainError::other(format!("open handshake stream: {e}")))?;
-        send_message(&mut stream, &handshake).await?;
-
-        // Read ack.
-        let mut ack_stream = conn
-            .accept_uni()
-            .await
-            .map_err(|e| TrainError::other(format!("accept ack stream: {e}")))?;
-        let msg = recv_message(&mut ack_stream).await?;
+        let msg = tokio::time::timeout(HANDSHAKE_MESSAGE_TIMEOUT, async {
+            let mut stream = conn
+                .open_uni()
+                .await
+                .map_err(|e| TrainError::other(format!("open handshake stream: {e}")))?;
+            send_message(&mut stream, &handshake).await?;
+            let mut ack_stream = conn
+                .accept_uni()
+                .await
+                .map_err(|e| TrainError::other(format!("accept ack stream: {e}")))?;
+            recv_message(&mut ack_stream).await
+        })
+        .await
+        .map_err(|_| {
+            TrainError::other(format!(
+                "coordinator {coordinator_addr} accepted the QUIC connection but sent \
+                 no handshake reply within {}s",
+                HANDSHAKE_MESSAGE_TIMEOUT.as_secs()
+            ))
+        })??;
         let peer_id = match msg {
             WireMessage::HandshakeAck { peer_id, trust } => {
                 tracing::info!(
-                    "Connected to coordinator as {} (trust: {})",
+                    "handshake with {coordinator_addr} complete: it knows this node as {} \
+                     (trust: {})",
                     peer_id,
                     trust.label()
                 );
@@ -955,6 +1389,21 @@ impl P2pClient {
         };
 
         Ok((conn, peer_id))
+    }
+
+    /// Wait for the next message a worker acts on between tasks: a task, an
+    /// orderly `Goodbye`, or a cancel for a task that is not running.
+    pub async fn recv_inbound(conn: &QuinnConnection) -> Result<PeerInbound, TrainError> {
+        let mut stream = conn
+            .accept_uni()
+            .await
+            .map_err(|e| TrainError::other(format!("accept task stream: {e}")))?;
+        match recv_message(&mut stream).await? {
+            WireMessage::Task(task) => Ok(PeerInbound::Task(Box::new(task))),
+            WireMessage::Goodbye { reason } => Ok(PeerInbound::Goodbye(reason)),
+            WireMessage::Cancel { task_id } => Ok(PeerInbound::StrayCancel(task_id)),
+            other => Err(TrainError::other(format!("unexpected message: {other:?}"))),
+        }
     }
 
     /// Wait for a task from the coordinator.
@@ -1042,6 +1491,8 @@ impl P2pClient {
     fn make_client_config(
         keypair: &KeyPair,
         coordinator_pubkey: Option<[u8; 32]>,
+        pin_mismatch: PinMismatch,
+        advertised_x25519: AdvertisedX25519,
     ) -> Result<quinn::ClientConfig, TrainError> {
         // If a coordinator pubkey is provided, pin it — reject connections
         // from servers whose TLS cert doesn't match. Otherwise accept any
@@ -1050,6 +1501,8 @@ impl P2pClient {
             if let Some(pubkey) = coordinator_pubkey {
                 Arc::new(PinnedVerifier {
                     expected_pubkey: pubkey,
+                    mismatch: pin_mismatch,
+                    advertised_x25519,
                 })
             } else {
                 Arc::new(InsecureVerifier)
@@ -1069,11 +1522,53 @@ impl P2pClient {
             .map_err(|e| TrainError::other(format!("TLS client cert: {e}")))?;
         crypto.alpn_protocols = vec![b"blut-p2p".to_vec()];
 
-        Ok(quinn::ClientConfig::new(Arc::new(
+        let mut config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|e| TrainError::other(format!("QUIC client config: {e}")))?,
-        )))
+        ));
+        config.transport_config(transport_config());
+        Ok(config)
     }
+}
+
+/// Where [`PinnedVerifier`] records the key a coordinator presented when it did
+/// not match the pin (`Some(None)`: not an Ed25519 key), so the dial error can
+/// say so instead of surfacing a bare TLS alert.
+type PinMismatch = Arc<std::sync::Mutex<Option<Option<[u8; 32]>>>>;
+
+/// Where [`PinnedVerifier`] leaves the X25519 key the pinned cert publishes.
+type AdvertisedX25519 = Arc<std::sync::Mutex<Option<[u8; 32]>>>;
+
+/// Turn a failed dial into an error an operator can act on.
+fn describe_dial_error(
+    addr: SocketAddr,
+    e: &quinn::ConnectionError,
+    pinned: Option<[u8; 32]>,
+    presented: Option<Option<[u8; 32]>>,
+) -> String {
+    if let (Some(pinned), Some(presented)) = (pinned, presented) {
+        let presented = match presented {
+            Some(k) => faster_hex::hex_string(&k),
+            None => "a non-Ed25519 key".to_string(),
+        };
+        return format!(
+            "the node at {addr} is not the one you pinned (--coordinator-pubkey, or the \
+             key in --seed): it presented Ed25519 key {presented}, the pin is {}. Copy \
+             the pubkey from `blut p2p keys show` on that node (the first 64 hex \
+             characters are the Ed25519 part)",
+            faster_hex::hex_string(&pinned)
+        );
+    }
+    if matches!(e, quinn::ConnectionError::TimedOut) {
+        return format!(
+            "no QUIC response from {addr} within {}s. Check that the coordinator is \
+             running and listening on that address and port, and that UDP port {} \
+             is reachable (firewalls and NAT often pass TCP but drop UDP)",
+            IDLE_TIMEOUT.as_secs(),
+            addr.port()
+        );
+    }
+    format!("QUIC handshake with {addr}: {e}")
 }
 
 /// TLS cert verifier enforcing `--coordinator-pubkey` pinning.
@@ -1101,6 +1596,8 @@ impl P2pClient {
 #[derive(Debug)]
 struct PinnedVerifier {
     expected_pubkey: [u8; 32],
+    mismatch: PinMismatch,
+    advertised_x25519: AdvertisedX25519,
 }
 
 impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
@@ -1117,10 +1614,16 @@ impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
         })?;
         let expected_spki = ed25519_spki_der(&self.expected_pubkey);
         if cert.subject_public_key_info().as_ref() != expected_spki.as_slice() {
+            let presented = ed25519_pubkey_from_spki(cert.subject_public_key_info().as_ref());
+            *self.mismatch.lock().unwrap_or_else(|p| p.into_inner()) = Some(presented);
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
         }
+        *self
+            .advertised_x25519
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = x25519_from_dns_names(cert.valid_dns_names());
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -1272,6 +1775,8 @@ mod pinned_verifier_tests {
 
         let correct_pin = PinnedVerifier {
             expected_pubkey: coordinator.verifying.to_bytes(),
+            mismatch: Default::default(),
+            advertised_x25519: Default::default(),
         };
         assert!(
             correct_pin
@@ -1283,6 +1788,8 @@ mod pinned_verifier_tests {
         let impostor = KeyPair::generate();
         let wrong_pin = PinnedVerifier {
             expected_pubkey: impostor.verifying.to_bytes(),
+            mismatch: Default::default(),
+            advertised_x25519: Default::default(),
         };
         let result = wrong_pin.verify_server_cert(&cert_der, &[], &server_name, &[], now);
         assert!(
@@ -1384,16 +1891,68 @@ mod pinned_verifier_tests {
         );
     }
 
-    async fn bind_loopback_server() -> (P2pServer, std::sync::Arc<KeyPair>) {
+    /// A peer that completes TLS but never sends its handshake message holds
+    /// a mesh node's handshake slot for up to HANDSHAKE_MESSAGE_TIMEOUT. It
+    /// must not hold up anyone else: before the fix the node accepted one
+    /// connection at a time, so every other peer waited (or timed out) behind
+    /// it.
+    #[tokio::test]
+    async fn a_stalled_handshake_does_not_block_other_peers_joining_the_mesh() {
+        use crate::p2p::node::{MeshNode, NodeCapabilities};
+        let node_kp = std::sync::Arc::new(KeyPair::generate());
+        let dir = tempfile::tempdir().unwrap();
+        let peers = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
+        let node = MeshNode::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            node_kp.clone(),
+            peers,
+            NodeCapabilities {
+                worker: false,
+                scheduler: true,
+            },
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let addr = node.local_addr().unwrap();
+        let pin = node_kp.verifying.to_bytes();
+
+        // Stalled peer: TLS completes, then silence.
+        let staller = KeyPair::generate();
+        let cfg = P2pClient::make_client_config(
+            &staller,
+            Some(pin),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        )
+        .unwrap();
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(cfg);
+        let _stalled = endpoint
+            .connect(addr, "blut-p2p")
+            .unwrap()
+            .await
+            .expect("TLS completes");
+
+        // A well-behaved peer joins promptly regardless.
+        let client = P2pClient::with_coordinator_pin(std::sync::Arc::new(KeyPair::generate()), pin);
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), client.connect(addr))
+            .await
+            .expect("the second peer is not queued behind the stalled one")
+            .expect("connects");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    async fn bind_loopback_server() -> (P2pServer, std::sync::Arc<KeyPair>, tempfile::TempDir) {
         let keypair = std::sync::Arc::new(KeyPair::generate());
         let dir = tempfile::tempdir().unwrap();
         let peers = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let server = P2pServer::bind(addr, keypair.clone(), peers).await.unwrap();
-        // Keep the tempdir alive for the registry's lifetime by leaking it —
-        // this is a short-lived unit test process, not a long-running one.
-        std::mem::forget(dir);
-        (server, keypair)
+        // The caller holds the directory for the registry's lifetime.
+        (server, keypair, dir)
     }
 
     /// End-to-end companion to the direct unit test above: exercises the
@@ -1402,7 +1961,7 @@ mod pinned_verifier_tests {
     /// the fix holds through the full handshake, not just in isolation.
     #[tokio::test]
     async fn connect_with_correct_pin_succeeds_end_to_end() {
-        let (server, server_keypair) = bind_loopback_server().await;
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
         let addr = server.local_addr().unwrap();
 
         // Drain the app-level handshake so `P2pClient::connect` (which waits
@@ -1439,8 +1998,129 @@ mod pinned_verifier_tests {
     /// than hang — this is what makes the bug exploitable (MITM presents an
     /// unrelated cert and the old code accepted it unconditionally).
     #[tokio::test]
+    async fn wrong_sealing_half_of_the_pin_is_refused_before_any_work() {
+        // Found on a real WAN run: a --coordinator-pubkey with the right
+        // Ed25519 half but a wrong X25519 half connected, ran the task, sealed
+        // the result to a key nobody holds, and exited 0.
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.accept_peer().await;
+        });
+        let wrong_x25519 = KeyPair::generate().x25519_public.to_bytes();
+        let client = P2pClient::with_coordinator_keys(
+            std::sync::Arc::new(KeyPair::generate()),
+            server_keypair.verifying.to_bytes(),
+            wrong_x25519,
+        );
+        let err = tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(addr))
+            .await
+            .expect("connect() must not hang on a sealing-key mismatch")
+            .expect_err("a wrong X25519 half must be refused")
+            .to_string();
+        assert!(
+            err.contains(&faster_hex::hex_string(
+                &server_keypair.x25519_public.to_bytes()
+            )) && err.contains(&faster_hex::hex_string(&wrong_x25519))
+                && err.contains("keys show"),
+            "the error must name both sealing keys and the fix: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_halves_of_the_right_pin_connect() {
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
+        let addr = server.local_addr().unwrap();
+        // Hold the accepted connection open, as in the single-pin test: a
+        // dropped handle tears QUIC down under the in-flight HandshakeAck.
+        tokio::spawn(async move {
+            if let Ok((_, conn)) = server.accept_peer().await {
+                let _ = tokio::time::timeout(crate::TEST_HANG_GUARD, conn.closed()).await;
+            }
+        });
+        let client = P2pClient::with_coordinator_keys(
+            std::sync::Arc::new(KeyPair::generate()),
+            server_keypair.verifying.to_bytes(),
+            server_keypair.x25519_public.to_bytes(),
+        );
+        tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(addr))
+            .await
+            .expect("connect() must not hang")
+            .expect("the full, correct pubkey must connect");
+    }
+
+    /// The variable must reach the live connection, not just the config.
+    // The env lock must span the awaits: both endpoints read the variable while
+    // they are built. Other holders are synchronous tests on their own threads,
+    // which only wait; this runtime keeps running, so nothing can deadlock.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn bbr_opt_in_reaches_the_connection() {
+        let guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by TEST_ENV_LOCK; removed below.
+        unsafe { std::env::set_var(CONGESTION_ENV, "bbr") };
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((_, conn)) = server.accept_peer().await {
+                let _ = tokio::time::timeout(crate::TEST_HANG_GUARD, conn.closed()).await;
+            }
+        });
+        let client = P2pClient::with_coordinator_pin(
+            std::sync::Arc::new(KeyPair::generate()),
+            server_keypair.verifying.to_bytes(),
+        );
+        let (conn, _) = client.connect(addr).await.unwrap();
+        unsafe { std::env::remove_var(CONGESTION_ENV) };
+        drop(guard);
+        let state = conn.congestion_state().into_any();
+        assert!(
+            state.downcast::<quinn::congestion::Bbr>().is_ok(),
+            "BLUT_P2P_CONGESTION=bbr must select BBR on the connection"
+        );
+    }
+
+    #[test]
+    fn congestion_env_selects_bbr_and_refuses_typos() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by TEST_ENV_LOCK; removed below.
+        unsafe { std::env::remove_var(CONGESTION_ENV) };
+        assert_eq!(congestion_from_env().unwrap(), Congestion::Cubic);
+        unsafe { std::env::set_var(CONGESTION_ENV, "BBR") };
+        assert_eq!(congestion_from_env().unwrap(), Congestion::Bbr);
+        unsafe { std::env::set_var(CONGESTION_ENV, "bbr2") };
+        let err = congestion_from_env().unwrap_err().to_string();
+        assert!(
+            err.contains("BLUT_P2P_CONGESTION") && err.contains("bbr"),
+            "{err}"
+        );
+        unsafe { std::env::remove_var(CONGESTION_ENV) };
+    }
+
+    #[test]
+    fn x25519_dns_name_round_trips_and_ignores_other_names() {
+        let key = KeyPair::generate().x25519_public.to_bytes();
+        let name = x25519_dns_name(&key);
+        assert!(name.split('.').all(|label| label.len() <= 63), "{name}");
+        assert_eq!(
+            x25519_from_dns_names(["blut-p2p", name.as_str()].into_iter()),
+            Some(key)
+        );
+        // A cert from before the name existed publishes none.
+        assert_eq!(x25519_from_dns_names(["blut-p2p"].into_iter()), None);
+        assert_eq!(
+            x25519_from_dns_names(["x25519-zz.zz.blut-p2p.invalid"].into_iter()),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn connect_with_wrong_pin_fails_end_to_end() {
-        let (server, _server_keypair) = bind_loopback_server().await;
+        let (server, _server_keypair, _registry_dir) = bind_loopback_server().await;
         let addr = server.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = server.accept_peer().await;
@@ -1453,10 +2133,187 @@ mod pinned_verifier_tests {
         let result = tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(addr))
             .await
             .expect("connect() must not hang even on rejection");
+        let err = result
+            .expect_err(
+                "connecting with the WRONG --coordinator-pubkey must be rejected \
+                 (regression test for the PinnedVerifier stub that accepted any cert)",
+            )
+            .to_string();
+        // The error must say what is wrong, not surface a bare TLS alert
+        // ("invalid peer certificate: ApplicationVerificationFailure").
         assert!(
-            result.is_err(),
-            "connecting with the WRONG --coordinator-pubkey must be rejected \
-             (regression test for the PinnedVerifier stub that accepted any cert)"
+            err.contains("is not the one you pinned")
+                && err.contains(&faster_hex::hex_string(
+                    &_server_keypair.verifying.to_bytes()
+                ))
+                && err.contains(&faster_hex::hex_string(&wrong_pubkey)),
+            "wrong-pin error must name the presented and the pinned key: {err}"
+        );
+    }
+
+    #[test]
+    fn unanswered_dial_error_names_the_bound_and_udp() {
+        let addr: SocketAddr = "192.0.2.1:9320".parse().unwrap();
+        let msg = describe_dial_error(addr, &quinn::ConnectionError::TimedOut, None, None);
+        assert!(
+            msg.contains("no QUIC response from 192.0.2.1:9320 within 30s")
+                && msg.contains("UDP port 9320"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn every_endpoint_gets_keep_alive_and_explicit_idle_timeout() {
+        // Without keep-alive an idle worker was torn down after 30 s even
+        // though both ends were up, and a session did not recover from a 20 s
+        // partition because nothing was sent between the heal and the idle
+        // timeout (PTO backoff). Both configs must carry the shared parameters.
+        let cfg = format!("{:?}", transport_config());
+        assert!(
+            cfg.contains(&format!(
+                "keep_alive_interval: Some({KEEP_ALIVE_INTERVAL:?})"
+            )),
+            "{cfg}"
+        );
+        assert!(KEEP_ALIVE_INTERVAL * 3 < IDLE_TIMEOUT);
+        let kp = KeyPair::generate();
+        let server = format!("{:?}", P2pServer::make_server_config(&kp, false).unwrap());
+        let client = format!(
+            "{:?}",
+            P2pClient::make_client_config(&kp, None, Default::default(), Default::default())
+                .unwrap()
+        );
+        for (side, dbg) in [("server", server), ("client", client)] {
+            assert!(
+                dbg.contains(&format!(
+                    "keep_alive_interval: Some({KEEP_ALIVE_INTERVAL:?})"
+                )),
+                "{side} config lacks keep-alive: {dbg}"
+            );
+        }
+    }
+
+    /// A UDP relay for tests: forwards between one client and `upstream`, and
+    /// drops everything while `blackhole` is set (a partition).
+    async fn spawn_relay(
+        upstream: SocketAddr,
+        blackhole: Arc<std::sync::atomic::AtomicBool>,
+    ) -> SocketAddr {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut client: Option<SocketAddr> = None;
+            let mut buf = vec![0u8; 65536];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                if blackhole.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let to = if from == upstream {
+                    match client {
+                        Some(c) => c,
+                        None => continue,
+                    }
+                } else {
+                    client = Some(from);
+                    upstream
+                };
+                let _ = sock.send_to(&buf[..n], to).await;
+            }
+        });
+        addr
+    }
+
+    /// An abandoned blob transfer is cancelled, not delivered later. Before the
+    /// fix `send_blob` returned as soon as quinn had BUFFERED a chunk, so a
+    /// dispatch dropped on its deadline left the data queued: it kept going out
+    /// for nobody and, under congestion, held the connection's CLOSE frame
+    /// behind it, so the worker waited out the idle timeout.
+    #[tokio::test]
+    async fn abandoned_blob_send_is_reset_not_delivered() {
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
+        let blackhole = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let relay = spawn_relay(server.local_addr().unwrap(), blackhole.clone()).await;
+        let client = P2pClient::with_coordinator_pin(
+            Arc::new(KeyPair::generate()),
+            server_keypair.verifying.to_bytes(),
+        );
+        let (accepted, connected) = tokio::time::timeout(crate::TEST_HANG_GUARD, async {
+            tokio::join!(server.accept_peer(), client.connect(relay))
+        })
+        .await
+        .expect("connect through the relay must not hang");
+        let (_peer, receiver) = accepted.unwrap();
+        let (sender, _id) = connected.unwrap();
+
+        // Partition, then send a blob small enough to be buffered at once: it
+        // cannot be acknowledged, and the sender gives up after a second.
+        blackhole.store(true, std::sync::atomic::Ordering::Relaxed);
+        let blob = vec![7u8; 64 * 1024];
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            send_blob(&sender, "t1", BlobDir::Input, &blob),
+        )
+        .await;
+        assert!(
+            abandoned.is_err(),
+            "send_blob must wait for the peer to acknowledge the chunk, not just buffer it"
+        );
+
+        // Heal. The abandoned chunk must arrive as a reset, not as data.
+        blackhole.store(false, std::sync::atomic::Ordering::Relaxed);
+        let received = tokio::time::timeout(
+            crate::TEST_HANG_GUARD,
+            recv_blob(&receiver, "t1", BlobDir::Input, MAX_BLOB_SIZE),
+        )
+        .await
+        .expect("recv_blob must not hang on a reset transfer");
+        assert!(
+            received.is_err(),
+            "an abandoned transfer must not be delivered after the sender gave up"
+        );
+    }
+
+    /// The coordinator ends a session with `Goodbye`; the worker's loop must
+    /// return promptly and cleanly instead of waiting out the idle timeout.
+    #[tokio::test]
+    async fn end_session_lets_the_worker_exit_promptly() {
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
+        let addr = server.local_addr().unwrap();
+        let client_keypair = std::sync::Arc::new(KeyPair::generate());
+        let client =
+            P2pClient::with_coordinator_pin(client_keypair, server_keypair.verifying.to_bytes());
+        let (accepted, connected) = tokio::time::timeout(crate::TEST_HANG_GUARD, async {
+            tokio::join!(server.accept_peer(), client.connect(addr))
+        })
+        .await
+        .expect("loopback connect must not hang");
+        let (_peer, server_conn) = accepted.unwrap();
+        let (client_conn, _id) = connected.unwrap();
+
+        let started = std::time::Instant::now();
+        let (_, inbound) = tokio::time::timeout(crate::TEST_HANG_GUARD, async {
+            tokio::join!(
+                end_session(&server_conn, "smoke done"),
+                P2pClient::recv_inbound(&client_conn)
+            )
+        })
+        .await
+        .expect("goodbye must not hang");
+        match inbound {
+            Ok(PeerInbound::Goodbye(reason)) => assert_eq!(reason, "smoke done"),
+            other => panic!("worker must receive Goodbye, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < CLOSE_DRAIN_TIMEOUT,
+            "the goodbye was acknowledged, so end_session must not wait out the drain bound"
+        );
+        server.drain(CLOSE_DRAIN_TIMEOUT).await;
+        assert!(
+            matches!(
+                server_conn.close_reason(),
+                Some(quinn::ConnectionError::LocallyClosed)
+            ),
+            "the coordinator closed the connection itself"
         );
     }
 
@@ -1466,7 +2323,7 @@ mod pinned_verifier_tests {
     /// against the client cert, not merely trusted as self-asserted.
     #[tokio::test]
     async fn mutual_auth_binds_peer_id_to_tls_identity() {
-        let (server, server_keypair) = bind_loopback_server().await;
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
         let addr = server.local_addr().unwrap();
 
         let accept = tokio::spawn(async move {
@@ -1481,11 +2338,14 @@ mod pinned_verifier_tests {
         let expected = PeerId::from_pubkey(&client_keypair.verifying);
         let client =
             P2pClient::with_coordinator_pin(client_keypair, server_keypair.verifying.to_bytes());
-        let (_conn, client_side_id) =
+        let (conn, client_side_id) =
             tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(addr))
                 .await
                 .expect("connect must not hang")
                 .expect("mutual-auth connect must succeed");
+        // Close the client side so the server task's `conn.closed()` returns.
+        // (With keep-alive the session no longer idles out on its own.)
+        drop(conn);
 
         let bound = tokio::time::timeout(crate::TEST_HANG_GUARD, accept)
             .await
@@ -1511,7 +2371,7 @@ mod pinned_verifier_tests {
         let blob: Vec<u8> = (0..(CHUNK_MAX * 2 + 77)).map(|i| (i % 251) as u8).collect();
 
         for preseed_all in [false, true] {
-            let (server, server_kp) = bind_loopback_server().await;
+            let (server, server_kp, _registry_dir) = bind_loopback_server().await;
             let addr = server.local_addr().unwrap();
 
             let recv_dir = tempfile::tempdir().unwrap();

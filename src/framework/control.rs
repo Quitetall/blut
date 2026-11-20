@@ -222,6 +222,13 @@ pub trait ControlPolicy: Send + Sync {
     /// Decide what to do with the graph given this step. MUST be cheap +
     /// non-blocking — it runs inline in the coordinator between joins.
     fn on_step(&self, metrics: &StepMetrics) -> Control;
+
+    /// A `Spawn` this policy (or a peer in a composite) returned was injected:
+    /// `label` is the delta's label and `nodes` its new nodes as
+    /// `(topo index, stage name)` in topo order — the `node_idx` their
+    /// `StageStep`s will carry. Not called for a spawn the executor dropped
+    /// (spawn cap, oversized or malformed delta). Default: ignore.
+    fn on_spawned(&self, _label: Option<&str>, _nodes: &[(u32, &str)]) {}
 }
 
 /// Kill a node's branch the moment its step metrics report a non-finite
@@ -283,6 +290,14 @@ impl ControlPolicy for CompositePolicy {
             }
         }
         Control::Continue
+    }
+
+    fn on_spawned(&self, label: Option<&str>, nodes: &[(u32, &str)]) {
+        // Every member hears about every injection; each recognises its own
+        // labels and ignores the rest.
+        for p in &self.policies {
+            p.on_spawned(label, nodes);
+        }
     }
 }
 

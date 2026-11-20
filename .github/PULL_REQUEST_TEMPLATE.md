@@ -18,9 +18,9 @@
 These are the gates CI runs, on the pinned toolchain. Running them locally first
 is faster than a round trip.
 
-- [ ] `cargo +1.88 fmt --all -- --check`
-- [ ] `cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings`
-- [ ] `cargo +1.88 test --locked --workspace`
+- [ ] `cargo +1.99.0 fmt --all -- --check`
+- [ ] `cargo +1.99.0 clippy --locked --workspace --all-targets -- -D warnings`
+- [ ] `cargo +1.99.0 test --locked --workspace`
 - [ ] Touched a sidecar under `crates/`? It is a **separate workspace** with its
       own lockfile — run the same three in that directory.
 - [ ] Changed a dependency? `bash scripts/dependency_policy.sh` (all ten

@@ -334,6 +334,8 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
     let training_io_resolver = TrainingIoResolver::from_ctx(&ctx).unwrap();
     let mut events = ctx.status.subscribe();
     let env = NodeEnv {
+        checkpoint_root: None,
+        invocation: String::new(),
         started_at: Instant::now(),
         job_dir: ctx.job_dir,
         cache: ctx.cache,
@@ -452,6 +454,8 @@ fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
     let training_io_resolver = TrainingIoResolver::from_ctx(&ctx).unwrap();
     let mut events = ctx.status.subscribe();
     let env = NodeEnv {
+        checkpoint_root: None,
+        invocation: String::new(),
         started_at: Instant::now(),
         job_dir: ctx.job_dir,
         cache: ctx.cache,
@@ -564,6 +568,8 @@ fn speculative_external_reference_succeeds_without_portable_cache() {
     let training_io_resolver = TrainingIoResolver::from_ctx(&ctx).unwrap();
     let mut events = ctx.status.subscribe();
     let env = NodeEnv {
+        checkpoint_root: None,
+        invocation: String::new(),
         started_at: Instant::now(),
         job_dir: ctx.job_dir,
         cache: ctx.cache,
@@ -862,7 +868,7 @@ impl Stage for AlwaysFail {
 impl Compatible<LamuTrainerBackend> for AlwaysFail {}
 
 // An ADVISORY gate that always fails — models a dry-run/verdict gate after
-// training (ADR 0071). Its failure must NOT fail the plan.
+// training (ADR 0156). Its failure must NOT fail the plan.
 struct AdvisoryGate;
 #[async_trait]
 impl Stage for AdvisoryGate {
@@ -915,7 +921,7 @@ async fn linear_plan_executes_in_order() {
 
 #[tokio::test]
 async fn advisory_gate_failure_is_non_fatal_and_preserves_output() {
-    // ADR 0071: train (MakeOne) → an advisory gate that FAILS. The plan must
+    // ADR 0156: train (MakeOne) → an advisory gate that FAILS. The plan must
     // NOT fail; the warning is recorded and the train output is surfaced.
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
@@ -1024,18 +1030,20 @@ async fn partitioned_plans_do_not_share_cache_entries() {
     let first = SequentialExecutor::execute(plan("tuh"), ctx).await.unwrap();
     assert_eq!(first.n_cache_misses, 1);
 
+    let second_job = tempfile::tempdir().unwrap();
     let second_ctx = ExecCtx {
         cache: cache.clone(),
-        ..ExecCtx::new(tempfile::tempdir().unwrap().keep())
+        ..ExecCtx::new(second_job.path().to_path_buf())
     };
     let second = SequentialExecutor::execute(plan("chb"), second_ctx)
         .await
         .unwrap();
     assert_eq!(second.n_cache_misses, 1, "a different partition is cold");
 
+    let repeat_job = tempfile::tempdir().unwrap();
     let repeat_ctx = ExecCtx {
         cache,
-        ..ExecCtx::new(tempfile::tempdir().unwrap().keep())
+        ..ExecCtx::new(repeat_job.path().to_path_buf())
     };
     let repeat = SequentialExecutor::execute(plan("tuh"), repeat_ctx)
         .await
@@ -1458,6 +1466,78 @@ async fn external_reference_succeeds_without_entering_portable_cache() {
         .unwrap();
     assert_eq!(rerun.n_cache_hits, 0);
     assert_eq!(rerun.n_cache_misses, 1);
+}
+
+/// Records every event's level and message on the thread it is installed on.
+#[derive(Clone, Default)]
+struct CapturedEvents(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((*event.metadata().level(), message.0));
+    }
+}
+
+/// A declared external reference (`ALLOW_EXTERNAL_PATHS`) was logged as a
+/// warning on every run: `check_jsonl` and `load_dataset` said "not portable
+/// and will not be cached" each time, for an outcome their artifact types
+/// declare. It is still recorded, at debug.
+#[tokio::test]
+async fn a_declared_external_reference_is_not_a_warning() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let external = tempfile::tempdir().unwrap();
+    let external_path = external.path().join("corpus.bin");
+    std::fs::write(&external_path, b"externally managed corpus").unwrap();
+    let (_job, ctx) = fresh_ctx();
+    let plan = Plan::<(), LamuTrainerBackend>::new("external", serde_json::json!({}))
+        .start(
+            MakeExternalRef,
+            ExternalArgs {
+                path: external_path,
+            },
+        )
+        .finish()
+        .into_compiled();
+    let events = CapturedEvents::default();
+    let subscriber = tracing_subscriber::registry().with(events.clone());
+    let result = {
+        // The test runtime is current-thread, so the executor's events are
+        // emitted on this thread, where the subscriber is installed.
+        let _scope = tracing::subscriber::set_default(subscriber);
+        SequentialExecutor::execute(plan, ctx).await.unwrap()
+    };
+    assert_eq!(result.n_cache_misses, 1);
+    let events = events.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let not_portable: Vec<_> = events
+        .iter()
+        .filter(|(_, message)| message.contains("not portable"))
+        .collect();
+    assert_eq!(not_portable.len(), 1, "still recorded once: {events:?}");
+    assert_eq!(not_portable[0].0, tracing::Level::DEBUG, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|(level, _)| *level > tracing::Level::WARN),
+        "no warning for a declared outcome: {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -2752,6 +2832,322 @@ async fn divergence_kill_lets_concurrent_sibling_finish_before_failfast() {
     );
 }
 
+static PRUNED_RAN: AtomicU32 = AtomicU32::new(0);
+
+/// A HEALTHY trial: emits a finite step metric, then parks on its cancel
+/// token. Retries are enabled so a kill wrongly classified as a divergence
+/// would show up as a second attempt.
+struct HealthyThenPark;
+#[async_trait]
+impl Stage for HealthyThenPark {
+    const NAME: &'static str = "healthy_then_park";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const RETRY: RetryPolicy = RetryPolicy {
+        max_attempts: 3,
+        backoff: Backoff::None,
+        retry_on: RetryOn::AllErrors,
+    };
+    type Input = Counter;
+    type Output = Counter;
+    type Args = EmptyArgs;
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        _input: Counter,
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        until_count(&INC_RUN_COUNT, 1).await;
+        PRUNED_RAN.fetch_add(1, Ordering::SeqCst);
+        let _ = ctx.status_tx.send(StageEvent::StageStep {
+            node_idx: ctx.node_idx,
+            stage_name: Self::NAME.to_string(),
+            update: serde_json::json!({ "val_r": 0.25, "epoch": 1 }),
+        });
+        ctx.cancel.cancelled().await;
+        Err(StageError::Cancelled)
+    }
+}
+impl Compatible<LamuTrainerBackend> for HealthyThenPark {}
+
+/// An early-stopping policy: prune `healthy_then_park` on its first step,
+/// whatever the (finite) metric says. This is what ASHA / median / percentile
+/// return for an underperforming trial.
+struct EarlyStopHealthy;
+impl crate::framework::control::ControlPolicy for EarlyStopHealthy {
+    fn on_step(
+        &self,
+        m: &crate::framework::control::StepMetrics,
+    ) -> crate::framework::control::Control {
+        if m.stage_name == HealthyThenPark::NAME {
+            crate::framework::control::Control::KillBranch
+        } else {
+            crate::framework::control::Control::Continue
+        }
+    }
+}
+
+#[tokio::test]
+async fn early_stop_kill_on_finite_metric_prunes_without_failing_the_plan() {
+    // E2E regression: `blut hpo run --algo asha` (and median / percentile /
+    // pbt) failed the WHOLE job on its first early stop, because every
+    // `KillBranch` was treated as a divergence → retried → terminal
+    // `Diverged`. A kill on a finite step is a prune: the trial runs once,
+    // the sibling completes, and the plan does not surface `Diverged`.
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    PRUNED_RAN.store(0, Ordering::SeqCst);
+    INC_RUN_COUNT.store(0, Ordering::SeqCst);
+    let (_td, base) = fresh_ctx();
+    let ctx = base.with_control(std::sync::Arc::new(EarlyStopHealthy));
+
+    let plan = Plan::<(), LamuTrainerBackend>::new("early_stop", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .fork(HealthyThenPark, EmptyArgs, Increment, EmptyArgs)
+        .merge(SumTwo, EmptyArgs)
+        .finish()
+        .into_compiled();
+    let fut = ParallelExecutor::execute(plan, ctx);
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
+        .await
+        .expect("the early-stop kill must fire — a parked trial would otherwise hang");
+
+    assert!(
+        !matches!(result, Err(PlanError::StageFailed { .. })),
+        "an early stop on a finite metric is a prune, not a stage failure: {result:?}"
+    );
+    assert_eq!(
+        PRUNED_RAN.load(Ordering::SeqCst),
+        1,
+        "a pruned trial must not be retried as if it had diverged"
+    );
+    assert_eq!(
+        INC_RUN_COUNT.load(Ordering::SeqCst),
+        1,
+        "the sibling branch still runs to completion"
+    );
+}
+
+static ISO_FAIL_RAN: AtomicU32 = AtomicU32::new(0);
+
+/// A trial that crashes after its sibling has run (so the sibling is never
+/// cancelled by an ordering race). Retries are on, to show an isolated
+/// failure still honours them before it is recorded.
+struct CrashingTrial;
+#[async_trait]
+impl Stage for CrashingTrial {
+    const NAME: &'static str = "crashing_trial";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const RETRY: RetryPolicy = RetryPolicy {
+        max_attempts: 2,
+        backoff: Backoff::None,
+        retry_on: RetryOn::AllErrors,
+    };
+    type Input = Counter;
+    type Output = Counter;
+    type Args = EmptyArgs;
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: Counter,
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        until_count(&INC_RUN_COUNT, 1).await;
+        ISO_FAIL_RAN.fetch_add(1, Ordering::SeqCst);
+        Err(StageError::Backend(anyhow::anyhow!("trial crashed")))
+    }
+}
+impl Compatible<LamuTrainerBackend> for CrashingTrial {}
+
+fn crash_fork_plan() -> CompiledPlan {
+    Plan::<(), LamuTrainerBackend>::new("isolated", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .fork(CrashingTrial, EmptyArgs, Increment, EmptyArgs)
+        .merge(SumTwo, EmptyArgs)
+        .finish()
+        .into_compiled()
+}
+
+#[tokio::test]
+async fn an_isolated_stage_failure_prunes_only_its_branch() {
+    // HPO trials are independent branches: one crashing trial must be
+    // recorded as failed while its siblings run to completion. Without
+    // isolation the same plan fails fast (the default, unchanged).
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for isolate in [true, false] {
+        ISO_FAIL_RAN.store(0, Ordering::SeqCst);
+        INC_RUN_COUNT.store(0, Ordering::SeqCst);
+        let (td, base) = fresh_ctx();
+        let ctx = if isolate {
+            base.with_isolated_stage_failures()
+        } else {
+            base
+        };
+        let fut = ParallelExecutor::execute(crash_fork_plan(), ctx);
+        let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
+            .await
+            .expect("plan must finish");
+        assert_eq!(ISO_FAIL_RAN.load(Ordering::SeqCst), 2, "both attempts ran");
+        assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 1, "the sibling ran");
+        if isolate {
+            assert!(
+                result.is_ok(),
+                "an isolated failure must not fail the plan: {result:?}"
+            );
+            let status = std::fs::read_to_string(td.path().join("status.jsonl")).unwrap();
+            assert!(
+                status.contains("\"kind\":\"stage_failed\"") && status.contains("trial crashed"),
+                "the failure is recorded with its error"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(PlanError::StageFailed { ref stage, .. }) if stage == "crashing_trial"),
+                "without isolation the plan fails fast: {result:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_exhausted_divergence_is_isolated_like_any_failure() {
+    // 2414f09 made a divergence retryable and an exhausted one a terminal
+    // `Diverged`. Under isolation that terminal failure prunes the trial and
+    // the sibling still finishes.
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    DIVERGER_RAN.store(0, Ordering::SeqCst);
+    INC_RUN_COUNT.store(0, Ordering::SeqCst);
+    let (td, base) = fresh_ctx();
+    let ctx = base
+        .with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN))
+        .with_isolated_stage_failures();
+    let plan = Plan::<(), LamuTrainerBackend>::new("isolated_div", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .fork(DivergeAfterIncrement, EmptyArgs, Increment, EmptyArgs)
+        .merge(SumTwo, EmptyArgs)
+        .finish()
+        .into_compiled();
+    let fut = ParallelExecutor::execute(plan, ctx);
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
+        .await
+        .expect("divergence kill must fire");
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(DIVERGER_RAN.load(Ordering::SeqCst), 1);
+    assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 1);
+    let status = std::fs::read_to_string(td.path().join("status.jsonl")).unwrap();
+    assert!(
+        status.contains("training diverged"),
+        "recorded as a divergence"
+    );
+}
+
+static SLOT_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+static SLOT_CRASH: AtomicBool = AtomicBool::new(true);
+static SLOT_RESUMED: AtomicBool = AtomicBool::new(false);
+
+/// A checkpointing trial: with `SLOT_CRASH` set it writes a checkpoint and
+/// a marker from an exited trainer, then crashes.
+struct SlotTrial;
+#[async_trait]
+impl Stage for SlotTrial {
+    const NAME: &'static str = "slot_trial";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const DETERMINISTIC: bool = false;
+    type Input = Counter;
+    type Output = Counter;
+    type Args = EmptyArgs;
+    fn checkpoint_slot(&self, _: &EmptyArgs) -> bool {
+        true
+    }
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: Counter,
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        SLOT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        let slot = ctx.checkpoint.as_ref().expect("opted-in stage gets a slot");
+        if slot.resume {
+            SLOT_RESUMED.store(true, Ordering::SeqCst);
+        }
+        if SLOT_CRASH.load(Ordering::SeqCst) {
+            until_count(&INC_RUN_COUNT, 1).await;
+            std::fs::write(slot.dir.join("step-0000000003.pt"), b"weights").unwrap();
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let dead_pid = child.id();
+            child.wait().unwrap();
+            let marker = serde_json::json!({
+                "status": "running",
+                "run_id": slot.run_id,
+                "pid": dead_pid,
+                "host": crate::framework::stage_checkpoint::hostname(),
+                "heartbeat_unix": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                "step": 3,
+                "epoch": 1,
+                "attempt_id": slot.attempt_id,
+                "resumed_from_step": null,
+            });
+            std::fs::write(slot.dir.join("state.json"), marker.to_string()).unwrap();
+            return Err(StageError::BadInput("trial lost at step 3".into()));
+        }
+        Ok(Counter { n: input.n })
+    }
+}
+impl Compatible<LamuTrainerBackend> for SlotTrial {}
+
+#[tokio::test]
+async fn an_isolated_failure_keeps_its_checkpoint_slot_for_the_rerun() {
+    // Isolation must not change what a failure leaves behind: the failed
+    // trial's slot is released (not left locked) and kept, so re-running the
+    // search resumes that trial from its checkpoint instead of step 0.
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    SLOT_ATTEMPTS.store(0, Ordering::SeqCst);
+    SLOT_CRASH.store(true, Ordering::SeqCst);
+    SLOT_RESUMED.store(false, Ordering::SeqCst);
+    INC_RUN_COUNT.store(0, Ordering::SeqCst);
+    let td = tempfile::tempdir().unwrap();
+    let ckpt_root = td.path().join("checkpoints");
+    let plan = || {
+        Plan::<(), LamuTrainerBackend>::new("isolated_slot", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .fork(SlotTrial, EmptyArgs, Increment, EmptyArgs)
+            .merge(SumTwo, EmptyArgs)
+            .finish()
+            .into_compiled()
+    };
+    let first = ExecCtx::new(td.path().join("job-1"))
+        .with_checkpoint_root(ckpt_root.clone())
+        .with_isolated_stage_failures();
+    let result = tokio::time::timeout(
+        crate::TEST_HANG_GUARD,
+        ParallelExecutor::execute(plan(), first),
+    )
+    .await
+    .expect("first run finishes");
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 1, "the sibling ran");
+
+    SLOT_CRASH.store(false, Ordering::SeqCst);
+    let second = ExecCtx::new(td.path().join("job-2"))
+        .with_checkpoint_root(ckpt_root)
+        .with_isolated_stage_failures();
+    let result = tokio::time::timeout(
+        crate::TEST_HANG_GUARD,
+        ParallelExecutor::execute(plan(), second),
+    )
+    .await
+    .expect("second run finishes");
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(SLOT_ATTEMPTS.load(Ordering::SeqCst), 2);
+    assert!(
+        SLOT_RESUMED.load(Ordering::SeqCst),
+        "the re-run resumed the failed trial from its kept slot"
+    );
+}
+
 #[tokio::test]
 async fn no_control_policy_is_byte_identical_nan_ignored() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -3238,7 +3634,7 @@ async fn multi_step_always_diverge_exhausts_exactly_max_attempts() {
 
 static TARGETED_KILL_RAN: AtomicU32 = AtomicU32::new(0);
 
-/// Under S1 every `KillBranch` is a DIVERGENCE kill (it populates the
+/// Under S1 a `KillBranch` on a DIVERGED step is a divergence kill (it populates the
 /// registry), so the only PLAIN (non-divergence) cancel reachable through the
 /// public API is a plan cancel. This node parks WITHOUT emitting a divergence
 /// step, so a plan cancel leaves the registry empty → the prior fail-fast
@@ -4426,6 +4822,9 @@ struct MockDispatchPolicy {
 }
 #[cfg(feature = "p2p")]
 impl crate::p2p::dispatch::DispatchPolicy for MockDispatchPolicy {
+    // The executor asks `remote_class` (default: the stage's own declaration),
+    // never this name list: `a_stage_declared_local_stays_here_whatever_the_name_list_says`
+    // names a local-only stage here and checks that it does not move.
     fn is_dispatchable(&self, stage_name: &str) -> bool {
         stage_name == self.dispatchable
     }
@@ -4459,6 +4858,9 @@ impl crate::p2p::dispatch::DispatchPolicy for MockDispatchPolicy {
 }
 
 #[cfg(feature = "p2p")]
+static DISPATCHABLE_LOCAL_RUNS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "p2p")]
 struct DispatchableStage;
 #[cfg(feature = "p2p")]
 #[async_trait]
@@ -4475,10 +4877,16 @@ impl Stage for DispatchableStage {
         _input: (),
         _args: &EmptyArgs,
     ) -> Result<Counter, StageError> {
+        DISPATCHABLE_LOCAL_RUNS.fetch_add(1, Ordering::SeqCst);
         // Distinct from `succeed_with` below: if the executor ever fell
         // through to running this LOCALLY instead of honouring the
         // dispatch, this value makes that wiring bug obvious.
         Ok(Counter { n: 999 })
+    }
+    fn placement(&self, _args: &EmptyArgs) -> crate::framework::stage::StagePlacement {
+        crate::framework::stage::StagePlacement::remote(
+            crate::framework::execution::DataClassification::Public,
+        )
     }
 }
 #[cfg(feature = "p2p")]
@@ -4690,6 +5098,177 @@ async fn canonical_adapter_failure_fails_the_plan() {
         other => panic!("remote adapter failure must fail the plan: {other:?}"),
     }
     assert_eq!(submit_count.load(Ordering::SeqCst), 1);
+}
+
+/// `--launcher p2p` and `cloud` ran every stage on this machine: no command
+/// installed an execution adapter, and the executor ran the plan locally
+/// anyway. k8s is a whole-plan submission and never runs in-process. Each is
+/// refused before any stage runs, by both executors.
+#[tokio::test]
+async fn a_placement_with_no_way_to_run_there_runs_nothing_here() {
+    use crate::config::launcher::LaunchTarget;
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for (target, expected) in [
+        (
+            LaunchTarget::P2P,
+            "--launcher p2p cannot place a plan executed without an execution adapter",
+        ),
+        (
+            LaunchTarget::Cloud,
+            "--launcher cloud cannot place a plan executed without an execution adapter",
+        ),
+        (LaunchTarget::K8s, "kubectl apply"),
+    ] {
+        for parallel in [false, true] {
+            MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+            let (_td, ctx) = fresh_ctx();
+            let ctx = ctx.with_launch_target(target);
+            let plan = Plan::<(), LamuTrainerBackend>::new("unplaced", serde_json::json!({}))
+                .start(MakeOne, EmptyArgs)
+                .finish()
+                .into_compiled();
+            let result = if parallel {
+                ParallelExecutor::execute(plan, ctx).await
+            } else {
+                SequentialExecutor::execute(plan, ctx).await
+            };
+            let err = match result {
+                Err(PlanError::Other(message)) => message,
+                other => panic!("{target:?} (parallel={parallel}) must be refused: {other:?}"),
+            };
+            assert!(
+                err.contains(expected),
+                "{target:?} (parallel={parallel}): {err}"
+            );
+            assert_eq!(
+                MAKE_RUN_COUNT.load(Ordering::SeqCst),
+                0,
+                "{target:?} (parallel={parallel}): the stage ran on this machine"
+            );
+        }
+    }
+}
+
+/// With an execution adapter installed, a p2p or cloud placement is the
+/// library path the refusal points at, and is not refused.
+#[cfg(feature = "p2p")]
+#[tokio::test]
+async fn a_remote_placement_with_an_execution_adapter_runs_through_it() {
+    use crate::config::launcher::LaunchTarget;
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for target in [LaunchTarget::P2P, LaunchTarget::Cloud] {
+        let (_td, base) = fresh_ctx();
+        let submit_count = Arc::new(AtomicU32::new(0));
+        let adapter = Arc::new(MockExecutionAdapter {
+            outcome: CanonicalAdapterOutcome::Succeeded(Counter { n: 42 }),
+            submit_count: submit_count.clone(),
+        });
+        let policy = Arc::new(MockDispatchPolicy {
+            dispatchable: "dispatchable_thing",
+        });
+        let ctx = base
+            .with_launch_target(target)
+            .with_execution_adapter(policy, adapter);
+        let plan = Plan::<(), LamuTrainerBackend>::new("adapter_placed", serde_json::json!({}))
+            .start(DispatchableStage, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = ParallelExecutor::execute(plan, ctx)
+            .await
+            .unwrap_or_else(|e| panic!("{target:?} with an adapter: {e}"));
+        let output: Counter = result.final_output.unwrap().into_typed().unwrap();
+        assert_eq!(output.n, 42, "{target:?}: the adapter's output");
+        assert_eq!(submit_count.load(Ordering::SeqCst), 1, "{target:?}");
+    }
+}
+
+/// `--launcher p2p` with no peer able to take an eligible stage fails that
+/// stage. It used to run it here with a warning: the silent local run the
+/// placement exists to prevent. The local fallback stays for library callers
+/// that installed an adapter without asking for a remote placement
+/// (`unavailable_canonical_adapter_falls_back_before_local_work_starts`).
+#[cfg(feature = "p2p")]
+#[tokio::test]
+async fn no_peer_under_launcher_p2p_fails_the_stage_and_runs_nothing_here() {
+    use crate::config::launcher::LaunchTarget;
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for parallel in [false, true] {
+        DISPATCHABLE_LOCAL_RUNS.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let submit_count = Arc::new(AtomicU32::new(0));
+        let adapter = Arc::new(MockExecutionAdapter {
+            outcome: CanonicalAdapterOutcome::Unavailable,
+            submit_count: submit_count.clone(),
+        });
+        let policy = Arc::new(MockDispatchPolicy {
+            dispatchable: "dispatchable_thing",
+        });
+        let ctx = base
+            .with_launch_target(LaunchTarget::P2P)
+            .with_execution_adapter(policy, adapter);
+        let plan = Plan::<(), LamuTrainerBackend>::new("no_peer", serde_json::json!({}))
+            .start(DispatchableStage, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = if parallel {
+            ParallelExecutor::execute(plan, ctx).await
+        } else {
+            SequentialExecutor::execute(plan, ctx).await
+        };
+        match result {
+            Err(PlanError::StageFailed { stage, source, .. }) => {
+                assert_eq!(stage, "dispatchable_thing");
+                assert!(source.to_string().contains("no mock peer"), "{source}");
+            }
+            other => panic!("parallel={parallel}: no peer must fail the run: {other:?}"),
+        }
+        assert_eq!(
+            submit_count.load(Ordering::SeqCst),
+            1,
+            "parallel={parallel}"
+        );
+        assert_eq!(
+            DISPATCHABLE_LOCAL_RUNS.load(Ordering::SeqCst),
+            0,
+            "parallel={parallel}: the eligible stage ran on this machine"
+        );
+    }
+}
+
+/// Eligibility is the stage's declaration, not a name list: a stage that does
+/// not declare it may leave runs here under `--launcher p2p`, even when the
+/// policy's name list names it, and the adapter never sees it.
+#[cfg(feature = "p2p")]
+#[tokio::test]
+async fn a_stage_declared_local_stays_here_whatever_the_name_list_says() {
+    use crate::config::launcher::LaunchTarget;
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+    let (_td, base) = fresh_ctx();
+    let submit_count = Arc::new(AtomicU32::new(0));
+    let adapter = Arc::new(MockExecutionAdapter {
+        outcome: CanonicalAdapterOutcome::Succeeded(Counter { n: 42 }),
+        submit_count: submit_count.clone(),
+    });
+    let policy = Arc::new(MockDispatchPolicy {
+        dispatchable: "make_one",
+    });
+    let ctx = base
+        .with_launch_target(LaunchTarget::P2P)
+        .with_execution_adapter(policy, adapter);
+    let plan = Plan::<(), LamuTrainerBackend>::new("declared_local", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .finish()
+        .into_compiled();
+    let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
+    let output: Counter = result.final_output.unwrap().into_typed().unwrap();
+    assert_eq!(output.n, 1, "the local stage's own output");
+    assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 1, "ran here, once");
+    assert_eq!(
+        submit_count.load(Ordering::SeqCst),
+        0,
+        "a local-only stage never reaches the adapter"
+    );
 }
 // ── GPU sampler leaked on panic (audit finding 4) ───────────────────
 //

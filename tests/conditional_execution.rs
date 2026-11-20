@@ -18,7 +18,7 @@ use blut::framework::cache::{CacheHandle, CacheProof};
 use blut::framework::cookbook::{Cookbook, Registry};
 use blut::framework::dag_opt::DagOptimizer;
 use blut::framework::error::{PlanError, StageError};
-use blut::framework::executor::{ExecCtx, execute_plan};
+use blut::framework::executor::{ExecCtx, PlanResult};
 use blut::framework::object_store::{ObjectKey, ObjectStore, ObjectStoreAdapter, StoreError};
 use blut::framework::plan::CompiledPlan;
 use blut::framework::plan_spec::{ConditionGateSpec, PLAN_SPEC_VERSION, PlanSpec, SpecNode};
@@ -55,6 +55,8 @@ struct ProbeSignals {
     target_runs: AtomicUsize,
     hold_target: AtomicBool,
     panic_first_target: AtomicBool,
+    // Read only by the Unix permission-sealing fixtures.
+    #[cfg_attr(not(unix), allow(dead_code))]
     seal_target_scratch: AtomicBool,
     profile_target: AtomicBool,
     target_steps: AtomicUsize,
@@ -94,8 +96,55 @@ fn probe_signals() -> Arc<ProbeSignals> {
         .clone()
 }
 
+/// Upper bound on any single wait in this file. These tests coordinate the
+/// executor and its stages through semaphores and a shared lock; an unbounded
+/// wait turned a lost race into a hang that held `SPECULATION_TEST_LOCK` and
+/// stalled every other test in the binary (seen under heavy host load). Each
+/// wait now fails the test instead. Generous, because a loaded host is slow.
+const WAIT_GUARD: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Await `fut` for at most [`WAIT_GUARD`], panicking with `what` on expiry.
+async fn bounded<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    match tokio::time::timeout(WAIT_GUARD, fut).await {
+        Ok(value) => value,
+        Err(_) => panic!("{what} did not complete within {WAIT_GUARD:?} (a lost race, not a hang)"),
+    }
+}
+
+/// [`blut::framework::executor::execute_plan`], bounded by [`WAIT_GUARD`].
+async fn execute_plan(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
+    bounded(
+        "plan execution",
+        blut::framework::executor::execute_plan(plan, ctx),
+    )
+    .await
+}
+
+/// The plan deadline in the deadline tests. The speculative target has to
+/// start and finish before it expires; at 500 ms it lost that race on a loaded
+/// host, its `target_started` signal never came, and the test hung (it now
+/// fails on [`WAIT_GUARD`] instead). The tests sleep until it passes.
+const PLAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Upper bound on queueing for [`SPECULATION_TEST_LOCK`]. The tests in this
+/// file serialize on it, so a legitimate wait is the sum of the tests ahead;
+/// a stuck holder now fails its own [`WAIT_GUARD`]-bounded waits and releases
+/// the lock, so this only has to catch a holder that never returns at all.
+const LOCK_GUARD: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Take [`SPECULATION_TEST_LOCK`], bounded by [`LOCK_GUARD`].
+async fn speculation_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    match tokio::time::timeout(LOCK_GUARD, SPECULATION_TEST_LOCK.lock()).await {
+        Ok(guard) => guard,
+        Err(_) => panic!("SPECULATION_TEST_LOCK was not released within {LOCK_GUARD:?}"),
+    }
+}
+
 async fn take_signal(signal: &tokio::sync::Semaphore) {
-    signal.acquire().await.expect("probe signal open").forget();
+    bounded("probe signal", signal.acquire())
+        .await
+        .expect("probe signal open")
+        .forget();
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -652,6 +701,8 @@ fn speculation_same_key_supersede_plan(registry: &Registry) -> CompiledPlan {
     .0
 }
 
+// Used only by a Unix-gated test.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn speculation_with_unrelated_failure_plan(registry: &Registry) -> CompiledPlan {
     let conditional = speculation_spec(true)
         .compile(registry)
@@ -843,7 +894,7 @@ fn optimizer_owns_cache_neutral_speculation_witness() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn speculation_default_off_waits_for_condition_before_starting_target() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     install_probe_signals(signals.clone());
     let temp = tempfile::tempdir().expect("default-off speculation tempdir");
@@ -869,7 +920,7 @@ async fn speculation_default_off_waits_for_condition_before_starting_target() {
     signals.decision_release.add_permits(1);
     take_signal(&signals.target_started).await;
     take_signal(&signals.target_finished).await;
-    let result = handle
+    let result = bounded("plan task", handle)
         .await
         .expect("default-off executor task")
         .expect("default-off selected plan");
@@ -884,7 +935,7 @@ async fn speculation_default_off_waits_for_condition_before_starting_target() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn selected_speculation_runs_early_and_publishes_once_with_ordinary_identity() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let registry = registry();
 
     let baseline_signals = ProbeSignals::new();
@@ -931,7 +982,7 @@ async fn selected_speculation_runs_early_and_publishes_once_with_ordinary_identi
     assert_eq!(signals.target_runs.load(Ordering::SeqCst), 1);
     signals.decision_release.add_permits(1);
 
-    let result = handle
+    let result = bounded("plan task", handle)
         .await
         .expect("selected speculation executor task")
         .expect("selected speculation run");
@@ -959,7 +1010,7 @@ async fn selected_speculation_runs_early_and_publishes_once_with_ordinary_identi
 
 #[tokio::test(flavor = "current_thread")]
 async fn unselected_speculation_discards_lifecycle_cache_and_scratch() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let registry = registry();
     let signals = ProbeSignals::new();
     install_probe_signals(signals.clone());
@@ -982,7 +1033,7 @@ async fn unselected_speculation_discards_lifecycle_cache_and_scratch() {
     take_signal(&signals.target_finished).await;
     signals.decision_release.add_permits(1);
 
-    let result = handle
+    let result = bounded("plan task", handle)
         .await
         .expect("discard speculation executor task")
         .expect("false speculative branch remains successful");
@@ -1039,7 +1090,7 @@ fn make_tree_owner_writable(path: &Path) {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn scratch_cleanup_failure_is_fatal_instead_of_false_success() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.seal_target_scratch.store(true, Ordering::SeqCst);
     install_probe_signals(signals.clone());
@@ -1057,7 +1108,7 @@ async fn scratch_cleanup_failure_is_fatal_instead_of_false_success() {
     take_signal(&signals.target_finished).await;
     signals.decision_release.add_permits(1);
 
-    let error = handle
+    let error = bounded("plan task", handle)
         .await
         .expect("cleanup failure executor task")
         .expect_err("observable private residue must fail the plan closed");
@@ -1077,7 +1128,7 @@ async fn scratch_cleanup_failure_is_fatal_instead_of_false_success() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn private_panic_with_cleanup_failure_is_fatal_instead_of_hidden() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.seal_target_scratch.store(true, Ordering::SeqCst);
     signals.panic_first_target.store(true, Ordering::SeqCst);
@@ -1096,7 +1147,7 @@ async fn private_panic_with_cleanup_failure_is_fatal_instead_of_hidden() {
     take_signal(&signals.target_finished).await;
     signals.decision_release.add_permits(1);
 
-    let error = handle
+    let error = bounded("plan task", handle)
         .await
         .expect("panic cleanup failure executor task")
         .expect_err("a panic must not hide undeletable private residue");
@@ -1116,7 +1167,7 @@ async fn private_panic_with_cleanup_failure_is_fatal_instead_of_hidden() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn unrelated_failure_explicitly_drains_prepared_private_scratch() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.seal_target_scratch.store(true, Ordering::SeqCst);
     install_probe_signals(signals.clone());
@@ -1140,7 +1191,7 @@ async fn unrelated_failure_explicitly_drains_prepared_private_scratch() {
     tokio::task::yield_now().await;
     signals.identity_release.add_permits(1);
 
-    let error = handle
+    let error = bounded("plan task", handle)
         .await
         .expect("unrelated failure executor task")
         .expect_err("terminal failure must explicitly drain prepared speculation");
@@ -1163,7 +1214,7 @@ async fn unrelated_failure_explicitly_drains_prepared_private_scratch() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn unrelated_failure_aggregates_running_private_cleanup_failure() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.seal_target_scratch.store(true, Ordering::SeqCst);
     signals.hold_target.store(true, Ordering::SeqCst);
@@ -1186,7 +1237,7 @@ async fn unrelated_failure_aggregates_running_private_cleanup_failure() {
     tokio::task::yield_now().await;
     signals.identity_release.add_permits(1);
 
-    let error = handle
+    let error = bounded("plan task", handle)
         .await
         .expect("running failure executor task")
         .expect_err("late private cleanup failure must join the primary error");
@@ -1208,7 +1259,7 @@ async fn unrelated_failure_aggregates_running_private_cleanup_failure() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn speculation_declines_silently_when_admission_is_not_spare() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     install_probe_signals(signals.clone());
     let temp = tempfile::tempdir().expect("speculation admission tempdir");
@@ -1248,7 +1299,7 @@ async fn speculation_declines_silently_when_admission_is_not_spare() {
     drop(held);
     take_signal(&signals.target_started).await;
     take_signal(&signals.target_finished).await;
-    let result = handle
+    let result = bounded("plan task", handle)
         .await
         .expect("admission-decline executor task")
         .expect("selected fallback runs ordinarily");
@@ -1258,7 +1309,7 @@ async fn speculation_declines_silently_when_admission_is_not_spare() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn selected_while_speculation_is_running_does_not_spawn_a_duplicate() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.hold_target.store(true, Ordering::SeqCst);
     install_probe_signals(signals.clone());
@@ -1296,7 +1347,7 @@ async fn selected_while_speculation_is_running_does_not_spawn_a_duplicate() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn rejecting_running_speculation_cancels_and_releases_its_envelope() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.hold_target.store(true, Ordering::SeqCst);
     install_probe_signals(signals.clone());
@@ -1334,7 +1385,7 @@ async fn rejecting_running_speculation_cancels_and_releases_its_envelope() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn warm_canonical_target_suppresses_speculative_recomputation() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let registry = registry();
     let temp = tempfile::tempdir().expect("warm speculation tempdir");
     let job_dir = temp.path().join("job");
@@ -1367,7 +1418,7 @@ async fn warm_canonical_target_suppresses_speculative_recomputation() {
         "presence probe must suppress optional recomputation"
     );
     signals.decision_release.add_permits(1);
-    let result = handle
+    let result = bounded("plan task", handle)
         .await
         .expect("warm conditional executor task")
         .expect("warm conditional run");
@@ -1377,7 +1428,7 @@ async fn warm_canonical_target_suppresses_speculative_recomputation() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn private_panic_is_hidden_and_selected_branch_falls_back_ordinarily() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.panic_first_target.store(true, Ordering::SeqCst);
     install_probe_signals(signals.clone());
@@ -1419,12 +1470,12 @@ async fn private_panic_is_hidden_and_selected_branch_falls_back_ordinarily() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn prepared_speculation_does_not_publish_after_plan_deadline() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     install_probe_signals(signals.clone());
     let temp = tempfile::tempdir().expect("prepared deadline tempdir");
     let job_dir = temp.path().join("job");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let deadline = std::time::Instant::now() + PLAN_DEADLINE;
     let mut ctx = speculation_ctx(job_dir.clone(), true);
     ctx.deadline = Some(deadline);
     let handle = tokio::spawn(execute_plan(
@@ -1444,7 +1495,7 @@ async fn prepared_speculation_does_not_publish_after_plan_deadline() {
     .await;
     signals.decision_release.add_permits(1);
 
-    let error = handle
+    let error = bounded("plan task", handle)
         .await
         .expect("prepared deadline executor task")
         .expect_err("expired plan must refuse prepared publication");
@@ -1467,13 +1518,13 @@ async fn prepared_speculation_does_not_publish_after_plan_deadline() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn prepared_deadline_surfaces_private_scratch_cleanup_failure() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.seal_target_scratch.store(true, Ordering::SeqCst);
     install_probe_signals(signals.clone());
     let temp = tempfile::tempdir().expect("sealed deadline tempdir");
     let job_dir = temp.path().join("job");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let deadline = std::time::Instant::now() + PLAN_DEADLINE;
     let mut ctx = speculation_ctx(job_dir.clone(), true);
     ctx.deadline = Some(deadline);
     let handle = tokio::spawn(execute_plan(
@@ -1493,7 +1544,7 @@ async fn prepared_deadline_surfaces_private_scratch_cleanup_failure() {
     .await;
     signals.decision_release.add_permits(1);
 
-    let error = handle
+    let error = bounded("plan task", handle)
         .await
         .expect("sealed deadline executor task")
         .expect_err("deadline must not hide undeletable private residue");
@@ -1518,13 +1569,13 @@ async fn prepared_deadline_surfaces_private_scratch_cleanup_failure() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn selected_running_speculation_does_not_publish_after_plan_deadline() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.hold_target.store(true, Ordering::SeqCst);
     install_probe_signals(signals.clone());
     let temp = tempfile::tempdir().expect("running deadline tempdir");
     let job_dir = temp.path().join("job");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let deadline = std::time::Instant::now() + PLAN_DEADLINE;
     let mut ctx = speculation_ctx(job_dir.clone(), true);
     ctx.deadline = Some(deadline);
     let handle = tokio::spawn(execute_plan(
@@ -1545,7 +1596,7 @@ async fn selected_running_speculation_does_not_publish_after_plan_deadline() {
     .await;
     signals.target_release.add_permits(1);
 
-    let error = handle
+    let error = bounded("plan task", handle)
         .await
         .expect("running deadline executor task")
         .expect_err("expired plan must refuse selected running publication");
@@ -1567,7 +1618,7 @@ async fn selected_running_speculation_does_not_publish_after_plan_deadline() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn selected_speculation_replays_step_gap_after_private_overflow() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.profile_target.store(true, Ordering::SeqCst);
     signals.target_steps.store(5_000, Ordering::SeqCst);
@@ -1586,7 +1637,7 @@ async fn selected_speculation_replays_step_gap_after_private_overflow() {
     take_signal(&signals.target_started).await;
     take_signal(&signals.target_finished).await;
     signals.decision_release.add_permits(1);
-    handle
+    bounded("plan task", handle)
         .await
         .expect("step overflow executor task")
         .expect("selected overflow plan succeeds");
@@ -1644,7 +1695,7 @@ async fn selected_speculation_replays_step_gap_after_private_overflow() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn ordinary_same_key_supersession_keeps_selected_target_accounted() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.hold_target.store(true, Ordering::SeqCst);
     install_probe_signals(signals.clone());
@@ -1687,7 +1738,7 @@ async fn ordinary_same_key_supersession_keeps_selected_target_accounted() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn merged_same_key_candidates_start_only_one_private_attempt() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let registry = registry();
     let first = speculation_spec(true)
         .compile(&registry)
@@ -1733,7 +1784,7 @@ async fn merged_same_key_candidates_start_only_one_private_attempt() {
         "a cache key may have only one private speculative owner"
     );
     cancel.cancel();
-    let error = handle
+    let error = bounded("plan task", handle)
         .await
         .expect("same-key candidate executor task")
         .expect_err("test cancellation stops the merged plan");
@@ -1742,7 +1793,7 @@ async fn merged_same_key_candidates_start_only_one_private_attempt() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn selected_publication_contains_remote_cache_plugin_panic() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let registry = registry();
     install_probe_signals(ProbeSignals::new());
     let baseline_temp = tempfile::tempdir().expect("panic target baseline tempdir");
@@ -1783,7 +1834,7 @@ async fn selected_publication_contains_remote_cache_plugin_panic() {
     take_signal(&signals.target_finished).await;
     signals.decision_release.add_permits(1);
 
-    let result = handle
+    let result = bounded("plan task", handle)
         .await
         .expect("remote panic must not unwind the coordinator")
         .expect("selected result remains locally publishable");
@@ -1800,7 +1851,7 @@ async fn selected_publication_contains_remote_cache_plugin_panic() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn selected_publication_panic_rolls_back_canonical_state() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     install_probe_signals(signals.clone());
     let temp = tempfile::tempdir().expect("publication rollback tempdir");
@@ -1817,7 +1868,7 @@ async fn selected_publication_panic_rolls_back_canonical_state() {
     take_signal(&signals.target_finished).await;
     signals.decision_release.add_permits(1);
 
-    let error = handle
+    let error = bounded("plan task", handle)
         .await
         .expect("publication panic must not unwind the coordinator")
         .expect_err("publication panic fails the selected plan closed");
@@ -1843,7 +1894,7 @@ async fn selected_publication_panic_rolls_back_canonical_state() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn selected_publication_panic_surfaces_canonical_rollback_failure() {
-    let _guard = SPECULATION_TEST_LOCK.lock().await;
+    let _guard = speculation_lock().await;
     let signals = ProbeSignals::new();
     signals.seal_target_scratch.store(true, Ordering::SeqCst);
     install_probe_signals(signals.clone());
@@ -1861,7 +1912,7 @@ async fn selected_publication_panic_surfaces_canonical_rollback_failure() {
     take_signal(&signals.target_finished).await;
     signals.decision_release.add_permits(1);
 
-    let error = handle
+    let error = bounded("plan task", handle)
         .await
         .expect("rollback failure must not unwind the coordinator")
         .expect_err("incomplete canonical publication must fail closed");

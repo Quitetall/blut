@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# The S3 store the kind end-to-end runs against (scripts/k8s_kind_e2e.sh).
+#
+# MinIO withdrew its published images and binaries: Docker Hub refuses the
+# pull and dl.min.io answers 410. Its source is still public, so this builds
+# the same release the end-to-end was validated with, server and client, at
+# the commits that release's binaries report.
+#
+#   docker build -f docker/Dockerfile.minio -t blut-e2e/minio:2025-09-07 docker
+#
+# MinIO and mc are AGPL-3.0, as is this repository.
+
+# golang:1.24.6-bookworm, the Go release MinIO built RELEASE.2025-09-07 with.
+ARG GO_IMAGE=golang@sha256:ab1d1823abb55a9504d2e3e003b75b36dbeb1cbcc4c92593d85a84ee46becc6c
+# debian:bookworm-slim
+ARG RUNTIME_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+
+FROM ${GO_IMAGE} AS builder
+# RELEASE.2025-09-07T16-13-09Z and the mc RELEASE.2025-08-13T08-35-41Z it shipped.
+ARG MINIO_COMMIT=07c3a429bfed433e49018cb0f78a52145d4bedeb
+ARG MC_COMMIT=7394ce0dd2a80935aded936b09fa12cbb3cb8096
+ENV CGO_ENABLED=0 GOFLAGS=-trimpath
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -eu; \
+    for spec in "minio $MINIO_COMMIT" "mc $MC_COMMIT"; do \
+      set -- $spec; \
+      git init -q "/src/$1"; \
+      git -C "/src/$1" fetch -q --depth 1 "https://github.com/minio/$1" "$2"; \
+      git -C "/src/$1" checkout -q FETCH_HEAD; \
+      test "$(git -C "/src/$1" rev-parse HEAD)" = "$2"; \
+      (cd "/src/$1" && go build -o "/out/$1" .); \
+    done
+
+FROM ${RUNTIME_IMAGE}
+COPY --from=builder /out/minio /out/mc /usr/bin/
+ENTRYPOINT ["minio"]

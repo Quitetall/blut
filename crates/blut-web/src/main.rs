@@ -107,6 +107,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// BLUT's state directory: `$LAMU_TRAIN_DATA_DIR` when set (a separate
+/// install), else `~/.blut` — the same rule as `blut::paths::blut_home`.
 fn dirs_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".blut"))
+    if blut::paths::state_root().is_some() || std::env::var_os("HOME").is_some() {
+        return Some(blut::paths::blut_home());
+    }
+    None
 }

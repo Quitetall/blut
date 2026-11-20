@@ -198,6 +198,51 @@ pub fn resolve_uri(
     Ok(resolved)
 }
 
+/// The immutable bindings that point at the raw source record `dataset_id`,
+/// as `dataset://<name>@<version> (tenant '<t>')` strings, oldest first.
+/// `blut dataset ingest rm` refuses while this is non-empty: removing the
+/// source row would leave every such version permanently unresolvable (the
+/// binding names the row by id) and impossible to pin again.
+pub(crate) fn pins_of_source(conn: &Connection, dataset_id: &str) -> Result<Vec<String>> {
+    ensure_schema(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT tenant, name, version FROM dataset_refs
+             WHERE dataset_id = ?1 ORDER BY pinned_at, name, version",
+        )
+        .map_err(|e| TrainError::other(format!("query dataset pins: {e}")))?;
+    let rows = stmt
+        .query_map(params![dataset_id], |row| {
+            Ok(format!(
+                "dataset://{}@{} (tenant '{}')",
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(0)?
+            ))
+        })
+        .map_err(|e| TrainError::other(format!("query dataset pins: {e}")))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| TrainError::other(format!("query dataset pins: {e}")))
+}
+
+/// The raw source name behind a pinned `dataset://<name>@<version>`, in any
+/// tenant (the local catalog lists every tenant's sources already).
+pub(crate) fn source_name_for_version(
+    conn: &Connection,
+    name: &str,
+    version: &str,
+) -> Result<Option<String>> {
+    ensure_schema(conn)?;
+    conn.query_row(
+        "SELECT d.name FROM dataset_refs r JOIN datasets d ON d.id = r.dataset_id
+         WHERE r.name = ?1 AND r.version = ?2 ORDER BY r.pinned_at LIMIT 1",
+        params![name, version],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| TrainError::other(format!("resolve dataset version: {e}")))
+}
+
 fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(CREATE_SCHEMA)
         .map_err(|e| TrainError::other(format!("create dataset registry schema: {e}")))
@@ -298,4 +343,58 @@ fn safe_ident(value: &str) -> bool {
         && !value.starts_with('.')
         && !value.starts_with('-')
         && !value.contains("..")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(conn: &Connection, dir: &std::path::Path, name: &str, body: &str) -> DatasetRecord {
+        let path = dir.join(format!("{name}.jsonl"));
+        std::fs::write(&path, body).unwrap();
+        let rec = datasets_db::record_from_jsonl(name, &path, "jsonl", None).unwrap();
+        datasets_db::add(conn, &rec).unwrap();
+        rec
+    }
+
+    #[test]
+    fn pins_of_source_lists_every_binding_of_the_row() {
+        let td = tempfile::tempdir().unwrap();
+        let conn = datasets_db::open_at(&td.path().join("datasets.db")).unwrap();
+        let rec = source(&conn, td.path(), "corpus", "{\"x\":1}\n");
+        let other = source(&conn, td.path(), "other", "{\"x\":2}\n");
+        assert!(pins_of_source(&conn, &rec.id).unwrap().is_empty());
+        pin(
+            &conn,
+            "corpus",
+            "dataset://corpus@v1",
+            &Tenant::default(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            pins_of_source(&conn, &rec.id).unwrap(),
+            vec!["dataset://corpus@v1 (tenant 'default')".to_string()]
+        );
+        assert!(pins_of_source(&conn, &other.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_name_for_version_follows_the_binding_not_the_uri_name() {
+        let td = tempfile::tempdir().unwrap();
+        let conn = datasets_db::open_at(&td.path().join("datasets.db")).unwrap();
+        source(&conn, td.path(), "raw_tuh", "{\"x\":1}\n");
+        pin(&conn, "raw_tuh", "dataset://tuh@v3", &Tenant::default(), 1).unwrap();
+        assert_eq!(
+            source_name_for_version(&conn, "tuh", "v3")
+                .unwrap()
+                .as_deref(),
+            Some("raw_tuh")
+        );
+        assert_eq!(source_name_for_version(&conn, "tuh", "v4").unwrap(), None);
+        assert_eq!(
+            source_name_for_version(&conn, "raw_tuh", "v3").unwrap(),
+            None
+        );
+    }
 }

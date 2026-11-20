@@ -182,7 +182,7 @@ pub fn acquire_exclusive_at(
         if pid_alive(existing.pid) {
             return Err(Error::Other(format!(
                 "GPU held by '{}' (pid {}, kind {:?}, since unix {}). \
-                 Wait or pass --allow-evict.",
+                 Wait for it to finish (`blut jobs`), or stop it with `blut cancel <job>`.",
                 existing.holder, existing.pid, existing.kind, existing.since_unix
             )));
         }
@@ -209,8 +209,8 @@ pub fn check_unlocked_at(path: &Path) -> Result<()> {
         && pid_alive(existing.pid)
     {
         return Err(Error::Other(format!(
-            "GPU held by '{}' (pid {}, kind {:?}). \
-                 Pass --allow-evict to wait.",
+            "GPU held by '{}' (pid {}, kind {:?}). Wait for it to finish \
+                 (`blut jobs`), or stop it with `blut cancel <job>`.",
             existing.holder, existing.pid, existing.kind
         )));
     }
@@ -297,9 +297,35 @@ fn pid_alive(pid: u32) -> bool {
     )
 }
 
-#[cfg(not(unix))]
+/// Windows: open the pid with `SYNCHRONIZE` and poll its handle. A pid that
+/// cannot be opened because it names no process (`ERROR_INVALID_PARAMETER`)
+/// is gone; any other open failure (e.g. access denied: it exists but belongs
+/// to someone else) counts as alive, so an unknown lock is never clobbered.
+#[cfg(windows)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    // SAFETY: plain FFI; the handle is checked before use and closed after.
+    #[allow(unsafe_code)]
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if h.is_null() {
+            return GetLastError() != ERROR_INVALID_PARAMETER;
+        }
+        // Signalled = the process has exited (its handle can outlive it).
+        let exited = WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+        CloseHandle(h);
+        !exited
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn pid_alive(_pid: u32) -> bool {
-    // No portable cheap check on non-Unix; assume alive so callers
+    // No portable cheap check here; assume alive so callers
     // err on the side of refusing to clobber an unknown lock.
     true
 }
@@ -343,9 +369,11 @@ mod tests {
             .expect_err("second acquire must fail");
         let msg = format!("{err}");
         assert!(msg.contains("first"), "msg should name the holder: {msg}");
+        // The hint must name commands that exist: `--allow-evict` is not a
+        // flag of any `blut` verb, yet the message used to suggest it.
         assert!(
-            msg.contains("--allow-evict"),
-            "msg should hint --allow-evict: {msg}"
+            msg.contains("blut cancel") && !msg.contains("--allow-evict"),
+            "msg should say how to free the lock: {msg}"
         );
     }
 

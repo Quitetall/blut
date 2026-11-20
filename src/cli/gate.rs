@@ -19,7 +19,7 @@ pub(super) fn footprint_or_floor(
     match declared_fp {
         Some(fp) => Ok(fp),
         None => {
-            if std::env::var("BLUT_STRICT_DECLARATIONS").is_ok_and(|v| v == "1") {
+            if crate::config::env_flag("BLUT_STRICT_DECLARATIONS") {
                 anyhow::bail!(
                     "'{name}' declares no resource envelope and BLUT_STRICT_DECLARATIONS=1 \
                      — implement Stage::resource_envelope (ADR 0133)"
@@ -264,7 +264,7 @@ pub(super) fn configure_training_io_admission(
     Ok((plan, admitted))
 }
 
-/// ADR 0071 A2: auto-tune the decode worker count to FIT-AND-SATURATE from a SINGLE
+/// ADR 0156 A2: auto-tune the decode worker count to FIT-AND-SATURATE from a SINGLE
 /// memory snapshot. Returns `Some(W)` for a train-shaped recipe (so RESOLVE +
 /// RECORD share the cached count), or `None` for a light/arg-less recipe or when
 /// the mem probe is unavailable (keep the conservative cap = unchanged behaviour).
@@ -324,7 +324,7 @@ pub(super) fn admitted_workers_for(
     Some(w)
 }
 
-/// E2: auto-tune the batch size to FIT the RAM budget, extending ADR 0071 A2's
+/// E2: auto-tune the batch size to FIT the RAM budget, extending ADR 0156 A2's
 /// fit-and-saturate auto-tune to a second knob. Runs ONLY when `resolved_workers`
 /// came from [`admitted_workers_for`] on this SAME admission call (batch is
 /// searched against the residual budget after workers is already fixed — see

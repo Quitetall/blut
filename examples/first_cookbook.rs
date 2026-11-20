@@ -112,11 +112,16 @@ impl Stage for Increment {
 
     // ── Declare your resources (ADR 0133) ────────────────────────────────
     // ONE method gives your stage the whole admission stack: the launch gate
-    // sizes it, the measured-peak store CALIBRATES it run over run (with an
-    // OOM-aware self-heal), and the engine AUTO-TUNES any dimension you
-    // declare a cost term for — you enumerate the coefficients and ceilings,
-    // the engine owns the search. Skip this method and your stage still runs,
-    // billed a loud 2 GiB compatibility floor.
+    // sizes it, and the engine AUTO-TUNES any dimension you declare a cost
+    // term for — you enumerate the coefficients and ceilings, the engine owns
+    // the search. The calibration dimensions key the measured-peak store
+    // (`blut footprint list`): a launch resolves this estimate against a
+    // measured peak recorded under the same key, with an OOM-aware self-heal.
+    // The engine reads that store but does not fill it for you: a cookbook
+    // runner that measures its child's peak records it
+    // (`FootprintStore::record`), so a cookbook that never records keeps
+    // being billed this declared estimate. Skip this method and your stage
+    // still runs, billed a loud 2 GiB compatibility floor.
     fn resource_envelope(&self, _args: &NoArgs) -> blut_types::envelope::ResourceEnvelope {
         blut_types::envelope::ResourceEnvelope {
             ram_bytes: 1 << 30, // 1 GiB conservative peak

@@ -118,7 +118,7 @@ enum Command {
         /// Second job id.
         b: String,
     },
-    /// One run's results from the metric store (ADR 0071 A3): best val_r +
+    /// One run's results from the metric store (ADR 0156 A3): best val_r +
     /// trajectory + per-band PRD + ckpt path. `blut results <job> [--json]` —
     /// replaces grepping BLUT_METRIC out of raw logs + `ls -t`-hunting a CSV.
     Results {
@@ -284,7 +284,7 @@ enum Command {
     /// already holds the user's registry configuration.
     Update {
         /// Only report; never offer to install.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "yes")]
         check: bool,
         /// Run the upgrade instead of printing the command.
         #[arg(long)]
@@ -374,8 +374,8 @@ enum PlanCommand {
     Inspect {
         /// Recipe name (as listed by `recipe list`).
         name: String,
-        /// Recipe args as inline JSON.
-        #[arg(long)]
+        /// Recipe args as inline JSON. Defaults to `{}`, as for `recipe run`.
+        #[arg(long, default_value = "{}")]
         args: String,
     },
     /// Typecheck a `.json` PlanSpec against the compiled-in stages WITHOUT
@@ -406,7 +406,7 @@ enum PlanCommand {
     /// so `blut lineage`, `blut log` and `blut dag` all work on the result.
     ///
     /// LOCAL launches only. `recipe run` takes a `--launcher` and can dispatch
-    /// to Slurm, Ray, P2P or k8s; this does not, because none of those paths has
+    /// to Slurm, Ray or k8s; this does not, because none of those paths has
     /// been exercised from a PlanSpec and offering an untested flag is worse
     /// than not offering one.
     ///
@@ -426,13 +426,8 @@ enum PlanCommand {
         /// Force async-I/O lanes onto their synchronous fallback.
         #[arg(long, default_value_t = false)]
         sync_io: bool,
-        /// Tenant that owns the launched job (ADR 0096).
-        ///
-        /// `default`, NOT `publish`'s `shared`. Two different namespaces wear
-        /// the word "tenant": the deployment registry keys rows under
-        /// `shared`/`restricted`, while the quota policy that admits a RUN
-        /// knows `default` and whatever a config declares. Defaulting this to
-        /// `shared` made the verb fail admission out of the box.
+        /// Tenant that owns the launched job (ADR 0096). Every verb defaults
+        /// to `default`, the tenant the quota policy admits out of the box.
         #[arg(long, default_value = "default")]
         tenant: String,
         /// Validate and compile without running anything: typecheck the spec,
@@ -446,33 +441,39 @@ enum PlanCommand {
     Publish {
         /// Path to a `.json` PlanSpec.
         spec: std::path::PathBuf,
-        /// Owning tenant (default `shared`; `restricted` = clinical/PHI).
-        #[arg(long, default_value = "shared")]
+        /// Owning tenant (`restricted` = clinical/PHI). Defaults to `default`,
+        /// the tenant `recipe declare --run` resolves and runs under; records
+        /// published under the former `shared` default need `--tenant shared`.
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
     /// Promote a published fingerprint onto a named pointer
     /// (`registry://plan@<name>`), recording the move in the audit trail.
     Promote {
-        /// The deployment fingerprint to promote.
+        /// The deployment fingerprint to promote, or an unambiguous prefix.
         fingerprint: String,
         /// Target pointer, e.g. `registry://plan@prod`.
         pointer: String,
         /// Acting tenant — must match the deployment's tenant.
-        #[arg(long, default_value = "shared")]
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
-    /// Roll a pointer back to its previous target atomically.
+    /// Roll a pointer back one step through its promotion history. Each
+    /// rollback moves one promotion further back (promote A, B, C, then two
+    /// rollbacks land on A); a promotion after a rollback continues from there.
+    /// Refused at the pointer's first promotion.
     Rollback {
         /// Pointer, e.g. `registry://plan@prod`.
         pointer: String,
-        #[arg(long, default_value = "shared")]
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
-    /// Print a pointer's deployment audit trail (oldest first).
+    /// Print a pointer's deployment audit trail, oldest first: time,
+    /// fingerprint, and whether the move was a promote or a rollback.
     History {
         /// Pointer, e.g. `registry://plan@prod`.
         pointer: String,
-        #[arg(long, default_value = "shared")]
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
 }
@@ -509,7 +510,10 @@ enum ModelCommand {
         #[arg(long)]
         change_id: Option<String>,
         /// Governance gate argv (e.g. `"python …/pccp_gate.py --candidate {hash}
-        /// --model {name} --change-id {change_id}"`). Falls back to
+        /// --model {name} --change-id {change_id}"`). Split on whitespace and run
+        /// with no shell, so it cannot contain quoted arguments or a path with
+        /// spaces; wrap anything more complex in a script. `{hash}`, `{name}`,
+        /// `{alias}` and `{change_id}` are substituted. Falls back to
         /// `$BLUT_MODEL_GATE_CMD`. Required to promote onto a governed alias.
         #[arg(long)]
         gate_cmd: Option<String>,
@@ -517,7 +521,10 @@ enum ModelCommand {
         #[arg(long, default_value = "5m", value_parser = parse_duration)]
         gate_timeout: Duration,
     },
-    /// Roll an alias back to its previous target atomically.
+    /// Roll an alias back one step through its promotion history. Each
+    /// rollback moves one promotion further back (promote A, B, C, then two
+    /// rollbacks land on A); a promotion after a rollback continues from there.
+    /// Refused at the alias's first promotion.
     Rollback {
         /// Pointer, e.g. `model://encoder-v1@prod`.
         pointer: String,
@@ -531,7 +538,8 @@ enum ModelCommand {
         #[arg(long, default_value = "default")]
         tenant: String,
     },
-    /// Print an alias's audit trail (oldest first).
+    /// Print an alias's audit trail, oldest first: UTC time, checkpoint hash,
+    /// whether the move was a promote or a rollback, and which row is current.
     History {
         /// Pointer, e.g. `model://encoder-v1@prod`.
         pointer: String,
@@ -545,11 +553,19 @@ enum CacheCommand {
     /// Show the global cache path + current size.
     Show,
     /// LRU-prune the global cache to fit under `max_gb` (or the
-    /// `LAMU_CACHE_MAX_GB` env var, or 50 GiB by default).
+    /// `LAMU_CACHE_MAX_GB` env var, or 50 GiB by default), and delete
+    /// mid-stage checkpoint slots nothing has used for
+    /// `--checkpoint-max-age-hours`. A slot whose stage is running, or whose
+    /// trainer may still be alive, is never deleted.
     Prune {
         /// Cap in GiB. Overrides `LAMU_CACHE_MAX_GB`.
         #[arg(long)]
         max_gb: Option<f64>,
+        /// Delete checkpoint slots unused for this many hours (default one
+        /// week). They hold the progress of stages that failed and were not
+        /// resumed.
+        #[arg(long, default_value_t = 168)]
+        checkpoint_max_age_hours: u64,
     },
     /// Per-ingredient cache hit/miss tally for a job (from its status.jsonl).
     Stats {
@@ -630,6 +646,12 @@ enum ScheduleCommand {
     /// List installed blut recipe timers.
     List,
     /// Install (or replace) a timer that runs a recipe on a schedule.
+    ///
+    /// The unit runs `recipe run` with the flags given here, from the current
+    /// working directory, with the location, policy, interpreter and device
+    /// variables set in this shell (`blut::schedule::ENVIRONMENT_ALLOWLIST`),
+    /// so a firing reproduces the launch you would run by hand. Nothing else
+    /// from the environment is copied: credentials never go in a unit file.
     Install {
         /// Recipe name (as listed by `recipe list`).
         recipe: String,
@@ -640,6 +662,25 @@ enum ScheduleCommand {
         /// Recipe args as inline JSON. Defaults to `{}`.
         #[arg(long, default_value = "{}")]
         args: String,
+        /// Tenant the scheduled runs are admitted under, as `recipe run
+        /// --tenant`.
+        #[arg(long, default_value = "default")]
+        tenant: String,
+        /// Scheduled runs read and write the global shared cache, as `recipe
+        /// run --shared-cache`.
+        #[arg(long)]
+        shared_cache: bool,
+        /// Scheduled runs bypass the cache, as `recipe run --no-cache`.
+        #[arg(long)]
+        no_cache: bool,
+        /// Scheduled runs use synchronous training I/O, as `recipe run
+        /// --sync-io`.
+        #[arg(long)]
+        sync_io: bool,
+        /// Experiment the scheduled runs group under, as `recipe run
+        /// --experiment`.
+        #[arg(long)]
+        experiment: Option<String>,
     },
     /// Remove a recipe's timer + service.
     Uninstall {
@@ -764,6 +805,79 @@ enum PolicyCommand {
     Disable,
 }
 
+/// What `blut policy enable` tells the operator to put in cron. It used to
+/// print `<exe> auto`, a verb `blut` does not have, so the advertised cron
+/// line failed every 30 minutes into a log nobody reads. The policy is read
+/// by the `auto-train-policy` sensor; `sensor eval` exits 0 only when every
+/// gate passes, so it chains in front of the recipe the operator picks.
+fn policy_cron_hint(exe: &str, log_path: &str, policy_override: Option<&str>) -> String {
+    let exe = update::shell_join(&[exe.to_string()]);
+    let log = update::shell_join(&[log_path.to_string()]);
+    // cron starts with a minimal environment: a policy chosen through
+    // `$LAMU_TRAIN_POLICY` must be named on the line, or the sensor reads the
+    // default policy file instead of the one just enabled.
+    let env = policy_override
+        .map(|p| {
+            format!(
+                "LAMU_TRAIN_POLICY={} ",
+                update::shell_join(&[p.to_string()])
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "# The policy gates the `auto-train-policy` sensor (exit 0 = run now).\n\
+         # To act on it every 30 min, add to crontab with your recipe and args:\n\
+         */30 * * * * {env}{exe} sensor eval auto-train-policy >> {log} 2>&1 && \
+         {exe} recipe run <RECIPE> --args '<JSON>' >> {log} 2>&1\n"
+    )
+}
+
+/// The `cache prune` cap in GiB: `--max-gb`, else `$LAMU_CACHE_MAX_GB`, else
+/// 50. A negative or non-finite cap is refused: cast to bytes it was 0, so
+/// `--max-gb=-1` or `--max-gb NaN` deleted the whole shared cache and then
+/// reported the cap it had been given. An unparseable `$LAMU_CACHE_MAX_GB`
+/// is refused too, instead of quietly meaning 50.
+fn resolve_prune_cap_gb(flag: Option<f64>, env: Option<std::ffi::OsString>) -> Result<f64> {
+    let (cap, source) = match (flag, env) {
+        (Some(cap), _) => (cap, "--max-gb".to_string()),
+        (None, Some(raw)) => {
+            let text = raw.to_str().unwrap_or("").trim().to_string();
+            let cap = text.parse::<f64>().map_err(|_| {
+                anyhow!(
+                    "LAMU_CACHE_MAX_GB={raw:?} is not a number of GiB; set it to e.g. 50, \
+                     or unset it for the 50 GiB default"
+                )
+            })?;
+            (cap, "LAMU_CACHE_MAX_GB".to_string())
+        }
+        (None, None) => (50.0, String::new()),
+    };
+    if !cap.is_finite() || cap < 0.0 {
+        return Err(anyhow!(
+            "{source} {cap} is not a usable cache cap: give a size in GiB, 0 or more \
+             (0 empties the cache)"
+        ));
+    }
+    Ok(cap)
+}
+
+/// A byte count in the largest binary unit that keeps it at or above 1.
+/// `cache prune` printed "pruned 0.00 GiB" after deleting a whole small cache.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
 fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("{e}"))
 }
@@ -820,13 +934,37 @@ fn run_external(argv: Vec<String>) -> Result<()> {
                  `{bin}` sidecar binary (ADR 0083); install it or check PATH: {e}"
             )
         })?;
-    if !status.success() {
-        return Err(anyhow!(
-            "`{bin}` exited with {}",
-            exit_status_reason(&status)
-        ));
+    // Pass the sidecar's own exit code through, as cargo does for
+    // `cargo-<cmd>`. It used to be collapsed to 1 behind an extra "exited with
+    // status N" line, so a script could not tell a usage error (2) from a
+    // failure, and the sidecar's own message was followed by a second one.
+    if let Some(code) = external_exit_code(&status) {
+        if status.code().is_none() {
+            eprintln!("`{bin}` exited with {}", exit_status_reason(&status));
+        }
+        std::process::exit(code);
     }
     Ok(())
+}
+
+/// The exit code `blut <cmd>` should exit with after the sidecar `blut-<cmd>`
+/// finished: `None` on success, `Some(code)` for a non-zero exit code, and for
+/// a signal death the conventional `128 + signal` (Unix) or 1.
+fn external_exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+    if status.success() {
+        return None;
+    }
+    if let Some(code) = status.code() {
+        return Some(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return Some(128 + sig);
+        }
+    }
+    Some(1)
 }
 
 /// Human-readable failure reason for a child `ExitStatus` — the code when it
@@ -933,15 +1071,7 @@ fn run_catalog_cmd(cmd: CatalogCommand) -> Result<()> {
             Ok(())
         }
         CatalogCommand::Show { name, json } => {
-            let bare = name.split_once('@').map(|(n, _)| n).unwrap_or(&name);
-            let record = crate::datasets_db::get_by_name(&datasets, &name)
-                .map_err(|e| anyhow!("{e}"))?
-                .or_else(|| {
-                    crate::datasets_db::get_by_name(&datasets, bare)
-                        .ok()
-                        .flatten()
-                })
-                .ok_or_else(|| anyhow!("no dataset '{name}' in the registry"))?;
+            let record = resolve_catalog_record(&datasets, &name)?;
             let entry = catalog::project(&record, &lineage).map_err(|e| anyhow!("{e}"))?;
             // Fail-closed consistency: a drifted schema is an error, not a serve.
             catalog::verify_consistency(&entry, &record).map_err(|e| anyhow!("{e}"))?;
@@ -991,12 +1121,11 @@ fn run_catalog_cmd(cmd: CatalogCommand) -> Result<()> {
             Ok(())
         }
         CatalogCommand::Tag { name, tag } => {
-            let bare = name
-                .split_once('@')
-                .map(|(n, _)| n.to_string())
-                .unwrap_or(name);
-            catalog::add_tag(&tags, &bare, &tag).map_err(|e| anyhow!("{e}"))?;
-            println!("tagged {bare} += {tag}");
+            // Tag a dataset that exists: a typo used to create a tag on a name
+            // nothing would ever match, and print success.
+            let record = resolve_catalog_record(&datasets, &name)?;
+            catalog::add_tag(&tags, &record.name, &tag).map_err(|e| anyhow!("{e}"))?;
+            println!("tagged {} += {tag}", record.name);
             Ok(())
         }
     }
@@ -1050,6 +1179,23 @@ pub type ConsoleFn = fn(
     std::sync::Arc<crate::framework::Registry>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>>;
 
+/// Fix the code identity every stage cache key folds
+/// ([`crate::framework::code_identity`]) from the registered cookbooks, before
+/// anything computes a key. A cookbook without an identity is named, because
+/// the cache cannot tell its builds apart.
+fn install_code_identity(reg: &crate::framework::Registry) {
+    let identity = reg.code_identity();
+    for name in &identity.unidentified {
+        tracing::warn!(
+            "cookbook '{name}' supplies no build identity (Cookbook::identity), so cached \
+             stage outputs survive changes to its code; rebuilds of it can reuse stale results"
+        );
+    }
+    if let Err(in_force) = crate::framework::code_identity::install(identity) {
+        tracing::warn!("cache code identity was already fixed as {in_force}; keeping it");
+    }
+}
+
 /// BLUT CLI entrypoint. The recipe catalog is supplied by the caller as
 /// a composed [`crate::framework::cookbook::Registry`] (the binary — in a cookbook crate — registers
 /// the cookbooks it ships and passes them here). This is the library seam that
@@ -1061,8 +1207,29 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
 
 /// [`run`] with an optional in-process cockpit (see [`TuiHook`]).
 pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>) -> Result<()> {
+    run_parsed(reg, tui, None).await
+}
+
+/// [`run`] with an explicit argument list instead of the process's own
+/// (`args[0]` is the program name, as in `std::env::args`). For binaries that
+/// rewrite their arguments, and for tests that drive the CLI in a child
+/// process.
+pub async fn run_from<I, T>(reg: crate::framework::Registry, args: I) -> Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    run_parsed(reg, None, Some(args.into_iter().map(Into::into).collect())).await
+}
+
+async fn run_parsed(
+    reg: crate::framework::Registry,
+    tui: Option<TuiHook>,
+    args: Option<Vec<std::ffi::OsString>>,
+) -> Result<()> {
     init_tracing();
     warn_if_stale_binary();
+    crate::paths::warn_stranded_stores();
     // The engine owns the built-in `checks` cookbook (ADR 0091): augment the
     // caller's registry so `check_jsonl`/`assert` + the `checks` error domain are
     // available to every binary (like `p2p-smoke` for the p2p path).
@@ -1071,7 +1238,11 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
     // ADR 0112: the built-in `connectors` cookbook so an integration graph
     // (`blut recipe declare s3_roundtrip.json`) resolves + kind-checks.
     crate::connectors::register(&mut reg);
-    let cli = Cli::parse();
+    install_code_identity(&reg);
+    let cli = match args {
+        Some(args) => Cli::parse_from(args),
+        None => Cli::parse(),
+    };
     let result = match cli.command {
         Some(Command::Jobs { json }) => run_jobs(json),
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
@@ -1110,7 +1281,13 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
         Some(Command::Dataset { cmd }) => run_dataset_cmd(cmd),
         Some(Command::Policy { cmd }) => run_policy(cmd),
-        Some(Command::Recipe { cmd }) => run_recipe(&reg, cmd).await,
+        Some(Command::Recipe { cmd }) => {
+            let result = run_recipe(&reg, cmd).await;
+            if let Err(error) = &result {
+                write_failed_run_summary_once(error);
+            }
+            result
+        }
         Some(Command::Plan { cmd }) => run_plan_cmd(&reg, cmd).await,
         Some(Command::Model { cmd }) => run_model_cmd(cmd).await,
         Some(Command::Experiment { cmd }) => run_experiment_cmd(cmd),
@@ -1178,7 +1355,7 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
     result
 }
 
-/// See the call in [`run`]. Mirrors the terseness of the ADR-0071
+/// See the call in [`run`]. Mirrors the terseness of the ADR-0156
 /// advisory-warning print (`⚠ training OK — completed with N advisory
 /// warning(s)...` below `run_recipe`): a short header line, then one
 /// `    · field: value` bullet per populated field. Fields left `None`
@@ -1269,6 +1446,376 @@ mod external_subcommand_tests {
             assert!(message.contains("removed by ADR 0170"), "{message}");
             assert!(message.contains(expected), "{message}");
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_cron_hint_tests {
+    use super::{Cli, policy_cron_hint};
+    use clap::Parser;
+
+    /// The suggested cron line must call verbs that exist: it used to run
+    /// `blut auto`, which is not a subcommand.
+    #[test]
+    fn the_cron_line_names_real_verbs_and_quotes_paths() {
+        let hint = policy_cron_hint("/opt/my tools/blut", "/var/log/a b.log", None);
+        assert!(!hint.contains(" auto "), "{hint}");
+        assert!(
+            hint.contains("'/opt/my tools/blut' sensor eval auto-train-policy"),
+            "{hint}"
+        );
+        assert!(hint.contains("'/var/log/a b.log'"), "{hint}");
+        assert!(Cli::try_parse_from(["blut", "sensor", "eval", "auto-train-policy"]).is_ok());
+        assert!(
+            crate::sensor::registry()
+                .iter()
+                .any(|s| s.name() == "auto-train-policy")
+        );
+    }
+
+    /// E2E regression: with `$LAMU_TRAIN_POLICY` set, the printed cron line
+    /// evaluated the DEFAULT policy, because cron does not inherit the variable.
+    #[test]
+    fn the_cron_line_carries_a_policy_override() {
+        let hint = policy_cron_hint("blut", "/l.log", Some("/srv/my policy.toml"));
+        assert!(
+            hint.contains("LAMU_TRAIN_POLICY='/srv/my policy.toml' blut sensor eval"),
+            "{hint}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resume_marker_tests {
+    use super::RecipeMarker;
+
+    /// Resuming a job launched from a plan file failed with a bare
+    /// "No such file or directory".
+    #[test]
+    fn resuming_a_plan_file_job_says_why_it_cannot() {
+        let td = tempfile::tempdir().unwrap();
+        let err = RecipeMarker::read_from(td.path())
+            .err()
+            .expect("no marker")
+            .to_string();
+        assert!(err.contains("launched from a plan file"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod artifact_inspect_tests {
+    use super::{InspectTarget, inspect_target};
+    use crate::framework::lineage::ArtifactRecord;
+
+    fn rec(job: &str, byte: u8) -> ArtifactRecord {
+        let meta = serde_json::from_value(serde_json::json!({
+            "kind": "k",
+            "schema": 1,
+            "content_id": format!("{byte:02x}").repeat(32),
+            "identity_scheme": "abir-content-id-v1",
+            "produced_by_stage": "s",
+            "produced_at_unix_secs": 0,
+        }))
+        .unwrap();
+        ArtifactRecord {
+            meta,
+            sidecar_path: std::path::PathBuf::from(format!(
+                "/j/{job}/stages/0-s/output.metadata.json"
+            )),
+            job_id: job.into(),
+        }
+    }
+
+    /// An artifact reused by later cache-hit jobs has one sidecar per job;
+    /// `inspect` refused it as ambiguous even when given the full hash.
+    #[test]
+    fn the_same_content_in_several_jobs_is_one_artifact() {
+        let recs = [
+            rec("20261023-000001-0", 7),
+            rec("20261023-000003-0", 7),
+            rec("20261023-000002-0", 7),
+        ];
+        match inspect_target(&recs) {
+            InspectTarget::One { record, also_in } => {
+                assert_eq!(record.job_id, "20261023-000003-0", "newest job");
+                assert_eq!(also_in, ["20261023-000001-0", "20261023-000002-0"]);
+            }
+            _ => panic!("same hash must resolve to one artifact"),
+        }
+        let mixed = [rec("a", 7), rec("b", 8)];
+        assert!(matches!(
+            inspect_target(&mixed),
+            InspectTarget::Ambiguous(_)
+        ));
+        assert!(matches!(inspect_target(&[]), InspectTarget::None));
+    }
+}
+
+#[cfg(test)]
+mod small_cli_fix_tests {
+    use super::{Cli, Command, PlanCommand, human_bytes};
+    use clap::Parser;
+
+    /// `cache prune` reported "pruned 0.00 GiB" after deleting 2778 bytes.
+    #[test]
+    fn small_sizes_are_not_rounded_to_zero() {
+        assert_eq!(human_bytes(2778), "2.71 KiB");
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(3 << 30), "3.00 GiB");
+    }
+
+    /// `plan inspect <recipe>` demanded `--args` where `recipe run` defaults
+    /// it to `{}`.
+    #[test]
+    fn plan_inspect_args_default_to_an_empty_object() {
+        let cli = Cli::try_parse_from(["blut", "plan", "inspect", "r"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plan { cmd: PlanCommand::Inspect { args, .. } }) if args == "{}"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod default_tenant_tests {
+    use super::{Cli, Command, PlanCommand, RecipeCommand};
+    use clap::Parser;
+
+    fn plan_tenant(argv: &[&str]) -> String {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Some(Command::Plan {
+                cmd:
+                    PlanCommand::Publish { tenant, .. }
+                    | PlanCommand::Promote { tenant, .. }
+                    | PlanCommand::Rollback { tenant, .. }
+                    | PlanCommand::History { tenant, .. }
+                    | PlanCommand::Run { tenant, .. },
+            }) => tenant,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// `plan publish`/`promote` defaulted to `shared` while `recipe declare`
+    /// resolved and ran under `default`, so the documented publish → promote →
+    /// `recipe declare registry://plan@prod --run` path found no pointer.
+    #[test]
+    fn every_plan_verb_defaults_to_the_tenant_recipe_declare_uses() {
+        let declare = match Cli::try_parse_from(["blut", "recipe", "declare", "x.json"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Recipe {
+                cmd: RecipeCommand::Declare { tenant, .. },
+            }) => tenant,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(declare, "default");
+        let p = "registry://plan@prod";
+        for argv in [
+            &["blut", "plan", "publish", "x.json"][..],
+            &["blut", "plan", "promote", "abc", p],
+            &["blut", "plan", "rollback", p],
+            &["blut", "plan", "history", p],
+            &["blut", "plan", "run", "x.json"],
+        ] {
+            assert_eq!(plan_tenant(argv), declare, "{argv:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod plan_registry_input_tests {
+    use super::{PlanCommand, run_plan_cmd, toy_plan};
+
+    struct RegistryDbEnv(Option<std::ffi::OsString>);
+    impl RegistryDbEnv {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("BLUT_REGISTRY_DB");
+            // SAFETY: the caller holds TEST_ENV_LOCK for this guard's lifetime.
+            unsafe { std::env::set_var("BLUT_REGISTRY_DB", path) };
+            Self(previous)
+        }
+    }
+    impl Drop for RegistryDbEnv {
+        fn drop(&mut self) {
+            // SAFETY: TEST_ENV_LOCK is still held by the caller.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("BLUT_REGISTRY_DB", value),
+                    None => std::env::remove_var("BLUT_REGISTRY_DB"),
+                }
+            }
+        }
+    }
+
+    fn write_spec(dir: &std::path::Path, n: u32) -> std::path::PathBuf {
+        let path = dir.join(format!("spec-{n}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&toy_plan::spec_with("toy", n)).unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    /// `plan publish --tenant` stored any string; a deployment published
+    /// under `a b` could never be resolved by a run. It is validated like
+    /// every other tenant input, and stored in canonical form.
+    // The env lock spans the awaited command: it reads BLUT_REGISTRY_DB.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn plan_publish_refuses_an_invalid_tenant() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("registry.db");
+        let _env = RegistryDbEnv::set(&db);
+        let reg = toy_plan::registry();
+        let spec = write_spec(td.path(), 1);
+        for bad in ["a b", "../x", "a/b/c", "x/", ".hidden"] {
+            let err = run_plan_cmd(
+                &reg,
+                PlanCommand::Publish {
+                    spec: spec.clone(),
+                    tenant: bad.into(),
+                },
+            )
+            .await
+            .expect_err(bad);
+            assert!(
+                err.to_string().contains("invalid --tenant"),
+                "{bad:?}: {err}"
+            );
+        }
+        let conn = crate::registry_db::open_at(&db).unwrap();
+        let fp = crate::registry_db::fingerprint(&toy_plan::spec_with("toy", 1));
+        assert_eq!(
+            crate::registry_db::get_deployment(&conn, &fp).unwrap(),
+            None
+        );
+        run_plan_cmd(
+            &reg,
+            PlanCommand::Publish {
+                spec,
+                tenant: " lab/vision ".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let stored = crate::registry_db::get_deployment(&conn, &fp)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.tenant, "lab/vision");
+    }
+
+    /// `plan promote` needed the full fingerprint while other commands take
+    /// prefixes. A unique prefix resolves; an ambiguous one is refused.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn plan_promote_takes_an_unambiguous_fingerprint_prefix() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("registry.db");
+        let _env = RegistryDbEnv::set(&db);
+        let reg = toy_plan::registry();
+        // 17 distinct deployments: at least two share a first hex digit.
+        let mut fps = Vec::new();
+        for n in 0..17 {
+            run_plan_cmd(
+                &reg,
+                PlanCommand::Publish {
+                    spec: write_spec(td.path(), n),
+                    tenant: "default".into(),
+                },
+            )
+            .await
+            .unwrap();
+            fps.push(crate::registry_db::fingerprint(&toy_plan::spec_with(
+                "toy", n,
+            )));
+        }
+        let shortest_unique = |fp: &str| {
+            (1..=fp.len())
+                .map(|len| &fp[..len])
+                .find(|prefix| fps.iter().filter(|o| o.starts_with(prefix)).count() == 1)
+                .unwrap()
+                .to_string()
+        };
+        let promote = |fingerprint: String| {
+            run_plan_cmd(
+                &reg,
+                PlanCommand::Promote {
+                    fingerprint,
+                    pointer: "registry://plan@prod".into(),
+                    tenant: "default".into(),
+                },
+            )
+        };
+        let pointer = || {
+            let conn = crate::registry_db::open_at(&db).unwrap();
+            crate::registry_db::resolve_pointer(&conn, "default", "prod")
+                .unwrap()
+                .expect("pointer")
+        };
+
+        let target = fps[3].clone();
+        promote(shortest_unique(&target)).await.unwrap();
+        assert_eq!(pointer(), target);
+        promote(shortest_unique(&fps[5]).to_ascii_uppercase())
+            .await
+            .unwrap();
+        assert_eq!(pointer(), fps[5]);
+        promote(fps[7].clone()).await.unwrap();
+        assert_eq!(pointer(), fps[7]);
+
+        let shared = fps
+            .iter()
+            .find_map(|fp| {
+                let first = &fp[..1];
+                (fps.iter().filter(|o| o.starts_with(first)).count() > 1).then(|| first.to_string())
+            })
+            .expect("pigeonhole: 17 fingerprints over 16 hex digits");
+        let err = promote(shared).await.expect_err("an ambiguous prefix");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        for bad in ["", "zz", "%", "ab_"] {
+            assert!(promote(bad.into()).await.is_err(), "{bad:?}");
+        }
+        assert_eq!(pointer(), fps[7], "a refused promote moves nothing");
+    }
+}
+
+#[cfg(test)]
+mod cache_prune_cap_tests {
+    use super::resolve_prune_cap_gb;
+
+    /// `--max-gb=-1` and `--max-gb NaN` cast to a 0-byte cap and emptied the
+    /// whole shared cache.
+    #[test]
+    fn a_negative_or_non_finite_cap_is_refused() {
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let err = resolve_prune_cap_gb(Some(bad), None).expect_err("must refuse");
+            assert!(err.to_string().contains("--max-gb"), "{err}");
+        }
+        assert_eq!(resolve_prune_cap_gb(Some(0.0), None).unwrap(), 0.0);
+        assert_eq!(resolve_prune_cap_gb(Some(12.5), None).unwrap(), 12.5);
+    }
+
+    /// A garbage `$LAMU_CACHE_MAX_GB` quietly meant 50 GiB; the flag still
+    /// wins over the variable, and no setting at all is the 50 GiB default.
+    #[test]
+    fn the_env_cap_is_validated_and_the_flag_wins() {
+        let err = resolve_prune_cap_gb(None, Some("fifty".into())).expect_err("must refuse");
+        assert!(err.to_string().contains("LAMU_CACHE_MAX_GB"), "{err}");
+        assert!(resolve_prune_cap_gb(None, Some("-3".into())).is_err());
+        assert_eq!(resolve_prune_cap_gb(None, Some(" 7 ".into())).unwrap(), 7.0);
+        assert_eq!(
+            resolve_prune_cap_gb(Some(1.0), Some("fifty".into())).unwrap(),
+            1.0
+        );
+        assert_eq!(resolve_prune_cap_gb(None, None).unwrap(), 50.0);
     }
 }
 
@@ -1548,6 +2095,7 @@ mod registry_completion_cli_tests {
                     pinned_at: 1,
                 }],
             },
+            launcher: Some("slurm".into()),
         };
         let encoded = serde_json::to_value(&marker).unwrap();
         assert_eq!(encoded["source_args"]["data"], "dataset://train@v1");
@@ -1558,6 +2106,8 @@ mod registry_completion_cli_tests {
         );
         let round_tripped: RecipeMarker = serde_json::from_value(encoded).unwrap();
         assert_eq!(round_tripped.resolved_handles, marker.resolved_handles);
+        // Resume must place stages where the run did.
+        assert_eq!(round_tripped.launcher.as_deref(), Some("slurm"));
         assert!(ensure_resume_registry_snapshot(&marker, &marker.args).is_ok());
         assert!(
             ensure_resume_registry_snapshot(
@@ -1578,6 +2128,10 @@ mod registry_completion_cli_tests {
             legacy.resolved_handles.is_empty(),
             "a marker written before resolved_handles existed must still load"
         );
+        assert!(
+            legacy.launcher.is_none(),
+            "a marker written before the launcher was recorded resumes locally"
+        );
 
         // A URI-free run serialises no empty scaffolding.
         let plain = RecipeMarker {
@@ -1585,9 +2139,11 @@ mod registry_completion_cli_tests {
             args: serde_json::json!({"epochs": 3}),
             source_args: Some(serde_json::json!({"epochs": 3})),
             resolved_handles: crate::registry_args::ResolvedHandles::default(),
+            launcher: None,
         };
         let encoded_plain = serde_json::to_value(&plain).unwrap();
         assert!(encoded_plain.get("resolved_handles").is_none());
+        assert!(encoded_plain.get("launcher").is_none());
     }
 }
 
@@ -1702,6 +2258,10 @@ struct RecipeMarker {
         skip_serializing_if = "crate::registry_args::ResolvedHandles::is_empty"
     )]
     resolved_handles: crate::registry_args::ResolvedHandles,
+    /// The `--launcher` the run used, so `plan resume` places stages where the
+    /// run did. Markers written before this field existed resume locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launcher: Option<String>,
 }
 
 impl RecipeMarker {
@@ -1714,6 +2274,20 @@ impl RecipeMarker {
     }
     fn read_from(job_dir: &std::path::Path) -> Result<Self> {
         let path = job_dir.join("recipe.json");
+        // A plan launched from a file (`recipe declare --run`, `plan run`)
+        // writes no marker on purpose: there is no registry recipe to
+        // re-compile. The bare ENOENT this produced did not say that.
+        if !path.exists() {
+            return Err(anyhow!(
+                "job {} cannot be resumed: it was launched from a plan file \
+                 (`recipe declare --run` or `plan run`), not a registry recipe, so \
+                 there is nothing to re-compile. Launch the file again.",
+                job_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ));
+        }
         let body = std::fs::read(&path)
             .with_context(|| format!("read recipe marker {}", path.display()))?;
         serde_json::from_slice(&body).context("parse recipe marker")
@@ -1732,22 +2306,76 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             let job_id = crate::jobs::resolve_job_id(&id).with_context(|| {
                 format!("resolve job id '{id}' (ambiguous prefix or missing job)")
             })?;
+            // Resuming a job that is still executing would run a second
+            // executor in the same job dir, and the old code then marked the
+            // live job `failed` when the scheduler lock refused. A Slurm job
+            // or a systemd unit its stage started survives the BLUT process
+            // that started it; resuming next to it would put two trainers on
+            // one job's work.
+            if let Some(why) = crate::jobs::resume_blocker(&job_id) {
+                return Err(anyhow!(why));
+            }
             let job_dir =
                 paths::job_dir(&job_id).with_context(|| format!("resolve job dir for {job_id}"))?;
             let marker = RecipeMarker::read_from(&job_dir)?;
             let tenant = crate::jobs::read_tenant(&job_id)
                 .with_context(|| format!("read tenant for {job_id}"))?;
             let source_args = marker.source_args.as_ref().unwrap_or(&marker.args).clone();
-            let args = crate::registry_args::resolve_recipe_args(
-                source_args,
-                &tenant,
-                crate::config::launcher::LaunchTarget::Local,
-            )
-            .map_err(|e| anyhow!("registry arg revalidation: {e}"))?;
+            // Resume where the run ran: a multi-node Slurm job resumed locally
+            // would fail at the first distributed stage, after re-running
+            // nothing useful.
+            let launch_target: crate::config::launcher::LaunchTarget = marker
+                .launcher
+                .as_deref()
+                .unwrap_or("local")
+                .parse()
+                .map_err(|e| anyhow!("job {job_id} records an unknown launcher: {e}"))?;
+            crate::config::launcher::check_launcher_env(launch_target)
+                .map_err(|e| anyhow!("--launcher {}: {e}", launch_target.as_str()))?;
+            if launch_target == crate::config::launcher::LaunchTarget::K8s {
+                return Err(anyhow!(crate::config::k8s_cluster::refuse_surface(
+                    "`plan resume` of a k8s job"
+                )));
+            }
+            if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+                // A cloud job resumes on the cloud queue: its finished stages
+                // are cache hits, the rest are submitted again. Not while a
+                // stage it submitted is still queued or running.
+                crate::config::launcher::check_cloud_launch(&format!("`plan resume` of {job_id}"))
+                    .map_err(|e| anyhow!("{e}"))?;
+                #[cfg(feature = "cloud")]
+                if let Some(why) = crate::cloud::records::resume_blocker(&job_id, &job_dir).await {
+                    return Err(anyhow!(why));
+                }
+            } else {
+                // A job recorded with p2p ran here before that was refused;
+                // resuming it "as it was run" would repeat the claim.
+                crate::config::launcher::check_launcher_placeable(
+                    launch_target,
+                    &format!(
+                        "`plan resume` of {job_id}, which recorded it but ran on this machine \
+                         (start it again with `recipe run {}`)",
+                        marker.name
+                    ),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+            if launch_target != crate::config::launcher::LaunchTarget::Local {
+                eprintln!(
+                    "resuming {job_id} with --launcher {} (as it was run)",
+                    launch_target.as_str()
+                );
+            }
+            let args =
+                crate::registry_args::resolve_recipe_args(source_args, &tenant, launch_target)
+                    .map_err(|e| anyhow!("registry arg revalidation: {e}"))?;
             ensure_resume_registry_snapshot(&marker, &args)?;
-            let r = reg
-                .find(&marker.name)
-                .ok_or_else(|| anyhow!("recipe '{}' not in catalog", marker.name))?;
+            let r = reg.find(&marker.name).ok_or_else(|| {
+                anyhow!(
+                    "recipe '{}' not in catalog (see `blut recipe list`)",
+                    marker.name
+                )
+            })?;
             let plan = (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile: {e}"))?;
             let tenant_admission =
                 crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
@@ -1767,7 +2395,10 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             )?;
 
             let mut ctx = ExecCtx::new(job_dir.clone());
-            ctx = ctx.with_tenant(tenant.clone()).with_sync_io(sync_io);
+            ctx = ctx
+                .with_tenant(tenant.clone())
+                .with_sync_io(sync_io)
+                .with_launch_target(launch_target);
             if let Some(budget) = tenant_admission
                 .executor_budget_gib(crate::broker::admission::DEFAULT_FLOOR_GIB)
                 .map_err(|e| anyhow!("tenant admission: {e}"))?
@@ -1789,9 +2420,25 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 admitted_batch_size,
                 footprint,
                 snapshot,
-                crate::config::launcher::LaunchTarget::Local,
+                launch_target,
             )?;
             footprint = prepared_footprint;
+            #[cfg(feature = "cloud")]
+            let cloud = if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+                let (with_cloud, cloud) = cloud::install_cloud_launch(
+                    reg,
+                    ctx,
+                    &job_dir,
+                    &tenant,
+                    &format!("`plan resume` of {job_id}"),
+                )?;
+                ctx = with_cloud;
+                cloud.check_same_queue(&job_id, &job_dir)?;
+                cloud.probe().await?;
+                Some(cloud)
+            } else {
+                None
+            };
             if shared_cache {
                 match CacheHandle::default_global_path() {
                     Some(global) => {
@@ -1811,44 +2458,68 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 }
             }
 
-            crate::jobs::write_state(&job_id, JobState::Running)
-                .with_context(|| format!("write Running state for {job_id}"))?;
-
-            let _tenant_reservation = match tenant_admission
-                .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
-            {
-                Ok(reservation) => reservation,
-                Err(reason) => {
-                    let _ = crate::jobs::write_state(&job_id, JobState::Failed);
-                    return Err(anyhow!(
-                        "resume '{}' admission refused: {reason}",
-                        marker.name
-                    ));
-                }
+            // Admission and the scheduler lock come BEFORE the job is marked
+            // running: a resume refused here never started, so the job keeps
+            // the state it had (a refused resume of a `done` job used to
+            // rewrite it as `failed`).
+            // A cloud job takes neither: its stages run on the workers.
+            #[cfg(feature = "cloud")]
+            let runs_here = cloud.is_none();
+            #[cfg(not(feature = "cloud"))]
+            let runs_here = true;
+            let _tenant_reservation = if runs_here {
+                Some(
+                    tenant_admission
+                        .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
+                        .map_err(|reason| {
+                            anyhow!("resume '{}' admission refused: {reason}", marker.name)
+                        })?,
+                )
+            } else {
+                None
             };
 
             // GPU lock — same arbitration as initial runs. Without
             // this, two resumes (or a resume + a fresh recipe run)
             // on the same machine could both touch the GPU.
-            let lock = match scheduler_lock::acquire_exclusive(
-                format!("blut-resume:{job_id}"),
-                LockKind::Training,
-            ) {
-                Ok(l) => l,
-                Err(e) => {
-                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                        tracing::warn!("write Failed state for {job_id}: {se}");
-                    }
-                    return Err(anyhow!("acquire_exclusive: {e}"));
-                }
+            let lock = if runs_here {
+                Some(
+                    scheduler_lock::acquire_exclusive(
+                        format!("blut-resume:{job_id}"),
+                        LockKind::Training,
+                    )
+                    .map_err(|e| anyhow!("acquire_exclusive: {e}"))?,
+                )
+            } else {
+                None
             };
+
+            crate::jobs::write_state(&job_id, JobState::Running)
+                .with_context(|| format!("write Running state for {job_id}"))?;
+            let _driver = crate::jobs::record_driver(&job_id);
+            #[cfg(feature = "cloud")]
+            if let Some(cloud) = &cloud {
+                cloud.record(&job_dir)?;
+            }
+            // The same signal discipline as `recipe run`: Ctrl-C / SIGTERM
+            // cancels the executor and kills the trainer groups, instead of
+            // the default action killing blut and orphaning a setsid trainer.
+            crate::python_kill::bind_current_job(job_id.clone());
+            install_cancel_handler(ctx.cancel.clone());
 
             eprintln!("resuming {} ({})", marker.name, job_id);
             eprintln!("dir      {}", job_dir.display());
-            eprintln!("lock     {}", lock.path().display());
+            if let Some(lock) = &lock {
+                eprintln!("lock     {}", lock.path().display());
+            }
             persist_plan_graph(&plan, &job_dir);
             let result = crate::framework::execute_plan(plan, ctx).await;
+            #[cfg(feature = "cloud")]
+            if let Some(cloud) = &cloud {
+                cloud.sweep(&job_dir).await;
+            }
             drop(lock);
+            crate::python_kill::unbind_current_job();
             match result {
                 Ok(r) => {
                     crate::jobs::write_state(&job_id, JobState::Done)
@@ -1863,11 +2534,11 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                     Ok(())
                 }
                 Err(e) => {
-                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                        tracing::warn!("write Failed state for {job_id}: {se}");
+                    let (state, outcome) = recipe::terminal_for_error(&e);
+                    if let Err(se) = crate::jobs::write_state(&job_id, state) {
+                        tracing::warn!("write {outcome} state for {job_id}: {se}");
                     }
-                    if let Err(ie) = crate::lineage_db::ingest_job(&job_id, &marker.name, "failed")
-                    {
+                    if let Err(ie) = crate::lineage_db::ingest_job(&job_id, &marker.name, outcome) {
                         tracing::warn!("lineage index {job_id}: {ie}");
                     }
                     // `.context()` (not `anyhow!("...: {e}")`) — preserves `e` as the
@@ -1879,9 +2550,9 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             }
         }
         PlanCommand::Inspect { name, args } => {
-            let r = reg
-                .find(&name)
-                .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            let r = reg.find(&name).ok_or_else(|| {
+                anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)")
+            })?;
             let raw: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
             let plan = (r.compile_fn)(raw).map_err(|e| anyhow!("recipe compile: {e}"))?;
@@ -1983,6 +2654,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 return Ok(());
             }
             let job_id = recipe::launch_compiled_plan(
+                reg,
                 &accepted.spec.name,
                 // The plan the typecheck produced — not a second compilation of
                 // the same spec. What was checked is what runs.
@@ -2008,6 +2680,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             Ok(())
         }
         PlanCommand::Publish { spec, tenant } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let text = std::fs::read_to_string(&spec)
                 .with_context(|| format!("read PlanSpec {}", spec.display()))?;
             let plan_spec: crate::framework::plan_spec::PlanSpec =
@@ -2031,15 +2704,21 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             pointer,
             tenant,
         } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let name = crate::registry_db::parse_pointer_uri(&pointer)
                 .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
             let mut conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
+            // A prefix, as `plan check`/`publish` print and other commands
+            // accept; it used to need the full 64-character fingerprint.
+            let fingerprint = crate::registry_db::resolve_fingerprint(&conn, &fingerprint)
+                .map_err(|e| anyhow!("{e}"))?;
             crate::registry_db::promote(&mut conn, &fingerprint, &tenant, name, now_unix())
                 .map_err(|e| anyhow!("{e}"))?;
             println!("promoted {fingerprint} → registry://plan@{name}");
             Ok(())
         }
         PlanCommand::Rollback { pointer, tenant } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let name = crate::registry_db::parse_pointer_uri(&pointer)
                 .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
             let mut conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
@@ -2049,16 +2728,17 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             Ok(())
         }
         PlanCommand::History { pointer, tenant } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let name = crate::registry_db::parse_pointer_uri(&pointer)
                 .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
             let conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
-            let hist =
-                crate::registry_db::history(&conn, &tenant, name).map_err(|e| anyhow!("{e}"))?;
+            let hist = crate::registry_db::history_moves(&conn, &tenant, name)
+                .map_err(|e| anyhow!("{e}"))?;
             if hist.is_empty() {
-                println!("no history for registry://plan@{name}");
+                println!("no history for registry://plan@{name} (tenant {tenant})");
             }
-            for h in &hist {
-                println!("{}  {}", h.moved_at, h.plan_fingerprint);
+            for (h, kind) in &hist {
+                println!("{}  {}  {}", h.moved_at, h.plan_fingerprint, kind.as_str());
             }
             Ok(())
         }
@@ -2109,6 +2789,13 @@ async fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
             gate_timeout,
         } => {
             let (name, alias) = parse(&pointer)?;
+            // Check the candidate BEFORE running any gate: a governance gate can
+            // take minutes (or record an approval), and it used to run in full
+            // for a hash that was never registered, then be refused anyway.
+            {
+                let conn = mr::open().map_err(|e| anyhow!("{e}"))?;
+                promote_precheck(&conn, &hash, &tenant, &name)?;
+            }
             // Governed-alias set: `$BLUT_MODEL_GOVERNED_ALIASES` can only add
             // aliases. The built-in `prod` boundary is never removable.
             let gov_env = std::env::var("BLUT_MODEL_GOVERNED_ALIASES").ok();
@@ -2118,6 +2805,7 @@ async fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
             // governed alias with no gate/change-id yields NotConfigured → refuse.
             let verdict = if mr::is_governed(&alias, &governed) {
                 let gate_spec = gate_cmd.or_else(|| std::env::var("BLUT_MODEL_GATE_CMD").ok());
+                governed_gate_preflight(&alias, gate_spec.as_deref(), change_id.as_deref())?;
                 match (
                     gate_spec.as_deref().and_then(mr::GateCmd::parse),
                     &change_id,
@@ -2173,16 +2861,42 @@ async fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
         ModelCommand::History { pointer, tenant } => {
             let (name, alias) = parse(&pointer)?;
             let conn = mr::open().map_err(|e| anyhow!("{e}"))?;
-            let hist = mr::history(&conn, &tenant, &name, &alias).map_err(|e| anyhow!("{e}"))?;
+            let hist =
+                mr::history_moves(&conn, &tenant, &name, &alias).map_err(|e| anyhow!("{e}"))?;
             if hist.is_empty() {
-                println!("no history for model://{name}@{alias}");
+                println!("no history for model://{name}@{alias} (tenant {tenant})");
             }
-            for h in &hist {
-                println!("{}  {}", h.moved_at, h.model_hash);
+            for line in model_history_lines(&hist) {
+                println!("{line}");
             }
             Ok(())
         }
     }
+}
+
+/// `model history` rows: UTC time, hash, the move's kind (`promote` or
+/// `rollback`, as `plan history` prints it) and a `(current)` mark on the last
+/// row. Every promote AND every rollback appends a row, so the last row is
+/// always where the alias points now.
+fn model_history_lines(
+    hist: &[(
+        crate::model_registry::HistoryEntry,
+        crate::registry_db::MoveKind,
+    )],
+) -> Vec<String> {
+    let last = hist.len().saturating_sub(1);
+    hist.iter()
+        .enumerate()
+        .map(|(i, (h, kind))| {
+            let current = if i == last { "  (current)" } else { "" };
+            format!(
+                "{}  {}  {}{current}",
+                utc_timestamp(h.moved_at),
+                h.model_hash,
+                kind.as_str()
+            )
+        })
+        .collect()
 }
 
 fn run_dataset_cmd(cmd: DatasetCommand) -> Result<()> {
@@ -2240,15 +2954,34 @@ fn run_experiment_cmd(cmd: ExperimentCommand) -> Result<()> {
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
             let comparison = crate::experiment_registry::compare_latest(&db, &name, &tenant)
                 .map_err(|e| anyhow!("{e}"))?;
+            // An HPO search is compared through its best completed trial: say
+            // which, since the metrics are that trial's and not the job's.
+            let headline =
+                |run: &str| crate::hpo::results::job_headline_trial(run).map(|(trial, _)| trial);
+            let (trial_a, trial_b) = (headline(&comparison.run_a), headline(&comparison.run_b));
             if json {
-                emit_json(&comparison)?;
+                let mut value = serde_json::to_value(&comparison)?;
+                if let Some(obj) = value.as_object_mut()
+                    && (trial_a.is_some() || trial_b.is_some())
+                {
+                    obj.insert(
+                        "hpo_headline_trials".into(),
+                        serde_json::json!({ "run_a": trial_a, "run_b": trial_b }),
+                    );
+                }
+                emit_json(&value)?;
             } else {
+                let note = |trial: Option<u32>| {
+                    trial
+                        .map(|t| format!("  (HPO: metrics of best completed trial {t})"))
+                        .unwrap_or_default()
+                };
                 println!(
                     "experiment://{}  tenant={}",
                     comparison.experiment, comparison.tenant
                 );
-                println!("baseline  : {}", comparison.run_a);
-                println!("candidate : {}", comparison.run_b);
+                println!("baseline  : {}{}", comparison.run_a, note(trial_a));
+                println!("candidate : {}{}", comparison.run_b, note(trial_b));
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&comparison.diff)
@@ -2272,9 +3005,82 @@ fn run_experiment_cmd(cmd: ExperimentCommand) -> Result<()> {
     }
 }
 
+/// A Unix time as `YYYY-MM-DDTHH:MM:SSZ`, or the raw number when it is out of
+/// range (a hand-edited row must still print).
+fn utc_timestamp(unix: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0)
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| unix.to_string())
+}
+
 /// The acting user recorded as a deployment's publisher.
+/// A plan registry `--tenant`, parsed as every other tenant input is and
+/// returned in canonical form (the form `recipe declare` resolves pointers
+/// under). `plan publish --tenant` stored any string, so a deployment could be
+/// published under a tenant no run can ever resolve, such as `a b`.
+fn parse_plan_tenant(raw: &str) -> Result<String> {
+    crate::tenant::Tenant::parse(raw)
+        .map(|tenant| tenant.to_string())
+        .ok_or_else(|| anyhow!("invalid --tenant '{raw}'"))
+}
+
 fn acting_user() -> String {
     std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Refuse a promotion whose candidate cannot succeed, before any gate runs:
+/// an unregistered hash, or one registered under another tenant or model name.
+fn promote_precheck(
+    conn: &rusqlite::Connection,
+    hash: &str,
+    tenant: &str,
+    name: &str,
+) -> Result<()> {
+    let model = crate::model_registry::get_model(conn, hash)
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow!("promote refused — no model {hash} (register it first: `blut model register`)")
+        })?;
+    if model.tenant != tenant {
+        return Err(anyhow!(
+            "promote refused — cross-tenant boundary: model tenant '{}' != pointer tenant '{tenant}'",
+            model.tenant
+        ));
+    }
+    if model.name != name {
+        return Err(anyhow!(
+            "promote refused — checkpoint {hash} is model '{}', not '{name}'",
+            model.name
+        ));
+    }
+    Ok(())
+}
+
+/// Name exactly what a governed promotion is missing. Both "gate given, no
+/// --change-id" and "--change-id given, no gate" used to report "none
+/// configured", which reads as if the gate flag had been ignored. A gate
+/// string with quotes is refused: it is split on whitespace with no shell, so
+/// quotes would reach the gate as literal characters.
+fn governed_gate_preflight(alias: &str, gate: Option<&str>, change_id: Option<&str>) -> Result<()> {
+    let gate = gate.map(str::trim).filter(|g| !g.is_empty());
+    match (gate, change_id) {
+        (None, None) => Err(anyhow!(
+            "promote refused — alias '{alias}' is governed (ADR 0090): it needs a governance \
+             gate (--gate-cmd or $BLUT_MODEL_GATE_CMD) and a --change-id"
+        )),
+        (None, Some(_)) => Err(anyhow!(
+            "promote refused — alias '{alias}' is governed: --change-id is set but no gate is \
+             (pass --gate-cmd or set $BLUT_MODEL_GATE_CMD)"
+        )),
+        (Some(_), None) => Err(anyhow!(
+            "promote refused — alias '{alias}' is governed: a gate is set but --change-id is missing"
+        )),
+        (Some(g), Some(_)) if g.contains(['"', '\'']) => Err(anyhow!(
+            "promote refused — the gate command is split on whitespace and run without a shell, \
+             so quotes would reach it literally: {g}. Put the command in a script and pass its path."
+        )),
+        (Some(_), Some(_)) => Ok(()),
+    }
 }
 
 /// UNIX seconds now (CLI-side; the registry fns take the timestamp explicitly so
@@ -2363,11 +3169,19 @@ fn run_sensor_cmd(cmd: SensorCommand) -> Result<()> {
 fn run_sla_cmd(cmd: SlaCommand) -> Result<()> {
     match cmd {
         SlaCommand::Check { rules, out, json } => {
-            let rules_path = rules.unwrap_or_else(|| {
-                std::env::var_os("BLUT_SLA_RULES")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| dot_blut().join("sla.toml"))
-            });
+            let from_env = std::env::var_os("BLUT_SLA_RULES").map(std::path::PathBuf::from);
+            let explicit = rules.is_some() || from_env.is_some();
+            let rules_path = rules
+                .or(from_env)
+                .unwrap_or_else(|| dot_blut().join("sla.toml"));
+            // A rule file you named that is not there is a typo, not "no
+            // rules": it used to report 0 breaches and exit 0.
+            if explicit && !rules_path.is_file() {
+                return Err(anyhow!(
+                    "SLA rule file {} does not exist (from --rules or $BLUT_SLA_RULES)",
+                    rules_path.display()
+                ));
+            }
             let out_path = out.unwrap_or_else(crate::sla::default_sla_path);
             let report = crate::sla::check_paths(&rules_path, &out_path)
                 .with_context(|| format!("check SLA rules {}", rules_path.display()))?;
@@ -2393,10 +3207,7 @@ fn run_sla_cmd(cmd: SlaCommand) -> Result<()> {
 
 /// `~/.blut` — the operator state root shared by triggers/sla/secrets configs.
 fn dot_blut() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join(".blut")
+    crate::paths::blut_home()
 }
 
 fn run_footprint_cmd(cmd: FootprintCommand) -> Result<()> {
@@ -2478,27 +3289,40 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
                 return Ok(());
             }
             let size = dir_size_bytes(&global)?;
-            println!("size: {:.2} GiB", size as f64 / 1024.0 / 1024.0 / 1024.0);
+            println!("size: {}", human_bytes(size));
             Ok(())
         }
-        CacheCommand::Prune { max_gb } => {
+        CacheCommand::Prune {
+            max_gb,
+            checkpoint_max_age_hours,
+        } => {
             // Resolution order: --max-gb flag → $LAMU_CACHE_MAX_GB →
             // 50 GiB default. The default matches the plan's spec.
-            let cap_gb = max_gb
-                .or_else(|| {
-                    std::env::var("LAMU_CACHE_MAX_GB")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                })
-                .unwrap_or(50.0);
+            let cap_gb = resolve_prune_cap_gb(max_gb, std::env::var_os("LAMU_CACHE_MAX_GB"))?;
             let cap_bytes = (cap_gb * 1024.0 * 1024.0 * 1024.0) as u64;
             let freed = crate::framework::cache::lru_prune(&global, cap_bytes)
                 .with_context(|| format!("lru_prune {}", global.display()))?;
             println!(
-                "pruned {:.2} GiB from {} (cap {:.2} GiB)",
-                freed as f64 / 1024.0 / 1024.0 / 1024.0,
+                "pruned {} from {} (cap {cap_gb:.2} GiB)",
+                human_bytes(freed),
                 global.display(),
-                cap_gb
+            );
+            let root =
+                crate::framework::stage_checkpoint::checkpoints_root_for_jobs(&paths::jobs_dir()?);
+            let slots = crate::framework::stage_checkpoint::collect_slots(
+                &root,
+                std::time::Duration::from_secs(checkpoint_max_age_hours.saturating_mul(3600)),
+            )
+            .with_context(|| format!("collect checkpoint slots under {}", root.display()))?;
+            println!(
+                "checkpoint slots: removed {} ({}) from {}; kept {} in use, {} with a live \
+                 trainer, {} used in the last {checkpoint_max_age_hours} h",
+                slots.removed.len(),
+                human_bytes(slots.bytes_freed),
+                root.display(),
+                slots.kept_locked.len(),
+                slots.kept_live.len(),
+                slots.kept_recent.len(),
             );
             Ok(())
         }
@@ -2573,19 +3397,28 @@ fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
                 return Err(anyhow!("hash prefix too short — give at least 4 hex chars"));
             }
             let recs = lineage::find_by_hash_prefix(&hash).map_err(|e| anyhow!("{e}"))?;
-            match recs.as_slice() {
-                [] => Err(anyhow!("no artifact with content hash prefix '{hash}'")),
-                [r] => {
+            match inspect_target(&recs) {
+                InspectTarget::None => {
+                    Err(anyhow!("no artifact with content hash prefix '{hash}'"))
+                }
+                InspectTarget::One { record: r, also_in } => {
                     if json {
                         emit_json(&r)?;
                         return Ok(());
                     }
                     println!("sidecar: {}", r.sidecar_path.display());
                     println!("job:     {}", r.job_id);
+                    if !also_in.is_empty() {
+                        println!(
+                            "also in: {} other job(s) (the same content, e.g. a cache hit): {}",
+                            also_in.len(),
+                            also_in.join(", ")
+                        );
+                    }
                     emit_json(&r.meta)?;
                     Ok(())
                 }
-                many => {
+                InspectTarget::Ambiguous(many) => {
                     eprintln!("ambiguous prefix '{hash}' — {} matches:", many.len());
                     for r in many {
                         let hash = r
@@ -2604,6 +3437,47 @@ fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// What `artifact inspect <prefix>` resolved to.
+enum InspectTarget<'a> {
+    None,
+    /// One artifact. A content-addressed artifact reused by a cache hit has a
+    /// sidecar in every job that used it; `also_in` names the other jobs.
+    One {
+        record: &'a crate::framework::lineage::ArtifactRecord,
+        also_in: Vec<&'a str>,
+    },
+    /// The prefix matches more than one distinct content hash.
+    Ambiguous(&'a [crate::framework::lineage::ArtifactRecord]),
+}
+
+/// Resolve `artifact inspect` matches. Matches that all carry the SAME hash
+/// are one artifact, not an ambiguity: it used to demand "a longer prefix"
+/// even for the full 64-hex hash of any artifact a later run had reused.
+/// Shows the newest job's sidecar.
+fn inspect_target(recs: &[crate::framework::lineage::ArtifactRecord]) -> InspectTarget<'_> {
+    let hash_of = |r: &crate::framework::lineage::ArtifactRecord| r.meta.display_hash();
+    match recs {
+        [] => InspectTarget::None,
+        [first, rest @ ..] if rest.iter().all(|r| hash_of(r) == hash_of(first)) => {
+            let newest = recs
+                .iter()
+                .max_by(|a, b| a.job_id.cmp(&b.job_id))
+                .unwrap_or(first);
+            let mut also_in: Vec<&str> = recs
+                .iter()
+                .filter(|r| r.job_id != newest.job_id)
+                .map(|r| r.job_id.as_str())
+                .collect();
+            also_in.sort_unstable();
+            InspectTarget::One {
+                record: newest,
+                also_in,
+            }
+        }
+        many => InspectTarget::Ambiguous(many),
     }
 }
 
@@ -2626,12 +3500,17 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
             recipe,
             calendar,
             args,
+            tenant,
+            shared_cache,
+            no_cache,
+            sync_io,
+            experiment,
         } => {
             // Validate the recipe exists + the args parse before touching
             // systemd, so a typo doesn't leave a broken unit behind.
-            let def = reg
-                .find(&recipe)
-                .ok_or_else(|| anyhow!("recipe '{recipe}' not in catalog"))?;
+            let def = reg.find(&recipe).ok_or_else(|| {
+                anyhow!("recipe '{recipe}' not in catalog (see `blut recipe list`)")
+            })?;
             // `--calendar` wins; otherwise fall back to the recipe's built-in
             // SCHEDULE (E1↔E5). Neither present → hard error (no silent default).
             let calendar = calendar
@@ -2641,10 +3520,36 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
                         "recipe '{recipe}' has no built-in SCHEDULE; pass --calendar <OnCalendar>"
                     )
                 })?;
-            let _: serde_json::Value = serde_json::from_str(&args)
+            let parsed: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
-            schedule::install(&recipe, &calendar, &args).map_err(|e| anyhow!("{e}"))?;
+            // Compile now, as `recipe run` will when the timer fires: args
+            // that only parsed as JSON used to install a timer that failed
+            // every time it ran, visible only in the journal.
+            (def.compile_fn)(parsed)
+                .map_err(|e| anyhow!("recipe '{recipe}' rejects these --args: {e}"))?;
+            // The same up-front tenant checks as `recipe run`: a tenant the
+            // quota policy does not know would refuse every firing.
+            let tenant = crate::tenant::Tenant::parse(&tenant)
+                .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+            crate::config::tenants::TenantQuotaPolicy::load()?
+                .fraction_for(&tenant)
+                .map_err(|e| anyhow!("{e}"))?;
+            let options = schedule::ScheduleOptions {
+                tenant: Some(tenant.to_string()),
+                shared_cache,
+                no_cache,
+                sync_io,
+                experiment,
+            };
+            let carried = schedule::install_with(&recipe, &calendar, &args, &options)
+                .map_err(|e| anyhow!("{e}"))?;
             eprintln!("installed timer blut-{recipe}.timer (OnCalendar={calendar})");
+            eprintln!("runs as: recipe run {recipe} --tenant {tenant} (and the flags given)");
+            if carried.is_empty() {
+                eprintln!("environment: none of the carried variables is set here");
+            } else {
+                eprintln!("environment: {}", carried.join(", "));
+            }
             eprintln!("inspect: systemctl --user list-timers | grep {recipe}");
             Ok(())
         }
@@ -2693,9 +3598,121 @@ fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
 /// Persist the plan STRUCTURE for the DAG backend (`blut dag`). Best-effort: a
 /// snapshot write must NEVER fail or delay the actual run, so errors only warn.
 /// Call with `&plan` BEFORE `execute_plan` moves it.
+/// A one-stage cookbook for CLI tests that launch, publish or promote a real
+/// (tiny) plan: one in-process stage producing an inline artifact.
+#[cfg(test)]
+mod toy_plan {
+    use crate::backends::LamuTrainerBackend;
+    use crate::framework::Compatible;
+    use crate::framework::artifact::{Artifact, ContentHash};
+    use crate::framework::cookbook::Cookbook;
+    use crate::framework::error::StageError;
+    use crate::framework::resource::Resource;
+    use crate::framework::stage::{ErasedStageCtor, Stage, StageContext};
+    use crate::recipes::recipe::RecipeDef;
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct Unit;
+    impl Artifact for Unit {
+        const KIND: &'static str = "cli_toy.unit";
+        const SCHEMA: u32 = 1;
+        const INLINE: bool = true;
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(b"cli_toy.unit")
+        }
+        fn primary_path(&self) -> &Path {
+            Path::new(".")
+        }
+    }
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+    struct ToyArgs {
+        #[serde(default)]
+        n: u32,
+    }
+
+    struct MakeUnit;
+    impl Compatible<LamuTrainerBackend> for MakeUnit {}
+    #[async_trait]
+    impl Stage for MakeUnit {
+        const NAME: &'static str = "cli_toy_make_unit";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = Unit;
+        type Args = ToyArgs;
+        async fn run(&self, _c: &StageContext, _i: (), _a: &ToyArgs) -> Result<Unit, StageError> {
+            Ok(Unit)
+        }
+    }
+
+    static ERASED: &[(&str, ErasedStageCtor)] = &[("cli_toy_make_unit", || Arc::new(MakeUnit))];
+    static NO_RECIPES: &[&RecipeDef] = &[];
+    struct ToyCookbook;
+    impl Cookbook for ToyCookbook {
+        fn name(&self) -> &'static str {
+            "cli_toy"
+        }
+        fn recipes(&self) -> &'static [&'static RecipeDef] {
+            NO_RECIPES
+        }
+        fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
+            ERASED
+        }
+    }
+
+    /// A registry holding only the toy cookbook.
+    pub(super) fn registry() -> crate::framework::Registry {
+        let mut reg = crate::framework::Registry::new();
+        reg.register(Box::new(ToyCookbook));
+        reg
+    }
+
+    /// A one-node spec named `name`.
+    pub(super) fn spec(name: &str) -> crate::framework::plan_spec::PlanSpec {
+        spec_with(name, 0)
+    }
+
+    /// A one-node spec whose stage arg `n` makes its fingerprint distinct.
+    pub(super) fn spec_with(name: &str, n: u32) -> crate::framework::plan_spec::PlanSpec {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "version": 1,
+            "edges": [],
+            "nodes": [{"stage": "cli_toy_make_unit", "args": {"n": n}}],
+        }))
+        .expect("toy spec")
+    }
+}
+
 fn persist_plan_graph(plan: &crate::framework::CompiledPlan, job_dir: &std::path::Path) {
+    persist_plan_graph_named(plan, job_dir, None);
+}
+
+/// [`persist_plan_graph`], with the graph named `name` (the name the run is
+/// recorded under in the lineage index) instead of the plan's own name.
+fn persist_plan_graph_as(
+    plan: &crate::framework::CompiledPlan,
+    job_dir: &std::path::Path,
+    name: &str,
+) {
+    persist_plan_graph_named(plan, job_dir, Some(name));
+}
+
+fn persist_plan_graph_named(
+    plan: &crate::framework::CompiledPlan,
+    job_dir: &std::path::Path,
+    name: Option<&str>,
+) {
     match plan.graph_structure() {
-        Ok(g) => {
+        Ok(mut g) => {
+            if let Some(name) = name {
+                g.name = name.to_string();
+            }
             if let Err(e) = g.write_to(job_dir) {
                 eprintln!("warning: could not write plan.json (blut dag unavailable): {e}");
             }
@@ -2706,6 +3723,16 @@ fn persist_plan_graph(plan: &crate::framework::CompiledPlan, job_dir: &std::path
 
 fn run_policy(cmd: PolicyCommand) -> Result<()> {
     use crate::policy;
+    let path = policy::policy_path()?;
+    let unknown = policy::unknown_keys_at(&path);
+    if !unknown.is_empty() {
+        eprintln!(
+            "warning: {} has key(s) BLUT does not recognise: {}. They are ignored \
+             (check for typos), and `policy enable`/`disable` rewrite the file without them.",
+            path.display(),
+            unknown.join(", ")
+        );
+    }
     match cmd {
         PolicyCommand::Show => {
             let p = policy::load().context("load policy")?;
@@ -2724,18 +3751,26 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
             let path = policy::policy_path()?;
             println!("auto-trigger enabled (policy: {})", path.display());
             println!();
-            println!("# Add to crontab so the heuristic runs every 30 min:");
             let exe = std::env::current_exe()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "lamu-train".into());
+                .unwrap_or_else(|_| "blut".into());
             // cron doesn't run through a shell that expands ~ , so
             // resolve the log path to an absolute string before
             // printing. Falls back to /tmp if XDG resolution fails.
-            let log_path = dirs::data_local_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join("lamu")
-                .join("train-auto.log");
-            println!("*/30 * * * * {exe} auto >> {} 2>&1", log_path.display());
+            let log_path = crate::paths::under_state_root("train-auto.log").unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("lamu")
+                    .join("train-auto.log")
+            });
+            print!(
+                "{}",
+                policy_cron_hint(
+                    &exe,
+                    &log_path.display().to_string(),
+                    std::env::var("LAMU_TRAIN_POLICY").ok().as_deref(),
+                )
+            );
         }
         PolicyCommand::Disable => {
             let mut p = policy::load().context("load policy")?;
@@ -2779,6 +3814,7 @@ fn run_dataset_ingest(cmd: DatasetIngestCommand) -> Result<()> {
             n_examples,
             metadata,
         } => {
+            let path = absolute_source_path(&path)?;
             let rec = match n_examples {
                 Some(count) => datasets_db::record_from_file(&name, &path, &kind, count, metadata)?,
                 None => datasets_db::record_from_jsonl(&name, &path, &kind, metadata)?,
@@ -2790,6 +3826,7 @@ fn run_dataset_ingest(cmd: DatasetIngestCommand) -> Result<()> {
             );
         }
         DatasetIngestCommand::Rm { name } => {
+            refuse_if_pinned(&conn, &name)?;
             let removed = datasets_db::remove(&conn, &name)?;
             if removed {
                 println!("removed '{name}'");
@@ -2809,6 +3846,56 @@ fn run_dataset_ingest(cmd: DatasetIngestCommand) -> Result<()> {
         },
     }
     Ok(())
+}
+
+/// `blut dataset ingest rm` must not delete a source record that an immutable
+/// `dataset://` version points at: the version would stop resolving and could
+/// never be pinned again (its manifest stays claimed by the dead binding).
+fn refuse_if_pinned(conn: &rusqlite::Connection, name: &str) -> Result<()> {
+    let Some(rec) = crate::datasets_db::get_by_name(conn, name)? else {
+        return Ok(());
+    };
+    let pins = crate::dataset_registry::pins_of_source(conn, &rec.id)?;
+    if pins.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "refusing to remove '{name}': it backs the immutable version(s) {}. \
+         Removing the source record would leave them unresolvable and impossible \
+         to pin again.",
+        pins.join(", ")
+    ))
+}
+
+/// The source path a dataset record stores. A relative path was stored as
+/// typed, so the record (and every version pinned from it) silently depended
+/// on the directory the command happened to run in.
+fn absolute_source_path(path: &std::path::Path) -> Result<PathBuf> {
+    std::path::absolute(path).with_context(|| format!("resolve dataset path {}", path.display()))
+}
+
+/// Resolve a `dataset catalog show|tag` argument to its raw source record:
+/// `name` is a source name; `name@version` must be a pinned
+/// `dataset://name@version` and resolves to the source behind it. The version
+/// used to be cut off and ignored, so `show ds@v99` printed `ds` as if v99
+/// existed.
+fn resolve_catalog_record(
+    datasets: &rusqlite::Connection,
+    name: &str,
+) -> Result<crate::datasets_db::DatasetRecord> {
+    let source_name = match name.split_once('@') {
+        None => name.to_string(),
+        Some((bare, version)) => {
+            crate::dataset_registry::source_name_for_version(datasets, bare, version)
+                .map_err(|e| anyhow!("{e}"))?
+                .ok_or_else(|| {
+                    anyhow!("no pinned version dataset://{bare}@{version} (see `blut dataset pin`)")
+                })?
+        }
+    };
+    crate::datasets_db::get_by_name(datasets, &source_name)
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| anyhow!("no dataset '{name}' in the registry"))
 }
 
 fn truncate_for_col(s: &str, max: usize) -> String {
@@ -2912,8 +3999,16 @@ use cloud::*;
 mod partition;
 use partition::*;
 
+mod mesh_launch;
+
 mod recipe;
 use recipe::*;
+
+mod run_summary;
+use run_summary::*;
+
+mod k8s_run;
+use k8s_run::*;
 
 mod runs;
 use runs::*;
@@ -2922,3 +4017,150 @@ mod registry_export;
 mod stale;
 mod study;
 use stale::*;
+
+#[cfg(test)]
+mod launcher_refusal_tests;
+
+#[cfg(test)]
+mod dataset_cli_tests {
+    use super::{absolute_source_path, refuse_if_pinned, resolve_catalog_record};
+
+    #[test]
+    fn a_relative_source_path_is_stored_absolute() {
+        // E2E regression: `blut dataset ingest add ds src/a.jsonl` stored
+        // `src/a.jsonl`, so the record broke from any other directory.
+        let abs = absolute_source_path(std::path::Path::new("src/a.jsonl")).unwrap();
+        assert!(abs.is_absolute(), "{}", abs.display());
+        assert!(abs.ends_with("src/a.jsonl"));
+    }
+
+    #[test]
+    fn catalog_names_resolve_through_pins_and_unknown_versions_are_refused() {
+        // E2E regression: `catalog show ds@v99` printed `ds`, and `catalog tag
+        // nope x` tagged a dataset that does not exist.
+        let td = tempfile::tempdir().unwrap();
+        let conn = crate::datasets_db::open_at(&td.path().join("datasets.db")).unwrap();
+        let path = td.path().join("raw.jsonl");
+        std::fs::write(&path, "{\"x\":1}\n").unwrap();
+        let rec = crate::datasets_db::record_from_jsonl("raw", &path, "jsonl", None).unwrap();
+        crate::datasets_db::add(&conn, &rec).unwrap();
+        crate::dataset_registry::pin(
+            &conn,
+            "raw",
+            "dataset://corpus@v1",
+            &crate::tenant::Tenant::default(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(resolve_catalog_record(&conn, "raw").unwrap().name, "raw");
+        assert_eq!(
+            resolve_catalog_record(&conn, "corpus@v1").unwrap().name,
+            "raw"
+        );
+        assert!(
+            resolve_catalog_record(&conn, "corpus@v99")
+                .unwrap_err()
+                .to_string()
+                .contains("no pinned version dataset://corpus@v99")
+        );
+        assert!(resolve_catalog_record(&conn, "nope").is_err());
+
+        // ...and the pinned source cannot be removed out from under v1.
+        let err = refuse_if_pinned(&conn, "raw").unwrap_err().to_string();
+        assert!(err.contains("dataset://corpus@v1"), "{err}");
+        refuse_if_pinned(&conn, "unpinned-or-absent").expect("nothing to protect");
+    }
+}
+
+#[cfg(test)]
+mod model_promote_cli_tests {
+    use super::{governed_gate_preflight, promote_precheck};
+
+    #[test]
+    fn a_governed_promotion_names_what_is_missing() {
+        // E2E regression: `--gate-cmd true` without `--change-id` said "none
+        // configured", as if the gate had been ignored.
+        let msg = |g, c| {
+            governed_gate_preflight("prod", g, c)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(msg(Some("true"), None).contains("--change-id is missing"));
+        assert!(msg(None, Some("CR-1")).contains("no gate"));
+        assert!(msg(None, None).contains("--gate-cmd"));
+        assert!(msg(Some("gate.sh 'two words'"), Some("CR-1")).contains("quotes"));
+        governed_gate_preflight("prod", Some("gate.sh {hash}"), Some("CR-1")).unwrap();
+    }
+
+    #[test]
+    fn an_unregistered_candidate_is_refused_before_any_gate() {
+        // E2E regression: the gate ran in full for a hash that was never
+        // registered, and only then was the promotion refused.
+        let td = tempfile::tempdir().unwrap();
+        let conn = crate::model_registry::open_at(&td.path().join("r.db")).unwrap();
+        let hash = "a".repeat(64);
+        let err = promote_precheck(&conn, &hash, "default", "demo").unwrap_err();
+        assert!(err.to_string().contains("no model"), "{err}");
+        crate::model_registry::register(&conn, &hash, "demo", "default", None, 1).unwrap();
+        promote_precheck(&conn, &hash, "default", "demo").unwrap();
+        assert!(promote_precheck(&conn, &hash, "t2", "demo").is_err());
+        assert!(promote_precheck(&conn, &hash, "default", "other").is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod external_exit_code_tests {
+    use super::external_exit_code;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn a_sidecar_exit_code_is_passed_through() {
+        // E2E regression: a sidecar exiting 3 made `blut <cmd>` exit 1.
+        let from_raw = |raw| std::process::ExitStatus::from_raw(raw);
+        assert_eq!(external_exit_code(&from_raw(0)), None);
+        assert_eq!(external_exit_code(&from_raw(3 << 8)), Some(3));
+        assert_eq!(external_exit_code(&from_raw(2 << 8)), Some(2));
+        assert_eq!(external_exit_code(&from_raw(9)), Some(128 + 9), "SIGKILL");
+    }
+}
+
+#[cfg(test)]
+mod utc_timestamp_tests {
+    #[test]
+    fn history_times_read_as_utc_dates() {
+        // E2E follow-up: `model history` printed raw Unix seconds.
+        assert_eq!(super::utc_timestamp(1_792_797_993), "2026-10-23T23:26:33Z");
+        assert_eq!(super::utc_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(super::utc_timestamp(i64::MAX), i64::MAX.to_string());
+    }
+
+    #[test]
+    fn model_history_rows_name_the_kind_of_each_move() {
+        // E2E follow-up: a promote and a rollback looked alike in the table.
+        use crate::model_registry::HistoryEntry;
+        use crate::registry_db::MoveKind;
+        let row = |hash: &str, at, kind| {
+            (
+                HistoryEntry {
+                    model_hash: hash.to_string(),
+                    moved_at: at,
+                },
+                kind,
+            )
+        };
+        let lines = super::model_history_lines(&[
+            row("aa", 0, MoveKind::Promote),
+            row("bb", 60, MoveKind::Promote),
+            row("aa", 120, MoveKind::Rollback),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "1970-01-01T00:00:00Z  aa  promote",
+                "1970-01-01T00:01:00Z  bb  promote",
+                "1970-01-01T00:02:00Z  aa  rollback  (current)",
+            ]
+        );
+    }
+}

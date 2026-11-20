@@ -17,17 +17,17 @@
 //! small random population starts the search, and as each trial COMPLETES the
 //! policy tells TPE the result and `Spawn`s a fresh TPE-suggested trial.
 //!
-//! v0.20 boundary: `trial_of_topo` covers the INITIAL fan-out only, so a
-//! `Spawn`'d trial's steps (topo positions beyond it) are unattributed and don't
-//! feed back into the model — TPE/PBT learn from the initial population and the
-//! suggestions explore from it, but spawned trials are not themselves re-told.
-//! A runtime trial-registration channel (attributing new node ranges to trials)
-//! is the follow-up that closes the loop.
+//! Suggested trials are registered in the policy's [`TrialBook`] when the
+//! executor injects them (`ControlPolicy::on_spawned`), so their steps are
+//! attributed like an initial trial's: a suggestion that completes is told to
+//! TPE too, and appears in `hpo.json` for the leaderboard.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+
+use super::book::TrialBook;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -128,6 +128,27 @@ pub(super) fn from_t(dist: &Dist, t: f64) -> Value {
     }
 }
 
+/// Decode a model-based suggestion: [`from_t`], kept inside the dim's declared
+/// support. `uniform` and `log_uniform` are half-open, `[low, high)`, but a
+/// candidate clamped to the t-space support can land exactly on `high` (TPE
+/// suggested `wd = 1.0` for `uniform(0, 1)`), and `exp(ln(low))` can round
+/// below `low`; such a value becomes the nearest one inside `[low, high)`.
+/// `int_uniform` is inclusive and `quniform` rounds to its grid, as
+/// [`Dist::sample`] does, so both decode unchanged.
+pub(super) fn suggestion_from_t(dist: &Dist, t: f64) -> Value {
+    let (low, high, decoded) = match dist {
+        Dist::Uniform { low, high } => (*low, *high, t),
+        Dist::LogUniform { low, high } => (*low, *high, t.exp()),
+        _ => return from_t(dist, t),
+    };
+    // `validate` guarantees `low < high`; `max` keeps the bounds ordered even
+    // for a space that skipped it, so `clamp` cannot panic.
+    let below_high = high.next_down().max(low);
+    serde_json::Number::from_f64(decoded.clamp(low, below_high))
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
+}
+
 /// Parzen density at `c`: a uniform prior plus a Gaussian per observation,
 /// normalized so the prior carries the weight of one pseudo-observation.
 fn parzen(c: f64, obs: &[f64], bw: f64, lo: f64, hi: f64) -> f64 {
@@ -191,7 +212,7 @@ impl TpeSampler {
                 best = Some((score, cand));
             }
         }
-        from_t(dist, best.map(|(_, t)| t).unwrap_or((lo + hi) / 2.0))
+        suggestion_from_t(dist, best.map(|(_, t)| t).unwrap_or((lo + hi) / 2.0))
     }
 
     fn suggest_choice(&mut self, choices: &[Value], good: &[&Value], bad: &[&Value]) -> Value {
@@ -304,9 +325,8 @@ struct TpeState {
 /// The TPE control policy: tracks trial completions, tells the sampler, and
 /// `Spawn`s a fresh suggested trial.
 pub struct TpePolicy {
-    trial_of_topo: Vec<Option<u32>>,
-    /// Per-trial overlay (the config we record when it completes).
-    trial_overlays: Vec<Overlay>,
+    /// Topo → trial and per-trial overlays, initial and spawned.
+    book: Arc<TrialBook>,
     space: SearchSpace,
     cfg: TpePolicyConfig,
     sampler: Mutex<TpeSampler>,
@@ -324,8 +344,7 @@ impl TpePolicy {
         factory: FreshFactory,
     ) -> Self {
         Self {
-            trial_of_topo,
-            trial_overlays,
+            book: Arc::new(TrialBook::from_parts(trial_of_topo, trial_overlays)),
             space,
             cfg,
             sampler: Mutex::new(sampler),
@@ -338,6 +357,14 @@ impl TpePolicy {
                 spawns_done: 0,
             }),
         }
+    }
+
+    /// Share `book` (the HPO job's, bound to its `hpo.json`) instead of the
+    /// private one built from the constructor's initial population. The book
+    /// must already hold that population.
+    pub fn with_trial_book(mut self, book: Arc<TrialBook>) -> Self {
+        self.book = book;
+        self
     }
 
     /// Pure decision core (no `CompiledPlan` — unit-testable): drains a queued
@@ -357,7 +384,7 @@ impl TpePolicy {
             };
             if budget >= self.cfg.max_budget && !st.told.contains(&trial) {
                 st.told.insert(trial);
-                if let Some(overlay) = self.trial_overlays.get(trial as usize).cloned() {
+                if let Some(overlay) = self.book.overlay(trial) {
                     st.observations.push(TrialResult {
                         overlay,
                         objective: best,
@@ -386,12 +413,7 @@ impl TpePolicy {
 
 impl ControlPolicy for TpePolicy {
     fn on_step(&self, m: &StepMetrics) -> Control {
-        let Some(trial) = self
-            .trial_of_topo
-            .get(m.node_idx as usize)
-            .copied()
-            .flatten()
-        else {
+        let Some(trial) = self.book.trial_of(m.node_idx) else {
             return Control::Continue;
         };
         let Some(obj) = dotted_f64(m.update, &self.cfg.metric_key) else {
@@ -403,13 +425,19 @@ impl ControlPolicy for TpePolicy {
             TpeDecision::Spawn(overlay) => match (self.factory)(&overlay) {
                 Ok(subplan) => Control::Spawn(Box::new(SpawnDelta::new(
                     subplan,
-                    Some("tpe-suggest".into()),
+                    Some(self.book.reserve(overlay)),
                 ))),
                 Err(e) => {
                     tracing::warn!("tpe suggest factory failed: {e}");
                     Control::Continue
                 }
             },
+        }
+    }
+
+    fn on_spawned(&self, label: Option<&str>, nodes: &[(u32, &str)]) {
+        if let Some(label) = label {
+            self.book.bind(label, nodes);
         }
     }
 }
@@ -451,6 +479,72 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((0.0..=1.0).contains(&lr));
+    }
+
+    /// E2E follow-up: TPE suggested `wd = 1.0` for `uniform(0, 1)`. A
+    /// candidate jittered past the support was clamped to `high` inclusive,
+    /// and good trials near the bound make that clamped candidate the best.
+    #[test]
+    fn suggestions_stay_below_a_half_open_upper_bound() {
+        let mut hist = vec![];
+        for i in 0..8 {
+            hist.push(tr(0.999 - 0.0001 * i as f64, 0.9)); // good, at the bound
+            hist.push(tr(0.01 * i as f64, 0.1)); // bad
+        }
+        let mut log_space = SearchSpace::default();
+        log_space.dims.insert(
+            "lr".into(),
+            Dist::LogUniform {
+                low: 1e-4,
+                high: 1.0,
+            },
+        );
+        for (space, low) in [(cont_space(), 0.0), (log_space, 1e-4)] {
+            for seed in 0..64 {
+                let mut t = TpeSampler::new(
+                    TpeConfig {
+                        gamma: 0.5,
+                        n_startup: 4,
+                        ..TpeConfig::default()
+                    },
+                    seed,
+                );
+                let o = t.ask(&space, &hist);
+                let lr = o[0].1.as_f64().unwrap();
+                assert!(
+                    (low..1.0).contains(&lr),
+                    "seed {seed}: {lr} is outside [{low}, 1)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn half_open_decoding_keeps_the_declared_support() {
+        let u = Dist::Uniform {
+            low: 0.0,
+            high: 1.0,
+        };
+        assert_eq!(suggestion_from_t(&u, 1.0), json!(1.0f64.next_down()));
+        assert_eq!(suggestion_from_t(&u, 0.5), json!(0.5));
+        assert_eq!(suggestion_from_t(&u, -0.1), json!(0.0));
+        let l = Dist::LogUniform {
+            low: 1e-3,
+            high: 1.0,
+        };
+        let top = suggestion_from_t(&l, 0.0).as_f64().unwrap();
+        assert!(top < 1.0, "{top}");
+        let bottom = suggestion_from_t(&l, 1e-3f64.ln()).as_f64().unwrap();
+        assert!(bottom >= 1e-3, "{bottom}");
+        // Inclusive and gridded dims decode as before.
+        let i = Dist::IntUniform { low: 1, high: 4 };
+        assert_eq!(suggestion_from_t(&i, 4.0), json!(4));
+        let q = Dist::QUniform {
+            low: 0.0,
+            high: 1.0,
+            q: 0.25,
+        };
+        assert_eq!(suggestion_from_t(&q, 1.0), from_t(&q, 1.0));
     }
 
     #[test]
@@ -634,5 +728,33 @@ mod tests {
             TpeDecision::Continue,
             "cap 0 → never suggests"
         );
+    }
+
+    #[test]
+    fn a_spawned_suggestion_is_attributed_and_told_once_it_completes() {
+        // E2E follow-up: suggested trials used to be invisible — their steps
+        // carried topo positions past the initial map, so TPE never learned
+        // from them and `hpo show` never listed them.
+        let p = policy(8);
+        let TpeDecision::Spawn(suggestion) = p.decide(0, 0.3, 4) else {
+            panic!("t0's completion suggests");
+        };
+        let label = p.book.reserve(suggestion.clone());
+        p.on_spawned(Some(&label), &[(2, "train")]);
+        assert_eq!(p.book.trial_of(2), Some(2));
+        assert_eq!(p.book.overlay(2), Some(suggestion));
+
+        let update = json!({"val_r": 0.9, "epoch": 4});
+        let _ = p.on_step(&StepMetrics {
+            node_idx: 2,
+            stage_name: "train",
+            update: &update,
+        });
+        let st = p.state.lock();
+        assert!(
+            st.told.contains(&2),
+            "the suggestion's completion is told to TPE"
+        );
+        assert_eq!(st.observations.len(), 2);
     }
 }

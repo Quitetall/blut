@@ -30,6 +30,7 @@ pub mod artifact;
 pub mod artifact_store;
 pub mod async_io;
 pub mod cache;
+pub mod code_identity;
 pub mod compat;
 pub mod control;
 pub mod cookbook;
@@ -48,6 +49,7 @@ pub mod resource;
 pub mod resume;
 pub mod retry;
 pub mod stage;
+pub mod stage_checkpoint;
 pub mod status;
 
 pub use artifact::{
@@ -92,6 +94,6 @@ pub use resource::Resource;
 pub use retry::{Backoff, RetryEvent, RetryHook, RetryOn, RetryPolicy, StageTimeout};
 pub use stage::{
     ErasedArtifact, ErasedDecodeError, PipelineManifest, Stage, StageContext, StageDyn,
-    StageExecutionBoundary,
+    StageExecutionBoundary, StagePlacement,
 };
 pub use status::{HostedEvent, StageEvent, StatusHub, make_broadcast, spawn_status_writer};

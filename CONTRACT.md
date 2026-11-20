@@ -1,6 +1,7 @@
 # BLUT Trainer Contract v1
 
-Frozen 2026-08-08 (ADR 0037 Stage 0). This is the wire contract between the orchestrator
+Frozen 2026-08-08 (ADR 0037 Stage 0); revision 1.1 (2026-10-23) adds §8, mid-stage
+checkpoint slots. This is the wire contract between the orchestrator
 (the Rust engine) and every trainer subprocess, across all cookbooks (LLM, LamQuant/EEG).
 The reference implementation will ship publicly as `tritium.torch.contract` (ADR 0037
 Stage 1); this document is
@@ -141,3 +142,91 @@ The Rust engine's golden test (`tests/contract_golden.rs`) parses the fixture st
 the engine's own `protocol.rs` reader — all six kinds including `heartbeat`, prefix
 recognition for both `BLUT_*` channels, one-terminal-event ordering, and unknown-kind
 rejection.
+
+## 8. Mid-stage checkpoint slots (revision 1.1)
+
+Without this section, an interrupted stage restarts from step 0: each attempt runs in a
+fresh stage directory. A stage that opts in (`Stage::checkpoint_slot` returns `true`)
+gets a **slot**, a directory that outlives the attempt, and its trainer resumes from
+the newest checkpoint in it. The section is additive: a trainer that ignores the
+variables below writes no marker, every attempt starts fresh, and nothing else changes.
+
+### Where the slot is
+
+`<root>/<tenant>/<stage>-<cache key>`. The cache key covers the stage's arguments,
+schema, code fingerprint and the content of its inputs, so a changed config or input
+gets a different slot and cannot resume a stale checkpoint. `<root>` is
+`$BLUT_CHECKPOINTS_DIR`, or by default a sibling of the jobs directory named
+`<jobs-dir-name>-checkpoints`; it is outside every job directory, so a requeued run,
+which is a new job, finds the slot its predecessor used. Rank 0 must be able to reach
+it; other ranks never read it.
+
+### Environment the trainer receives
+
+| variable | meaning |
+|---|---|
+| `BLUT_CHECKPOINT_DIR` | the slot; checkpoints and the marker go here |
+| `BLUT_RESUME` | `1`: resume from the newest valid checkpoint; `0`: start at step 0 |
+| `BLUT_RUN_ID` | the job id, copied into the marker's `run_id` |
+| `BLUT_ATTEMPT_ID` | this attempt's identity, copied into the marker's `attempt_id` |
+
+The stage forwards them with `CheckpointSlot::apply_to`. `srun` and `torchrun` pass the
+environment on to every rank.
+
+### What the trainer does
+
+- Writes checkpoints atomically: temp file, fsync, rename, then fsync the directory. The
+  envelope is §4's, with canonical keys. Keeps at least the previous checkpoint until the
+  new one is durable.
+- Under DDP, only rank 0 writes; the others receive the loaded state from rank 0.
+- On `BLUT_RESUME=1`, loads the newest checkpoint that verifies and skips, saying why,
+  any that is partial (missing or mismatched integrity record), unloadable, missing an
+  envelope key, or written for another config or world size. If none verifies, it starts
+  at step 0.
+- Restores model, optimizer, schedule, RNG and the position in the data, so the step
+  count and the loss continue rather than restart.
+- Maintains the marker `state.json` (§3) with these fields: `status` (`running`),
+  `run_id`, `pid` and `host` (`gethostname`) of the writing process, `heartbeat_unix`,
+  `step` and `epoch` of the newest durable checkpoint, `attempt_id`, and
+  `resumed_from_step` (the step it loaded, or `null`). It writes the marker atomically
+  and refreshes the heartbeat at least every `HEARTBEAT_INTERVAL` seconds.
+
+### What the engine does
+
+For each local attempt it takes an exclusive, non-blocking lock on the slot (held until
+the node finishes, released if the process dies). If another process holds it, the
+attempt fails with `CheckpointBusy`. Otherwise it reads the marker and its own
+`owner.json` record of the last attempt, and decides:
+
+| marker | decision |
+|---|---|
+| absent, unparseable, or `status: finished` | fresh: the slot is cleared |
+| `running`, writer abandoned, `step` set | resume |
+| `running`, writer abandoned, no `step` | fresh |
+| `running`, writer may be alive | refuse with `CheckpointBusy` |
+
+The writer counts as abandoned when the last attempt belonged to the same engine
+invocation (an in-process retry: the previous attempt has returned), when the last
+attempt ran in the same Slurm job with a lower `SLURM_RESTART_COUNT` (Slurm requeued the
+job), when the marker's `host` is this host and its `pid` no longer exists, or when the
+heartbeat is at least `DEFAULT_STALE_AFTER_SECS` old. The engine records each step in the
+job's `status.jsonl` as a `stage_checkpoint` event: `fresh`, `resume_offered` (with the
+marker's step), `resumed` (with the step the trainer recorded), and after the output is
+committed to the cache, `cleaned` (slot deleted) or `kept` (with the reason, e.g. a
+failed cache insert). A slot whose stage failed is kept for the next attempt.
+
+The engine never reads checkpoint files. Slots are not created for remote (P2P) attempts,
+pipelined or speculative execution.
+
+### Relation to ADR 0088 and `resume::decide_resume`
+
+ADR 0088 planned mid-epoch resume through the `--resume`/`--resume-dir` flags and
+`decide_resume`, which the executor consults only on a retry. That path is unchanged and
+still serves stages that implement `Stage::resume_handle`. Slots differ in three ways:
+the trainer is told through the environment rather than flags; the decision is made for
+every attempt, so `plan resume` and a requeued job resume too, not only retries; and a
+marker with this job's `run_id` is not taken as proof that its writer is gone.
+`decide_resume` assumes that, which holds for a retry but not for a `plan resume` started
+while a trainer orphaned by a killed engine is still running. `decide_slot` judges such a
+marker by process liveness, Slurm restart count and heartbeat instead.
+

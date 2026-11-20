@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# kubectl apply -k crates/blut-operator/deploy
+# Override the image with `images:` in an overlay, or `kustomize edit set image`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - crds.yaml
+  - operator.yaml
+  - rbac.yaml

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! ADR 0092 A08 execution-lifecycle contract.
+//! Ownership contract A08: execution lifecycle.
 
 use std::future::pending;
 use std::path::{Path, PathBuf};

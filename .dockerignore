@@ -1,0 +1,4 @@
+# Build contexts for docker/Dockerfile.*: keep VCS data and build output out.
+.git
+target
+**/target

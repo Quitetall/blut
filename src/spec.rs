@@ -370,13 +370,24 @@ fn is_supported_quant(q: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// An absolute path on the host: `/tmp/<rel>` on Unix (unchanged from
+    /// before), `C:\tmp\<rel>` on Windows, where `/tmp/...` has no drive
+    /// and so is not absolute.
+    fn abs_tmp(rel: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\tmp").join(rel)
+        } else {
+            PathBuf::from("/tmp").join(rel)
+        }
+    }
+
     fn good_spec() -> TrainSpec {
         TrainSpec::defaults_qlora_7b(
             "Qwen/Qwen3-7B",
             "test-out",
-            PathBuf::from("/tmp/lamu-train-test"),
+            abs_tmp("lamu-train-test"),
             DatasetSource::JsonlPath {
-                path: PathBuf::from("/tmp/x.jsonl"),
+                path: abs_tmp("x.jsonl"),
             },
         )
     }

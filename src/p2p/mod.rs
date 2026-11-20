@@ -18,9 +18,11 @@ pub mod dispatch;
 pub mod fedround;
 pub mod gossip;
 pub mod introduction;
+pub mod mesh_exec;
 pub mod mesh_runner;
 pub mod mesh_wire;
 pub mod node;
+pub mod objects;
 pub mod peer;
 pub mod peer_exec;
 pub mod privacy;
@@ -30,6 +32,22 @@ pub mod task;
 pub mod transport;
 pub mod trust;
 
+/// Test scratch: directories that live as long as the test holding this.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestDirs(std::sync::Mutex<Vec<tempfile::TempDir>>);
+
+#[cfg(test)]
+impl TestDirs {
+    /// A new directory, removed when this value drops.
+    pub(crate) fn dir(&self) -> std::path::PathBuf {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        self.0.lock().unwrap().push(dir);
+        path
+    }
+}
+
 pub use bundle::{BlobDir, BundleError, BundleManifest, bundle, unbundle};
 pub use chunkstore::{ChunkError, ChunkIndex, ChunkStore};
 pub use coordinator::Coordinator;
@@ -38,11 +56,15 @@ pub use dispatch::{DefaultDispatchPolicy, DispatchPolicy, DispatchVerdict};
 pub use fedround::{CollectedDelta, FedRoundConfig, RoundOutcome, finalize_round};
 pub use gossip::{PeerExchange, PeerRecord};
 pub use introduction::{IntroError, Introduction, MAX_INTRODUCED_TRUST};
-pub use mesh_runner::SharedCacheRunner;
+pub use mesh_exec::{MeshExecutionAdapter, MeshStageWorker};
+pub use mesh_runner::{MeshDispatch, SharedCacheRunner, dispatch_stage};
 pub use mesh_wire::{
     MeshFrame, MeshHello, PROTOCOL_VERSION, Wire, accept_request, mesh_request, negotiate,
 };
-pub use node::{MeshNode, MeshTaskRunner, NodeCapabilities};
+pub use node::{
+    GossipConfig, MeshNode, MeshPeerView, MeshTaskRunner, NodeCapabilities, PeerSource, TaskOrigin,
+};
+pub use objects::MeshObjects;
 pub use peer::{PeerCapabilities, PeerId, PeerInfo};
 pub use privacy::{DpConfig, GradientStatus, PrivacyLedger, gate_gradient_dispatch};
 pub use registry::PeerRegistry;
