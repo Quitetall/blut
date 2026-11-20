@@ -190,16 +190,14 @@ Release notes must link this changelog, the exact CI run, package checksums, and
 the supported-version statement. Mark alpha releases prerelease, or GitHub will
 advertise one as "Latest".
 
-## Two gates in this document do not pass today
+## The benchmark gate, and one gate that ends red by design
 
-Both are recorded here rather than quietly worked around.
-
-**`scripts/run_benchmarks.sh compare` cannot pass yet.** It defaults to the
-baseline name `release-0.2`, and the only baseline committed under
-`bench-baselines/` is `opt0`, so it exits 2 with `missing committed benchmark
-baseline 'release-0.2'`. Establish the baseline on the designated quiet host
-(`bash scripts/run_benchmarks.sh --save`), at the release candidate's SHA. Do
-not delete the check.
+**`scripts/run_benchmarks.sh compare`** compares against the committed
+`release-0.2` baseline. A baseline is only comparable on the machine that
+recorded it, so for each release: rent a machine taken in full, check out the
+release commit, run `--save` then `compare` there, and commit the baseline it
+wrote. Hash the tree `compare` ran on and check it equals the commit's tree, so
+the commit you publish is the one that passed. Do not delete the check.
 
 Until 2026-10-20 the comparison could not fail either. Criterion prints
 "Performance has regressed" and still exits 0. `compare` now ends with
@@ -224,7 +222,8 @@ designated host must be a whole machine nobody else is using: owned
 hardware, or a rented machine taken in full. Record its CPU model, core count
 and kernel with the baseline.
 
-**`release.yml`'s `gate` job ends BLOCKED by design.** Its last step runs
+**`release.yml`'s `gate` job ends BLOCKED by design.** This one still does not
+pass, by design. Its last step runs
 `tools/check_blut_release_state.py`, which reports BLOCKED whenever the two
 external cookbook components (`blut-cookbook-standard`, `blut-cookbook-lamquant`)
 are not checked out — which they never are in CI. A `v*` tag therefore produces a
