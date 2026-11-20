@@ -208,8 +208,8 @@ jobs:
           files: dist/*
 
   # ── publish: the crate chain to crates.io, in dependency order ──────
-  # MANUAL + owner-gated. blut-types → blut → blut-dsl → blut-notify. The
-  # blut-web and blut-operator are publish=false and ship as the binaries above.
+  # MANUAL + owner-gated. blut-types → blut-notify → blut → blut-dsl, then
+  # blut-operator. blut-web is publish=false and ships as a binary above.
   # blut-tui is NOT: it is published (0.2.0-alpha.1 is on crates.io) and ships
   # both ways. It is not in this chain because the chain is the four crates the
   # release train publishes together.
@@ -263,13 +263,15 @@ jobs:
             done
             echo "::error::failed to publish $pkg"; return 1
           }
-          # blut-types is the ONLY chain root: blut depends on it, so it must
-          # be indexed before blut packages ("no matching package named
-          # `blut-types` found" otherwise).
+          # blut-types is the ONLY chain root: blut-notify and blut depend on
+          # it, so it must be indexed before either packages ("no matching
+          # package named `blut-types` found" otherwise). blut-notify goes
+          # before blut because the root package declares it as a versioned
+          # dev-dependency, which cargo publish resolves against the registry.
           publish blut-types
+          publish blut-notify
           publish blut
           publish blut-dsl --manifest-path crates/blut-dsl/Cargo.toml
-          publish blut-notify
           # blut-operator depends on no crate in this repository; it is last
           # only so the engine chain is never held up behind it.
           publish blut-operator --manifest-path crates/blut-operator/Cargo.toml

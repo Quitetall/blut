@@ -1,12 +1,17 @@
 # BLUT Release Procedure
 
-Public preview train: `blut-types` → `blut` → `blut-dsl` → `blut-notify`, then
-`blut-operator`, which depends on none of them and is published last only so
-it never holds up the engine chain.
-`blut-types` is the single chain ROOT (no in-repo path deps); `blut` depends on
-it, so it must be indexed on crates.io before `blut` will package — otherwise
-`no matching package named 'blut-types' found`. Members share the exact preview
-version.
+Public preview train: `blut-types` → `blut-notify` → `blut` → `blut-dsl`, then
+`blut-operator` and `blut-tui`, which are published last only so they never
+hold up the engine chain.
+`blut-types` is the single chain ROOT (no in-repo path deps); `blut-notify` and
+`blut` depend on it, so it must be indexed on crates.io before either will
+package — otherwise `no matching package named 'blut-types' found`.
+`blut-notify` goes before `blut`: the root package declares it as a
+dev-dependency with a version (`Cargo.toml`), and `cargo publish` resolves that
+requirement against the registry. Publishing `blut` first fails with
+`failed to select a version for the requirement blut-notify = "^0.2.0-alpha.2"`
+(it did for 0.2.0-alpha.2, before anything uploaded). Members share the exact
+preview version.
 
 `blut-graph-core` is NOT part of this train. The LamQuant semantic-graph adapter that used it
 moved out of the engine into the unpublished `crates/blut-semantic` sidecar
@@ -125,21 +130,25 @@ Each publish is irreversible. Confirm package contents before removing
 # Re-run exact-SHA CI now; root and DSL tarball verification cannot resolve
 # their exact owner dependencies until the preceding package is indexed.
 
+cargo publish --dry-run --locked -p blut-notify
+cargo publish --locked -p blut-notify
+# Wait until crates.io resolves blut-notify; the root package's
+# dev-dependency on it cannot resolve before then.
+
 cargo publish --dry-run --locked
 cargo publish --locked
 # Wait until crates.io resolves blut at the exact preview version.
 
 (cd crates/blut-dsl && cargo publish --dry-run --locked)
 (cd crates/blut-dsl && cargo publish --locked)
-# Wait until crates.io resolves blut-dsl, then the last member of the chain:
-
-cargo publish --dry-run --locked -p blut-notify
-cargo publish --locked -p blut-notify
 
 # Independent of the chain; publish only with the owner's go-ahead for this
 # release (its first publish reserves the name):
 (cd crates/blut-operator && cargo publish --dry-run --locked)
 (cd crates/blut-operator && cargo publish --locked)
+
+(cd crates/blut-tui && cargo publish --dry-run --locked)
+(cd crates/blut-tui && cargo publish --locked)
 ```
 
 Run the kind smoke and the operator end to end before tagging (the operator's
