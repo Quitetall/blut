@@ -9,6 +9,8 @@ ignore = [
     { id = "RUSTSEC-2025-0057", reason = "unmaintained-only fxhash is transitive through starlark 0.14; no known vulnerability, replace with the next audited starlark release" },
     { id = "RUSTSEC-2024-0436", reason = "unmaintained-only paste is transitive through starlark 0.14; no known vulnerability, replace with the next audited starlark release" },
     { id = "RUSTSEC-2024-0449", reason = "unmaintained-only unsafe-libyaml is transitive through serde_yaml 0.9, which parses local operator-written config (Hydra, registry, HPO spaces), never network input; no known vulnerability, migrate to a safe-Rust parser (serde-saphyr) as its own change" },
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained-only, no known vulnerability. Waived 2026-11-19 until 0.3: chrono comes in directly and through cron 0.15 and object_store 0.14; 0.3 moves blut's own code to jiff and replaces cron. object_store keeps it under cloud/s3 until upstream moves" },
+    { id = "RUSTSEC-2026-0542", reason = "unmaintained-only, no known vulnerability. Waived 2026-11-19 until 0.3, which drops the direct humantime dependency" },
     { id = "RUSTSEC-2026-0173", reason = "unmaintained-only proc-macro-error2 is transitive through the Leptos dashboard in crates/blut-web/ui, which is publish = false; no known vulnerability, replace when Leptos drops it" },
 ]
 

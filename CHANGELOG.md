@@ -221,6 +221,12 @@ depend on this crate.
   stage failed with "Permission denied". Probe names are now unique.
 
 ### Security
+- `blut-notify` requires `lettre` 0.11.24, which fixes RUSTSEC-2026-0560 to
+  0565: STARTTLS reply injection, SMTP command injection through a bare LF or
+  CR, two panics on crafted input, mail for a quoted local part going to a
+  different address, and unbounded buffering of a server reply.
+- `deny.toml` waives RUSTSEC-2026-0543 (`chrono`) and RUSTSEC-2026-0542
+  (`humantime`), both unmaintained-only, until 0.3 removes them.
 - `quinn-udp` 0.5.16, for RUSTSEC-2026-0538 (a receive loop that can spin on a
   truncated datagram).
 - `rusqlite` moves from 0.32 to 0.41, whose bundled SQLite fixes
