@@ -37,8 +37,9 @@ justification. Never refresh a baseline merely to hide regression.
 ## Current release state
 
 - Historical `opt0` baseline: 2026-06-18, pre-public internal development.
-- `release-0.2` baseline: **not committed**. It is recorded at the release
-  commit, on the host that then runs `compare`.
+- `release-0.2` baseline: **committed**, recorded at the release commit on a
+  rented machine taken in full, which then ran `compare` on the same tree. The
+  baseline commit's message names the host, its load and the compare result.
 - 2026-11-13 trial, commit `44491b7`, Rust 1.99.0, a rented machine taken in
   full (AMD Ryzen 9 5900XT, 32 threads, 62 GB; load 0.01 to 0.05 before the
   runs). The save recorded all 27 current benchmarks. Two single-pass
@@ -50,8 +51,12 @@ justification. Never refresh a baseline merely to hide regression.
   | 2 | −1.7% to +7.6% | none | passed |
 
   Unchanged code failed one pass in two, so a single pass cannot be the gate.
-  That trial is why a slowdown now has to repeat. The two-pass gate itself has
-  not yet run on a quiet host.
+  That trial is why a slowdown now has to repeat.
+- 2026-11-13 rehearsal of the two-pass gate, commit `c106e91`, a rented AMD
+  Ryzen 9 5900X taken in full. Unchanged code passed twice: once in one pass,
+  once after a second pass cleared a first-pass flag at +16.7%. A planted
+  slowdown (one benchmark made to do 50% more work) was flagged at +52.6% and
+  +52.7% and failed the gate.
 
 A 2026-07-12 attempt was rejected as invalid evidence: workstation carried a
 high concurrent CPU load, medians varied sharply between consecutive runs, and

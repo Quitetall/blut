@@ -64,15 +64,16 @@ processes on one host. `blut cancel` and `plan resume` work with the submitter
 gone. Still missing: workers on separate hosts, a GPU stage, a large artifact,
 `hpo`/`study`/`partition` on the cloud launcher, and retention of finished jobs.
 
-**4. A benchmark baseline that exists.** The regression gate
-(`scripts/bench_regression_gate.py`) compares confidence bounds rather than
-raw medians, and `scripts/run_benchmarks.sh compare` names the `release-0.2`
-baseline. A shared host drifted −12% to +8% on unchanged code, so the baseline
-is recorded on a whole dedicated machine. Even there, one pass in two failed on
-unchanged code (one benchmark +17%), so the gate now waits for a quiet host
-and fails only on a slowdown that repeats in a second pass. Still missing: the
-two-pass gate run on a quiet host, and the baseline committed at the release
-commit.
+**4. A benchmark baseline that exists.** Done. The `release-0.2` baseline is
+committed, recorded at the release commit on a rented machine taken in full,
+and `compare` passed there on the same tree. A shared host had drifted −12% to
++8% on unchanged code, and even a whole idle machine failed one single pass in
+two, so the gate waits for a quiet host and fails only on a slowdown that
+repeats in a second pass. That rule was rehearsed: unchanged code passed, and a
+planted +50% slowdown failed in both passes. Still missing: a machine that
+stays the same between releases. A rented one does not, so each release records
+its own baseline and compares on the same machine, which checks the release
+against noise but not against the previous release.
 
 **5. Windows containment.** Local stages are contained on Windows.
 `LocalSystemd::spawn_contained` places a stage process in a Job Object: a

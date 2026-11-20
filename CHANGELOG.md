@@ -10,7 +10,7 @@ depend on this crate.
 
 ## [Unreleased]
 
-## [0.2.0-alpha.2] — published 2026-11-14
+## [0.2.0-alpha.2] — 2026-11-19
 
 ### Added
 - **Recipe-level dispatch over the `p2p node` mesh** (feature `p2p`).
